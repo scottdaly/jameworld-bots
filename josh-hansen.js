@@ -43,56 +43,80 @@ async function connectWithRetry(maxRetries = 5, delay = 5000) {
   throw new Error("Max retries reached. Could not connect to the database.");
 }
 
-// Update the buildUserProfile function
-async function buildUserProfile(username, isBot) {
+async function buildUserProfile(username, channelId, isBot) {
   if (isBot) {
     return `Skipped profile generation for bot or app user: ${username}`;
   }
 
   const client = await pool.connect();
   try {
-    const { rows: messages } = await client.query(
-      "SELECT content FROM messages"
+    // Fetch all messages from the channel
+    const result = await client.query(
+      "SELECT author, content FROM channel_messages WHERE channel_id = $1 ORDER BY created_at ASC",
+      [channelId]
     );
 
-    let prompt = `Generate a detailed profile for the user "${username}" based on their entire conversation history. Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
+    const allMessages = result.rows;
+    const totalTokens = allMessages.reduce(
+      (acc, msg) => acc + msg.content.length,
+      0
+    );
 
-    messages.forEach(({ content }) => {
-      prompt += `${username}: ${content}\n`;
+    let prompt = `Generate a detailed profile for the user "${username}" based on the following conversation history from a discord of friends called "Jameworld". Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
+
+    allMessages.forEach((msg) => {
+      prompt += `${msg.author}: ${msg.content}\n`;
     });
 
     console.log(`Generated prompt for ${username}:`, prompt);
 
-    const profile = await callGeminiAPI(prompt, CHAT_MODEL_URL);
+    const profile = await callGeminiAPI(prompt, PROFILE_MODEL_URL);
 
+    // Store the profile in the database
     await client.query(
-      "INSERT INTO user_profiles (username, profile) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET profile = $2",
+      "INSERT INTO user_profiles (username, profile) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET profile = $2, updated_at = CURRENT_TIMESTAMP",
       [username, profile]
     );
 
     return profile;
+  } catch (err) {
+    console.error("Error building user profile:", err);
+    return null;
   } finally {
     client.release();
   }
 }
 
-// Command to generate profiles for all users in the conversation history using `gemini-1.5-pro`
+// Command to generate profiles for all users in the conversation history
 client.on("messageCreate", async (message) => {
   if (message.content === "!generateProfiles") {
     const client = await pool.connect();
     try {
-      const { rows: users } = await client.query(
-        "SELECT DISTINCT author FROM messages"
+      const result = await client.query(
+        "SELECT DISTINCT author FROM channel_messages WHERE channel_id = $1",
+        [message.channel.id]
       );
 
-      for (const { author } of users) {
+      for (const row of result.rows) {
+        const username = row.author;
         const userIsBot =
-          message.guild.members.cache.get(author)?.user.bot || false;
+          message.guild.members.cache.get(message.author.id)?.user.bot || false;
 
-        console.log(`Generating profile for ${author}`);
-        const profile = await buildUserProfile(author, userIsBot);
-        message.channel.send(`Generated profile for ${author}:\n${profile}`);
+        console.log(`Generating profile for ${username}`);
+        const profile = await buildUserProfile(
+          username,
+          message.channel.id,
+          userIsBot
+        );
+        if (profile) {
+          message.channel.send(
+            `Generated profile for ${username}:\n${profile}`
+          );
+        }
       }
+    } catch (err) {
+      console.error("Error generating profiles:", err);
+      message.channel.send("An error occurred while generating profiles.");
     } finally {
       client.release();
     }
