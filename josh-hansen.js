@@ -53,7 +53,7 @@ async function buildUserProfile(username, channelId, isBot) {
   try {
     // Fetch all messages from the channel
     const result = await client.query(
-      "SELECT author, content FROM channel_messages WHERE channel_id = $1 ORDER BY created_at ASC",
+      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY created_at ASC",
       [channelId]
     );
 
