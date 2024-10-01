@@ -94,7 +94,7 @@ client.on("messageCreate", async (message) => {
     const client = await pool.connect();
     try {
       const result = await client.query(
-        "SELECT DISTINCT author FROM channel_messages WHERE channel_id = $1",
+        "SELECT DISTINCT author FROM messages WHERE channel_id = $1",
         [message.channel.id]
       );
 
