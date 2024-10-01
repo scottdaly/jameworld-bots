@@ -269,7 +269,7 @@ client.on("messageCreate", async (message) => {
 
       const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       message.reply(reply);
 

@@ -179,7 +179,7 @@ client.on("messageCreate", async (message) => {
       const reply = await callGeminiAPI(prompt, CHAT_MODEL_URL);
 
       // Introduce a 500ms delay before sending the response
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       message.reply(reply);
 
