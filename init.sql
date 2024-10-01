@@ -11,5 +11,6 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE TABLE IF NOT EXISTS user_profiles (
     username TEXT PRIMARY KEY,
-    profile TEXT
+    profile TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

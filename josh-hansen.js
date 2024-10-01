@@ -67,7 +67,7 @@ async function buildUserProfile(username, channelId, isBot) {
 
     let iterator = 0;
     allMessages.forEach((msg) => {
-      prompt += `${msg.author}: ${msg.content}\n`;
+      prompt += `[${msg.timestamp}] ${msg.author}: ${msg.content}\n`;
       if (iterator === 10) {
         console.log("Prompt:", prompt);
       }
