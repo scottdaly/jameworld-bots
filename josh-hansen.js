@@ -78,6 +78,8 @@ async function buildUserProfile(username, channelId, isBot) {
 
     const profile = await callGeminiAPI(prompt, PROFILE_MODEL_URL);
 
+    console.log(`Generated profile for ${username}`);
+
     // Store the profile in the database
     await client.query(
       "INSERT INTO user_profiles (username, profile) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET profile = $2, updated_at = CURRENT_TIMESTAMP",
@@ -105,8 +107,16 @@ client.on("messageCreate", async (message) => {
 
       for (const row of result.rows) {
         const username = row.author;
-        const userIsBot =
-          message.guild.members.cache.get(message.author.id)?.user.bot || false;
+
+        let users = [
+          "jame8k",
+          "scottdaly",
+          "17monkeys",
+          "noah3759",
+          "matthan99",
+        ];
+
+        let userIsBot = !users.includes(username);
 
         console.log(`Generating profile for ${username}`);
         const profile = await buildUserProfile(
