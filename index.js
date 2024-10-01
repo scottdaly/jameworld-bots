@@ -236,10 +236,8 @@ client.on("messageCreate", async (message) => {
   if (message.content === "!generateProfiles") {
     const clientDB = await pool.connect();
     try {
-      const res = await clientDB.query(
-        `SELECT DISTINCT author_username FROM messages`
-      );
-      const usernames = res.rows.map((row) => row.author_username);
+      const res = await clientDB.query(`SELECT DISTINCT author FROM messages`);
+      const usernames = res.rows.map((row) => row.author);
 
       for (const username of usernames) {
         // Check if we have already generated a profile for this user
