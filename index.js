@@ -234,31 +234,22 @@ async function buildUserProfile(username, isBot) {
 // Command to generate profiles for all users in the conversation history using `gemini-1.5-pro`
 client.on("messageCreate", async (message) => {
   if (message.content === "!generateProfiles") {
-    const clientDB = await pool.connect();
+    const client = await pool.connect();
     try {
-      const res = await clientDB.query(`SELECT DISTINCT author FROM messages`);
-      const usernames = res.rows.map((row) => row.author);
+      const { rows: users } = await client.query(
+        "SELECT DISTINCT author FROM messages"
+      );
 
-      for (const username of usernames) {
-        // Check if we have already generated a profile for this user
-        const profileExists = await getUserProfile(username);
-        if (!profileExists) {
-          console.log(`Generating profile for ${username}`);
-          const userIsBot = false; // You can enhance this by storing bot info in messages table
-          const profile = await buildUserProfile(username, userIsBot);
-          message.channel.send(
-            `Generated profile for ${username}:\n${profile}`
-          );
-        } else {
-          message.channel.send(
-            `Profile for ${username} already exists:\n${profileExists}`
-          );
-        }
+      for (const { author } of users) {
+        const userIsBot =
+          message.guild.members.cache.get(author)?.user.bot || false;
+
+        console.log(`Generating profile for ${author}`);
+        const profile = await buildUserProfile(author, userIsBot);
+        message.channel.send(`Generated profile for ${author}:\n${profile}`);
       }
-    } catch (err) {
-      console.error("Error generating profiles:", err);
     } finally {
-      clientDB.release();
+      client.release();
     }
   }
 });
