@@ -177,40 +177,6 @@ async function callOpenAIAPI(
   return response.choices[0].message.content;
 }
 
-// Update the buildUserProfile function
-async function buildUserProfile(username, isBot) {
-  if (isBot) {
-    return `Skipped profile generation for bot or app user: ${username}`;
-  }
-
-  const client = await pool.connect();
-  try {
-    const { rows: messages } = await client.query(
-      "SELECT content FROM messages WHERE author = $1",
-      [username]
-    );
-
-    let prompt = `Generate a detailed profile for the user "${username}" based on their entire conversation history. Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
-
-    messages.forEach(({ content }) => {
-      prompt += `${username}: ${content}\n`;
-    });
-
-    console.log(`Generated prompt for ${username}:`, prompt);
-
-    const profile = await callOpenAIAPI(prompt, true);
-
-    await client.query(
-      "INSERT INTO user_profiles (username, profile) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET profile = $2",
-      [username, profile]
-    );
-
-    return profile;
-  } finally {
-    client.release();
-  }
-}
-
 // // Handler for the !saveChannel command
 // client.on("messageCreate", async (message) => {
 //   if (message.content.toLowerCase() === "!savechannel") {
@@ -230,29 +196,6 @@ async function buildUserProfile(username, isBot) {
 //     }
 //   }
 // });
-
-// Command to generate profiles for all users in the conversation history using `gemini-1.5-pro`
-client.on("messageCreate", async (message) => {
-  if (message.content === "!generateProfiles") {
-    const client = await pool.connect();
-    try {
-      const { rows: users } = await client.query(
-        "SELECT DISTINCT author FROM messages"
-      );
-
-      for (const { author } of users) {
-        const userIsBot =
-          message.guild.members.cache.get(author)?.user.bot || false;
-
-        console.log(`Generating profile for ${author}`);
-        const profile = await buildUserProfile(author, userIsBot);
-        message.channel.send(`Generated profile for ${author}:\n${profile}`);
-      }
-    } finally {
-      client.release();
-    }
-  }
-});
 
 // Test command to check user profiles
 client.on("messageCreate", async (message) => {

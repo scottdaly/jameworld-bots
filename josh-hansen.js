@@ -65,11 +65,16 @@ async function buildUserProfile(username, channelId, isBot) {
 
     let prompt = `Generate a detailed profile for the user "${username}" based on the following conversation history from a discord of friends called "Jameworld". Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
 
+    let iterator = 0;
     allMessages.forEach((msg) => {
       prompt += `${msg.author}: ${msg.content}\n`;
+      if (iterator === 10) {
+        console.log("Prompt:", prompt);
+      }
+      iterator++;
     });
 
-    console.log(`Generated prompt for ${username}:`, prompt);
+    console.log(`Generated prompt for ${username}`);
 
     const profile = await callGeminiAPI(prompt, PROFILE_MODEL_URL);
 
