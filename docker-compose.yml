@@ -42,7 +42,7 @@ services:
         condition: service_healthy
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN_SOCRATES}
-      - GOOGLE_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
