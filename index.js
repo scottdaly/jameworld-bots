@@ -236,7 +236,7 @@ client.on("messageCreate", async (message) => {
     try {
       const client = await pool.connect();
       const { rows: users } = await client.query(
-        "SELECT username FROM user_profiles"
+        "SELECT username FROM messages GROUP BY username ORDER BY COUNT(*) DESC LIMIT 10"
       );
       for (const { username } of users) {
         await buildUserProfile(username, false);
