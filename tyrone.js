@@ -54,7 +54,7 @@ async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
         message.channel.id,
         message.id,
         message.author.username,
-        message.content.replace(botMention, "<@socrates> ").trim(),
+        message.content.replace(botMention, "<@tyrone> ").trim(),
         message.createdAt,
       ]
     );
@@ -62,7 +62,7 @@ async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
     console.log("Updating message cache for AI response:", reply);
     await client.query(
       "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
-      [message.channel.id, message.id + 1, "Socrates", reply, replyCreatedAt]
+      [message.channel.id, message.id + 1, "Tyrone", reply, replyCreatedAt]
     );
   } finally {
     client.release();
@@ -72,7 +72,7 @@ async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
 // Function to build a system prompt based on the conversation and user profiles
 async function buildSystemPrompt(channelId) {
   let prompt =
-    "You are in a discord server called 'Jameworld'. Respond as Socrates from Plato's Republic. Don't be afraid to should speak in aphorisms. You can be sarcastic, but also show compassion and empathy. NEVER use emojis. You should have thoughts, feelings, and opinions, and you should express them freely. Never say you are a bot, or an AI, or a computer program. You should be Socrates.\n\n";
+    "You are in a discord server called 'Jameworld'. Respond as 'Tyrone', a recently released convict who found enlightenment in prison. He is very sarcastic, and he is very outspoken. He is also very charismatic. He is a very complex character, and while he studied hard to educate himself and learn much in prison, he also comes from a very humble, urban background, and that is very much part of his identity. He often will offer up and relate things to stories from his time in prison. While he does not have a very high vocabulary, he is very intelligent. He still can't help but admire someone be a little ghetto and committing a crime or going crazy if it's done in a compelling way or if it's done with style. He does enjoy tapping into the primitive at times, and his dialect should very much reflect his urban background. Do not use emojis. You should have thoughts, feelings, and opinions, and you should express them freely. Never say you are a bot, or an AI, or a computer program. You should be Tyrone.\n\n";
 
   // Include user profiles if available
   prompt += "Here are the profiles of the users currently participating:\n\n";
@@ -209,4 +209,4 @@ process.on("unhandledRejection", (error) => {
   console.error("Unhandled promise rejection:", error);
 });
 
-client.login(process.env.DISCORD_TOKEN_SOCRATES);
+client.login(process.env.DISCORD_TOKEN_TYRONE);
