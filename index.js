@@ -211,25 +211,25 @@ async function buildUserProfile(username, isBot) {
   }
 }
 
-// // Handler for the !saveChannel command
-// client.on("messageCreate", async (message) => {
-//   if (message.content.toLowerCase() === "!savechannel") {
-//     try {
-//       await message.channel.send(
-//         "Starting to fetch and save messages from this channel. This may take a while..."
-//       );
-//       await fetchAndSaveMessages(message.channel);
-//       await message.channel.send(
-//         "All messages from this channel have been saved to the database."
-//       );
-//     } catch (error) {
-//       console.error("Error in !saveChannel command:", error);
-//       await message.channel.send(
-//         "An error occurred while saving messages. Please check the logs for more information."
-//       );
-//     }
-//   }
-// });
+// Handler for the !saveChannel command
+client.on("messageCreate", async (message) => {
+  if (message.content.toLowerCase() === "!savechannel") {
+    try {
+      await message.channel.send(
+        "Starting to fetch and save messages from this channel. This may take a while..."
+      );
+      await fetchAndSaveMessages(message.channel);
+      await message.channel.send(
+        "All messages from this channel have been saved to the database."
+      );
+    } catch (error) {
+      console.error("Error in !saveChannel command:", error);
+      await message.channel.send(
+        "An error occurred while saving messages. Please check the logs for more information."
+      );
+    }
+  }
+});
 
 // Test command to check user profiles
 client.on("messageCreate", async (message) => {
