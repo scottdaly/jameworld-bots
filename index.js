@@ -190,7 +190,7 @@ async function buildUserProfile(username, isBot) {
       [username]
     );
 
-    let prompt = `Generate a detailed profile for the user "${username}" based on their entire conversation history. Include information about their writing style, personality, and tone. Summarize if needed. Here are the messages:\n\n`;
+    let prompt = `Generate a detailed profile for the user "${username}" based on their entire conversation history. Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
 
     messages.forEach(({ content }) => {
       prompt += `${username}: ${content}\n`;
@@ -211,22 +211,44 @@ async function buildUserProfile(username, isBot) {
   }
 }
 
-// Handler for the !saveChannel command
+// // Handler for the !saveChannel command
+// client.on("messageCreate", async (message) => {
+//   if (message.content.toLowerCase() === "!savechannel") {
+//     try {
+//       await message.channel.send(
+//         "Starting to fetch and save messages from this channel. This may take a while..."
+//       );
+//       await fetchAndSaveMessages(message.channel);
+//       await message.channel.send(
+//         "All messages from this channel have been saved to the database."
+//       );
+//     } catch (error) {
+//       console.error("Error in !saveChannel command:", error);
+//       await message.channel.send(
+//         "An error occurred while saving messages. Please check the logs for more information."
+//       );
+//     }
+//   }
+// });
+
 client.on("messageCreate", async (message) => {
-  if (message.content.toLowerCase() === "!savechannel") {
+  if (message.content.toLowerCase() === "!generateprofiles") {
     try {
-      await message.channel.send(
-        "Starting to fetch and save messages from this channel. This may take a while..."
+      const client = await pool.connect();
+      const { rows: users } = await client.query(
+        "SELECT username FROM user_profiles"
       );
-      await fetchAndSaveMessages(message.channel);
-      await message.channel.send(
-        "All messages from this channel have been saved to the database."
-      );
+      for (const { username } of users) {
+        await buildUserProfile(username, false);
+      }
+      await message.channel.send("All user profiles have been generated.");
     } catch (error) {
-      console.error("Error in !saveChannel command:", error);
+      console.error("Error generating user profiles:", error);
       await message.channel.send(
-        "An error occurred while saving messages. Please check the logs for more information."
+        "An error occurred while generating user profiles."
       );
+    } finally {
+      client.release();
     }
   }
 });
