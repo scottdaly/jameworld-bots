@@ -189,7 +189,7 @@ async function callOpenAIAPI(
     console.log("Calling OpenAI API with image", imageUrl);
     console.log("Calling OpeanAI API with model", model);
     response = await openai.chat.completions.create({
-      model: model,
+      model: "gpt-4o",
       messages: [
         { role: "system", content: systemPrompt },
         {
