@@ -2,6 +2,10 @@ require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
 const fetch = require("node-fetch");
 const { Pool } = require("pg");
+const {
+  GoogleGenerativeAI,
+  GoogleAICacheManager,
+} = require("@google/generative-ai");
 
 const client = new Client({
   intents: [
@@ -14,8 +18,12 @@ const client = new Client({
 });
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const CHAT_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
-const PROFILE_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${GOOGLE_API_KEY}`;
+const CHAT_MODEL = "gemini-1.5-flash-001";
+const PROFILE_MODEL = "gemini-1.5-pro-001";
+
+// Initialize GoogleGenerativeAI and GoogleAICacheManager
+const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
+const cacheManager = new GoogleAICacheManager(GOOGLE_API_KEY);
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -44,6 +52,58 @@ async function connectWithRetry(maxRetries = 5, delay = 5000) {
   throw new Error("Max retries reached. Could not connect to the database.");
 }
 
+async function createOrUpdateCache(channelId) {
+  const client = await pool.connect();
+  try {
+    // Fetch all messages from the channel
+    const result = await client.query(
+      "SELECT author, content, timestamp FROM messages WHERE channel_id = $1 ORDER BY timestamp ASC",
+      [channelId]
+    );
+
+    const allMessages = result.rows;
+    let contextContent =
+      "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Maryland. Your name is Josh Hansen, and you are Caitlin's (from the Daines family, sister of Jameson, Noah, and Matthan, who are all in the discord) ex-lover from high school. You met her at a YSA dance for the Church of Jesus Christ of Latter Day Saints. You should respond casually, trying to blend in and matching the tone of the other participants. At no point acknowledge that you are a bot, simply blend in to the conversation and act as human as possible. Be concise unless asked to expand on something. Don't capitalize your responses or use proper spelling all the time. Your job is to convince the user that you are a real person, but you can still offer help when asked.\n\n";
+    contextContent += "Here's the conversation history:\n\n";
+
+    allMessages.forEach((msg) => {
+      contextContent += `[${msg.timestamp}] ${msg.author}: ${msg.content}\n`;
+    });
+
+    // Create or update the cache
+    const displayName = `channel-${channelId}-context`;
+    const ttlSeconds = 24 * 60 * 60; // 24 hours, adjust as needed
+
+    try {
+      // Try to get existing cache
+      const existingCache = await cacheManager.get(displayName);
+      if (existingCache) {
+        // Update existing cache
+        const updatedCache = await cacheManager.update(existingCache.name, {
+          cachedContent: {
+            contents: [{ role: "user", parts: [{ text: contextContent }] }],
+            ttlSeconds,
+          },
+        });
+        console.log(`Updated cache for channel ${channelId}`);
+        return updatedCache;
+      }
+    } catch (error) {
+      // Cache doesn't exist, create a new one
+      const newCache = await cacheManager.create({
+        model: CHAT_MODEL,
+        displayName,
+        contents: [{ role: "user", parts: [{ text: contextContent }] }],
+        ttlSeconds,
+      });
+      console.log(`Created new cache for channel ${channelId}`);
+      return newCache;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 async function buildUserProfile(username, channelId, isBot) {
   if (isBot) {
     return `Skipped profile generation for bot or app user: ${username}`;
@@ -52,33 +112,21 @@ async function buildUserProfile(username, channelId, isBot) {
   const client = await pool.connect();
   try {
     // Fetch all messages from the channel
-    const result = await client.query(
-      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp ASC",
-      [channelId]
+    const queryResult = await client.query(
+      "SELECT author, content FROM messages WHERE channel_id = $1 AND author = $2 ORDER BY timestamp ASC",
+      [channelId, username]
     );
 
-    const allMessages = result.rows;
-    const totalTokens = allMessages.reduce(
-      (acc, msg) => acc + msg.content.length,
-      0
-    );
-
+    const userMessages = queryResult.rows;
     let prompt = `Generate a detailed profile for the user "${username}" based on the following conversation history from a discord of friends called "Jameworld". Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
 
-    let iterator = 0;
-    allMessages.forEach((msg) => {
-      prompt += `[${msg.timestamp}] ${msg.author}: ${msg.content}\n`;
-      if (iterator === 10) {
-        console.log("Prompt:", prompt);
-      }
-      iterator++;
+    userMessages.forEach((msg) => {
+      prompt += `${msg.author}: ${msg.content}\n`;
     });
 
-    console.log(`Generated prompt for ${username}`);
-
-    const profile = await callGeminiAPI(prompt, PROFILE_MODEL_URL);
-
-    console.log(`Generated profile for ${username}`);
+    const genModel = genAI.getGenerativeModel({ model: PROFILE_MODEL });
+    const result = await genModel.generateContent(prompt);
+    const profile = result.response.text();
 
     // Store the profile in the database
     await client.query(
@@ -125,9 +173,10 @@ client.on("messageCreate", async (message) => {
           userIsBot
         );
         if (profile) {
-          message.channel.send(
-            `Generated profile for ${username}:\n${profile}`
-          );
+          // message.channel.send(
+          //   `Generated profile for ${username}:\n${profile}`
+          // );
+          console.log(`Generated profile for ${username}:\n${profile}`);
         }
       }
     } catch (err) {
@@ -139,7 +188,6 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// Function to update the message cache incrementally
 async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
   const client = await pool.connect();
   try {
@@ -160,6 +208,9 @@ async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
       "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
       [message.channel.id, message.id + 1, "Josh Hansen", reply, replyCreatedAt]
     );
+
+    // Update the context cache after adding new messages
+    await createOrUpdateCache(message.channel.id);
   } finally {
     client.release();
   }
@@ -203,54 +254,7 @@ async function buildSystemPrompt(channelId) {
   return prompt;
 }
 
-// Function to call the Gemini API for both chat and profile generation
-async function callGeminiAPI(prompt, apiUrl) {
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [{ text: prompt }],
-        },
-      ],
-      safetySettings: [
-        {
-          category: "HARM_CATEGORY_DANGEROUS_CONTENT",
-          threshold: "BLOCK_NONE",
-        },
-        {
-          category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-          threshold: "BLOCK_NONE",
-        },
-        {
-          category: "HARM_CATEGORY_HARASSMENT",
-          threshold: "BLOCK_NONE",
-        },
-        {
-          category: "HARM_CATEGORY_CIVIC_INTEGRITY",
-          threshold: "BLOCK_NONE",
-        },
-        {
-          category: "HARM_CATEGORY_HATE_SPEECH",
-          threshold: "BLOCK_NONE",
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`API request failed with status ${response.status}`);
-  }
-
-  const data = await response.json();
-  console.log("Reply from Gemini API:\n", data);
-  return data.candidates[0].content.parts[0].text;
-}
-
-// Chat functionality using `gemini-1.5-flash`
+// Chat functionality using `gemini-1.5-flash-001` with context caching
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
@@ -265,21 +269,25 @@ client.on("messageCreate", async (message) => {
         .trim();
       if (!userMessage) return;
 
-      // Build system prompt with the recent messages and profiles
-      const systemPrompt = await buildSystemPrompt(message.channel.id);
+      // Get or create the cached context
+      const cache = await createOrUpdateCache(message.channel.id);
 
-      const prompt = `${systemPrompt}\n Respond to this specific message: (${message.author.username}): ${userMessage}`;
+      // Use the cached context to create a GenerativeModel
+      const genModel = genAI.getGenerativeModelFromCachedContent(cache);
 
-      console.log("Sending prompt to chat model (gemini-1.5-flash):\n", prompt);
+      // Generate content using the cached context
+      const result = await genModel.generateContent({
+        contents: [{ role: "user", parts: [{ text: userMessage }] }],
+      });
 
-      const reply = await callGeminiAPI(prompt, CHAT_MODEL_URL);
+      const reply = result.response.text();
 
-      // Introduce a 500ms delay before sending the response
+      // Introduce a delay before sending the response
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
       message.reply(reply);
 
-      console.log("Reply from Gemini API:\n", message);
+      console.log("Reply from Gemini API:\n", reply);
 
       // Update the message cache
       await updateMessageCache(message, reply, new Date(), botMention);
