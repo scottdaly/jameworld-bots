@@ -171,7 +171,7 @@ async function buildSystemPrompt(channelId) {
     client.release();
   }
 
-  prompt += `Keep your responses concise unless asked otherwise. Never use emojis.`;
+  prompt += `Keep your responses concise unless asked otherwise. Never use emojis. Don't ask any questions.`;
   console.log("Generated system prompt:", prompt);
   return prompt;
 }
