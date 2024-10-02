@@ -172,17 +172,36 @@ async function buildSystemPrompt(channelId) {
 async function callOpenAIAPI(
   systemPrompt,
   userMessage,
-  isProfileGeneration = false
+  isProfileGeneration = false,
+  imageUrl = null
 ) {
   const model = isProfileGeneration ? "gpt-4o" : "gpt-4o-mini";
-  const response = await openai.chat.completions.create({
-    model: model,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: `${userMessage}` },
-    ],
-    max_tokens: 4000,
-  });
+  let response;
+  if (imageUrl) {
+    response = await openai.chat.completions.create({
+      model: model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `${userMessage}` },
+      ],
+      max_tokens: 4000,
+    });
+  } else {
+    response = await openai.chat.completions.create({
+      model: model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `${userMessage}` },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+      max_tokens: 4000,
+    });
+  }
 
   console.log("OpenAI API response:", response);
   return response.choices[0].message.content;
@@ -227,32 +246,47 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// Function to handle text and image messages
 client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+
   try {
-    if (message.author.bot) return;
+    const botMention = `<@${client.user.id}>`;
+    const botNicknameMention = `<@!${client.user.id}>`;
+    let userMessage = message.content
+      .replace(botMention, "")
+      .replace(botNicknameMention, "")
+      .trim();
 
-    if (message.mentions.has(client.user)) {
-      const botMention = `<@${client.user.id}>`;
-      const botNicknameMention = `<@!${client.user.id}>`;
-      let userMessage = message.content
-        .replace(botMention, "")
-        .replace(botNicknameMention, "")
-        .trim();
-      if (!userMessage) return;
+    const systemPrompt = await buildSystemPrompt(message.channel.id);
 
-      const systemPrompt = await buildSystemPrompt(message.channel.id);
+    // Check if the message contains an image attachment
+    if (message.attachments.size > 0) {
+      const imageAttachment = message.attachments.first();
+      const imageUrl = imageAttachment.url;
 
-      console.log("Sending prompt to OpenAI:", systemPrompt);
+      console.log(`Image URL detected: ${imageUrl}`);
 
+      // Call the GPT-4o-mini API for image analysis
+      // const imageAnalysis = await analyzeImage(imageUrl, systemPrompt);
+
+      const reply = await callOpenAIAPI(
+        systemPrompt,
+        userMessage,
+        false,
+        imageUrl
+      );
+
+      // Reply with the image analysis result
+      await message.reply(reply);
+
+      // Update message cache if needed
+      await updateMessageCache(message, reply, new Date(), botMention);
+    } else if (userMessage) {
+      // If no image, continue with normal text-based interaction
       const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
-      // Get a random number of seconds between 1 and 5
-      let replyTime = Math.floor(Math.random() * 4000) + 1000;
-      // Introduce a delay before sending the response
-      await new Promise((resolve) => setTimeout(resolve, replyTime));
-
-      message.reply(reply);
-
+      await message.reply(reply);
       await updateMessageCache(message, reply, new Date(), botMention);
     }
   } catch (error) {
