@@ -2,10 +2,8 @@ require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
 const fetch = require("node-fetch");
 const { Pool } = require("pg");
-const {
-  GoogleGenerativeAI,
-  GoogleAICacheManager,
-} = require("@google/generative-ai");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleAICacheManager } = require("@google/generative-ai/server");
 
 const client = new Client({
   intents: [
@@ -18,8 +16,8 @@ const client = new Client({
 });
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const CHAT_MODEL = "gemini-1.5-flash-001";
-const PROFILE_MODEL = "gemini-1.5-pro-001";
+const CHAT_MODEL = "gemini-1.5-flash-002";
+const PROFILE_MODEL = "gemini-1.5-pro-002";
 
 // Initialize GoogleGenerativeAI and GoogleAICacheManager
 const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
