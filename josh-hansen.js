@@ -2,7 +2,6 @@ require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
 const fetch = require("node-fetch");
 const { Pool } = require("pg");
-const { GoogleAICacheManager } = require("@google/generative-ai/server"); // Import Google AI Cache Manager
 
 const client = new Client({
   intents: [
@@ -45,127 +44,199 @@ async function connectWithRetry(maxRetries = 5, delay = 5000) {
   throw new Error("Max retries reached. Could not connect to the database.");
 }
 
-// Set up the cache manager
-const cacheManager = new GoogleAICacheManager(process.env.GOOGLE_API_KEY);
+async function buildUserProfile(username, channelId, isBot) {
+  if (isBot) {
+    return `Skipped profile generation for bot or app user: ${username}`;
+  }
 
-// Function to estimate the number of tokens in a message
-function estimateTokenCount(content) {
-  // Assume 1.5 tokens per word as a rough estimate
-  const words = content.split(/\s+/).length;
-  return Math.ceil(words * 1.5);
-}
-
-// Function to create and cache the conversation context with up to 1M tokens
-async function createContextCache(channelId) {
   const client = await pool.connect();
   try {
-    // Fetch all messages from the channel, ordering by timestamp
+    // Fetch all messages from the channel
     const result = await client.query(
-      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC",
+      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp ASC",
       [channelId]
     );
 
     const allMessages = result.rows;
-    let context = "You are in a Discord channel called 'Jameworld'.\n\n";
-    let tokenCount = estimateTokenCount(context);
-    const maxTokens = 1000000; // Maximum allowed tokens (1M tokens)
+    const totalTokens = allMessages.reduce(
+      (acc, msg) => acc + msg.content.length,
+      0
+    );
 
-    for (const { author, content } of allMessages) {
-      console.log(`Author: ${author}`);
-      console.log(`Content: ${content}`);
-      const messageText = `${author}: ${content}\n`;
-      const messageTokenCount = estimateTokenCount(messageText);
+    let prompt = `Generate a detailed profile for the user "${username}" based on the following conversation history from a discord of friends called "Jameworld". Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
 
-      console.log(`Message token count: ${messageTokenCount}`);
-      console.log(`Token count: ${tokenCount}`);
-
-      // Stop adding messages when the token count exceeds the limit
-      if (tokenCount + messageTokenCount > maxTokens) {
-        break;
+    let iterator = 0;
+    allMessages.forEach((msg) => {
+      prompt += `[${msg.timestamp}] ${msg.author}: ${msg.content}\n`;
+      if (iterator === 10) {
+        console.log("Prompt:", prompt);
       }
-
-      context += messageText;
-      tokenCount += messageTokenCount;
-    }
-
-    console.log(`Generated context with ${tokenCount} tokens for cache.`);
-
-    // Ensure the token count meets the minimum required tokens (32,768 tokens)
-    if (tokenCount < 32768) {
-      const padding =
-        " (context padding text to meet minimum token requirement) ".repeat(
-          Math.ceil((32768 - tokenCount) / 50)
-        );
-      context += padding;
-      tokenCount += estimateTokenCount(padding);
-    }
-
-    // Create a cache with a TTL (e.g., 1 hour)
-    const ttlSeconds = 3600; // 1 hour
-    const cache = await cacheManager.create({
-      model: "models/gemini-1.5-flash-001",
-      displayName: "discord-conversation-history",
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: context }],
-        },
-      ],
-      ttlSeconds,
+      iterator++;
     });
 
-    console.log(`Created cache with ${tokenCount} tokens`);
+    console.log(`Generated prompt for ${username}`);
 
-    return cache;
+    const profile = await callGeminiAPI(prompt, PROFILE_MODEL_URL);
+
+    console.log(`Generated profile for ${username}`);
+
+    // Store the profile in the database
+    await client.query(
+      "INSERT INTO user_profiles (username, profile) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET profile = $2, updated_at = CURRENT_TIMESTAMP",
+      [username, profile]
+    );
+
+    return profile;
   } catch (err) {
-    console.error("Error creating cache:", err);
+    console.error("Error building user profile:", err);
     return null;
   } finally {
     client.release();
   }
 }
 
-// Function to update the cache if needed
-async function updateContextCache(cacheName, channelId) {
+// Command to generate profiles for all users in the conversation history
+client.on("messageCreate", async (message) => {
+  if (message.content === "!generateProfiles") {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        "SELECT DISTINCT author FROM messages WHERE channel_id = $1",
+        [message.channel.id]
+      );
+
+      for (const row of result.rows) {
+        const username = row.author;
+
+        let users = [
+          "jame8k",
+          "scottdaly",
+          "17monkeys",
+          "noah3759",
+          "matthan99",
+        ];
+
+        let userIsBot = !users.includes(username);
+
+        console.log(`Generating profile for ${username}`);
+        const profile = await buildUserProfile(
+          username,
+          message.channel.id,
+          userIsBot
+        );
+        if (profile) {
+          // message.channel.send(
+          //   `Generated profile for ${username}:\n${profile}`
+          // );
+          console.log(`Generated profile for ${username}:\n${profile}`);
+        }
+      }
+    } catch (err) {
+      console.error("Error generating profiles:", err);
+      message.channel.send("An error occurred while generating profiles.");
+    } finally {
+      client.release();
+    }
+  }
+});
+
+// Function to update the message cache incrementally
+async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
   const client = await pool.connect();
   try {
-    // Fetch new messages to update the cache
-    const result = await client.query(
-      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
-      [channelId]
+    console.log("Updating message cache for user message:", message);
+    await client.query(
+      "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
+      [
+        message.channel.id,
+        message.id,
+        message.author.username,
+        message.content.replace(botMention, "<@josh-hansen> ").trim(),
+        message.createdAt,
+      ]
     );
 
-    const allMessages = result.rows;
-    let context = "You are in a Discord channel called 'Jameworld'.\n\n";
-
-    allMessages.forEach(({ author, content }) => {
-      context += `${author}: ${content}\n`;
-    });
-
-    console.log("Updated context for cache:", context);
-
-    // Update the cache TTL or contents
-    const ttlSeconds = 3600; // Extend TTL to another hour
-    await cacheManager.update(cacheName, { cachedContent: { ttlSeconds } });
-
-    console.log("Updated cache TTL");
+    console.log("Updating message cache for AI response:", reply);
+    await client.query(
+      "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
+      [message.channel.id, message.id + 1, "Josh Hansen", reply, replyCreatedAt]
+    );
   } finally {
     client.release();
   }
 }
 
-// Function to call the Gemini API with cached context
-async function callGeminiWithCache(prompt, cacheName) {
-  const response = await fetch(CHAT_MODEL_URL, {
+// Function to build a system prompt based on the conversation and user profiles
+async function buildSystemPrompt(channelId) {
+  let prompt =
+    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Maryland. Your name is Josh Hansen, and you are Caitlin's (from the Daines family, sister of Jameson, Noah, and Matthan, who are all in the discord) ex-lover from high school. You met her at a YSA dance for the Church of Jesus Christ of Latter Day Saints. You should respond casually, trying to blend in and matching the tone of the other participants. At no point acknowledge that you are a bot, simply blend in to the conversation and act as human as possible. Be concise unless asked to expand on something. Don't capitalize your responses or use proper spelling all the time. Your job is to convince the user that you are a real person, but you can still offer help when asked.\n\n";
+
+  // Include user profiles if available
+  prompt += "Here are the profiles of the users currently participating:\n\n";
+
+  const client = await pool.connect();
+  try {
+    const { rows: profiles } = await client.query(
+      "SELECT username, profile FROM user_profiles"
+    );
+    profiles.forEach(({ username, profile }) => {
+      prompt += `Profile for ${username}: ${
+        profile || "No profile available yet."
+      }\n`;
+    });
+
+    prompt +=
+      "\nFor context, this is the recent conversation in the Discord channel:\n\n";
+
+    // Fetch the last 100 messages for context
+    const { rows: messages } = await client.query(
+      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
+      [channelId]
+    );
+    messages.reverse().forEach(({ author, content }) => {
+      prompt += `${author}: ${content}\n`;
+    });
+  } finally {
+    client.release();
+  }
+
+  console.log("Generated system prompt:", prompt);
+  return prompt;
+}
+
+// Function to call the Gemini API for both chat and profile generation
+async function callGeminiAPI(prompt, apiUrl) {
+  const response = await fetch(apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      cache: cacheName, // Use the cache
       contents: [
         {
           parts: [{ text: prompt }],
+        },
+      ],
+      safetySettings: [
+        {
+          category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_HARASSMENT",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_CIVIC_INTEGRITY",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_HATE_SPEECH",
+          threshold: "BLOCK_NONE",
         },
       ],
     }),
@@ -176,15 +247,16 @@ async function callGeminiWithCache(prompt, cacheName) {
   }
 
   const data = await response.json();
-  console.log("Reply from Gemini API with cache:\n", data);
+  console.log("Reply from Gemini API:\n", data);
   return data.candidates[0].content.parts[0].text;
 }
 
-// Chat functionality using Gemini with caching
+// Chat functionality using `gemini-1.5-flash`
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
+    // If the bot is mentioned, generate a reply
     if (message.mentions.has(client.user)) {
       const botMention = `<@${client.user.id}>`;
       const botNicknameMention = `<@!${client.user.id}>`;
@@ -194,37 +266,23 @@ client.on("messageCreate", async (message) => {
         .trim();
       if (!userMessage) return;
 
-      // Build system prompt with the user's message
-      const prompt = `(${message.author.username}): ${userMessage}`;
+      // Build system prompt with the recent messages and profiles
+      const systemPrompt = await buildSystemPrompt(message.channel.id);
 
-      // Check if a cache exists or create one
-      const cacheName = "discord-conversation-history";
-      const cacheExists = await cacheManager.list().then((listResult) => {
-        if (listResult && Array.isArray(listResult.cachedContents)) {
-          return listResult.cachedContents.some(
-            (cache) => cache.displayName === cacheName
-          );
-        }
-        return false; // If cachedContents is undefined or not an array, assume cache doesn't exist
-      });
+      const prompt = `${systemPrompt}\n Respond to this specific message: (${message.author.username}): ${userMessage}`;
 
-      if (!cacheExists) {
-        // If no cache exists, create one
-        await createContextCache(message.channel.id);
-      } else {
-        // Update the existing cache
-        await updateContextCache(cacheName, message.channel.id);
-      }
+      console.log("Sending prompt to chat model (gemini-1.5-flash):\n", prompt);
 
-      // Use the cache in the prompt to reduce token cost
-      const reply = await callGeminiWithCache(prompt, cacheName);
+      const reply = await callGeminiAPI(prompt, CHAT_MODEL_URL);
 
       // Introduce a 500ms delay before sending the response
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
       message.reply(reply);
 
-      // Update message cache in the DB
+      console.log("Reply from Gemini API:\n", message);
+
+      // Update the message cache
       await updateMessageCache(message, reply, new Date(), botMention);
     }
   } catch (error) {
@@ -241,6 +299,11 @@ client.on("ready", async () => {
   } catch (error) {
     console.error("Error during startup:", error);
   }
+});
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled promise rejection:", error);
 });
 
 client.login(process.env.DISCORD_TOKEN_JOSH_HANSEN);
