@@ -115,7 +115,7 @@ async function updateMessageCache(
         message.channel.id,
         message.id,
         message.author.username,
-        message.content,
+        message.content.replace(botMention, "<@almighty-zuck> ").trim(),
         message.createdAt,
       ]
     );
@@ -215,8 +215,6 @@ async function callOpenAIAPI(
   }
 
   console.log("OpenAI API response:", response);
-
-  console.log("OpenAI API response message:", response.choices[0].message);
 
   return response.choices[0].message.content;
 }
@@ -329,6 +327,10 @@ client.on("messageCreate", async (message) => {
         // If no image, continue with normal text-based interaction
         const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
+        // Get a random number of seconds between 1 and 5
+        let replyTime = Math.floor(Math.random() * 4000) + 1000;
+        // Introduce a delay before sending the response
+        await new Promise((resolve) => setTimeout(resolve, replyTime));
         await message.reply(reply);
         await updateMessageCache(message, true, reply, new Date(), botMention);
       }
