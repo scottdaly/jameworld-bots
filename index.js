@@ -178,6 +178,7 @@ async function callOpenAIAPI(
   const model = isProfileGeneration ? "gpt-4o" : "gpt-4o-mini";
   let response;
   if (imageUrl) {
+    console.log("Calling OpenAI API with image");
     response = await openai.chat.completions.create({
       model: model,
       messages: [
@@ -187,6 +188,7 @@ async function callOpenAIAPI(
       max_tokens: 4000,
     });
   } else {
+    console.log("Calling OpenAI API without image");
     response = await openai.chat.completions.create({
       model: model,
       messages: [
