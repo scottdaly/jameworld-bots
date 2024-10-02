@@ -190,7 +190,7 @@ async function buildSystemPrompt(channelId) {
 
     // Fetch the last 100 messages for context
     const { rows: messages } = await client.query(
-      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
+      "SELECT author, content FROM messages ORDER BY timestamp DESC LIMIT 100",
       [channelId]
     );
     messages.reverse().forEach(({ author, content }) => {
