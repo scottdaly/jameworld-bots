@@ -322,7 +322,7 @@ client.on("messageCreate", async (message) => {
         await message.reply(reply);
 
         // Update message cache if needed
-        await updateMessageCache(message, reply, new Date(), botMention);
+        await updateMessageCache(message, true, reply, new Date(), botMention);
       } else if (userMessage) {
         // If no image, continue with normal text-based interaction
         const reply = await callOpenAIAPI(systemPrompt, userMessage);
