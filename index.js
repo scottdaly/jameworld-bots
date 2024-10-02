@@ -183,7 +183,13 @@ async function callOpenAIAPI(
       model: model,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: `${userMessage}` },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `${userMessage}` },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
       ],
       max_tokens: 4000,
     });
@@ -193,13 +199,8 @@ async function callOpenAIAPI(
       model: model,
       messages: [
         { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: `${userMessage}` },
-            { type: "image_url", image_url: { url: imageUrl } },
-          ],
-        },
+
+        { role: "user", content: `${userMessage}` },
       ],
       max_tokens: 4000,
     });
