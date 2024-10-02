@@ -178,7 +178,8 @@ async function callOpenAIAPI(
   const model = isProfileGeneration ? "gpt-4o" : "gpt-4o-mini";
   let response;
   if (imageUrl) {
-    console.log("Calling OpenAI API with image");
+    console.log("Calling OpenAI API with image", imageUrl);
+    console.log("Calling OpeanAI API with model", model);
     response = await openai.chat.completions.create({
       model: model,
       messages: [
@@ -199,7 +200,6 @@ async function callOpenAIAPI(
       model: model,
       messages: [
         { role: "system", content: systemPrompt },
-
         { role: "user", content: `${userMessage}` },
       ],
       max_tokens: 4000,
@@ -207,6 +207,9 @@ async function callOpenAIAPI(
   }
 
   console.log("OpenAI API response:", response);
+
+  console.log("OpenAI API response message:", response.choices[0].message);
+
   return response.choices[0].message.content;
 }
 
@@ -229,6 +232,33 @@ async function callOpenAIAPI(
 //     }
 //   }
 // });
+
+client.on("messageCreate", async (message) => {
+  if (message.content.toLowerCase() === "!testImageAI") {
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "What’s in this image?" },
+              {
+                type: "image_url",
+                image_url: {
+                  url: "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+                },
+              },
+            ],
+          },
+        ],
+      });
+      console.log(response.choices[0]);
+    } catch (error) {
+      console.error("Error in !testImageAI command:", error);
+    }
+  }
+});
 
 // Test command to check user profiles
 client.on("messageCreate", async (message) => {
