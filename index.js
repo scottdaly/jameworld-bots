@@ -234,7 +234,7 @@ async function callOpenAIAPI(
 // });
 
 client.on("messageCreate", async (message) => {
-  if (message.content.toLowerCase() === "!testImageAI") {
+  if (message.content.toLowerCase() === "!testimageai") {
     console.log("Test Image AI command received");
     try {
       const response = await openai.chat.completions.create({
@@ -284,48 +284,50 @@ client.on("messageCreate", async (message) => {
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
-  try {
-    const botMention = `<@${client.user.id}>`;
-    const botNicknameMention = `<@!${client.user.id}>`;
-    let userMessage = message.content
-      .replace(botMention, "")
-      .replace(botNicknameMention, "")
-      .trim();
+  if (message.mentions.has(client.user)) {
+    try {
+      const botMention = `<@${client.user.id}>`;
+      const botNicknameMention = `<@!${client.user.id}>`;
+      let userMessage = message.content
+        .replace(botMention, "")
+        .replace(botNicknameMention, "")
+        .trim();
 
-    const systemPrompt = await buildSystemPrompt(message.channel.id);
+      const systemPrompt = await buildSystemPrompt(message.channel.id);
 
-    // Check if the message contains an image attachment
-    if (message.attachments.size > 0) {
-      const imageAttachment = message.attachments.first();
-      const imageUrl = imageAttachment.url;
+      // Check if the message contains an image attachment
+      if (message.attachments.size > 0) {
+        const imageAttachment = message.attachments.first();
+        const imageUrl = imageAttachment.url;
 
-      console.log(`Image URL detected: ${imageUrl}`);
+        console.log(`Image URL detected: ${imageUrl}`);
 
-      // Call the GPT-4o-mini API for image analysis
-      // const imageAnalysis = await analyzeImage(imageUrl, systemPrompt);
+        // Call the GPT-4o-mini API for image analysis
+        // const imageAnalysis = await analyzeImage(imageUrl, systemPrompt);
 
-      const reply = await callOpenAIAPI(
-        systemPrompt,
-        userMessage,
-        false,
-        imageUrl
-      );
+        const reply = await callOpenAIAPI(
+          systemPrompt,
+          userMessage,
+          false,
+          imageUrl
+        );
 
-      // Reply with the image analysis result
-      await message.reply(reply);
+        // Reply with the image analysis result
+        await message.reply(reply);
 
-      // Update message cache if needed
-      await updateMessageCache(message, reply, new Date(), botMention);
-    } else if (userMessage) {
-      // If no image, continue with normal text-based interaction
-      const reply = await callOpenAIAPI(systemPrompt, userMessage);
+        // Update message cache if needed
+        await updateMessageCache(message, reply, new Date(), botMention);
+      } else if (userMessage) {
+        // If no image, continue with normal text-based interaction
+        const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
-      await message.reply(reply);
-      await updateMessageCache(message, reply, new Date(), botMention);
+        await message.reply(reply);
+        await updateMessageCache(message, reply, new Date(), botMention);
+      }
+    } catch (error) {
+      console.error("Error handling message:", error);
+      message.reply("Sorry, an error occurred while processing your request.");
     }
-  } catch (error) {
-    console.error("Error handling message:", error);
-    message.reply("Sorry, an error occurred while processing your request.");
   }
 });
 
