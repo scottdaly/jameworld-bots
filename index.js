@@ -100,7 +100,7 @@ async function fetchAndSaveMessages(channel) {
 }
 
 // Function to update the message cache incrementally
-async function updateMessageCache(message) {
+async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
   const client = await pool.connect();
   try {
     await client.query(
@@ -113,6 +113,17 @@ async function updateMessageCache(message) {
         message.createdAt,
       ]
     );
+
+    await client.query(
+      "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
+      [
+        message.channel.id,
+        message.id + 1,
+        "Almighty Zuck",
+        reply,
+        replyCreatedAt,
+      ]
+    );
   } finally {
     client.release();
   }
@@ -121,7 +132,7 @@ async function updateMessageCache(message) {
 // Function to build a system prompt based on the conversation and user profiles
 async function buildSystemPrompt(channelId) {
   let prompt =
-    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland. Your name is G. Don't use emojis. Be friendly and respond casually, matching the tone of the other participants, but also be helpful and informative when asked. Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants.\n\n";
+    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland. Your name is Almighty Zuck, and you are the CEO of Meta. Don't use emojis. Be friendly and respond casually, matching the tone of the other participants, but also be helpful and informative when asked. Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants.\n\n";
 
   // Include user profiles if available
   prompt += "Here are the profiles of the users currently participating:\n\n";
@@ -242,7 +253,7 @@ client.on("messageCreate", async (message) => {
 
       message.reply(reply);
 
-      await updateMessageCache(message);
+      await updateMessageCache(message, reply, new Date(), botMention);
     }
   } catch (error) {
     console.error("Error handling message:", error);
