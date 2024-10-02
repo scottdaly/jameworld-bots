@@ -337,6 +337,7 @@ client.on("messageCreate", async (message) => {
       message.reply("Sorry, an error occurred while processing your request.");
     }
   } else {
+    console.log("Message not mentioned, saving message to cache");
     await updateMessageCache(message, false);
   }
 });
