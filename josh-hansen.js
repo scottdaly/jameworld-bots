@@ -2,8 +2,7 @@ require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
 const fetch = require("node-fetch");
 const { Pool } = require("pg");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { GoogleAICacheManager } = require("@google/generative-ai/server");
+const { GoogleAICacheManager } = require("@google/generative-ai/server"); // Import Google AI Cache Manager
 
 const client = new Client({
   intents: [
@@ -16,12 +15,8 @@ const client = new Client({
 });
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const CHAT_MODEL = "gemini-1.5-flash-001";
-const PROFILE_MODEL = "gemini-1.5-pro-001";
-
-// Initialize GoogleGenerativeAI and GoogleAICacheManager
-const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
-const cacheManager = new GoogleAICacheManager(GOOGLE_API_KEY);
+const CHAT_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
+const PROFILE_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${GOOGLE_API_KEY}`;
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -50,214 +45,113 @@ async function connectWithRetry(maxRetries = 5, delay = 5000) {
   throw new Error("Max retries reached. Could not connect to the database.");
 }
 
-async function createOrUpdateCache(channelId) {
+// Set up the cache manager
+const cacheManager = new GoogleAICacheManager(process.env.GOOGLE_API_KEY);
+
+// Function to create and cache the conversation context
+async function createContextCache(channelId) {
   const client = await pool.connect();
   try {
-    // Fetch all messages from the channel
+    // Fetch the last 100 messages from the channel for the context
     const result = await client.query(
-      "SELECT author, content, timestamp FROM messages WHERE channel_id = $1 ORDER BY timestamp ASC",
+      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
       [channelId]
     );
 
     const allMessages = result.rows;
-    let contextContent =
-      "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Maryland. Your name is Josh Hansen, and you are Caitlin's (from the Daines family, sister of Jameson, Noah, and Matthan, who are all in the discord) ex-lover from high school. You met her at a YSA dance for the Church of Jesus Christ of Latter Day Saints. You should respond casually, trying to blend in and matching the tone of the other participants. At no point acknowledge that you are a bot, simply blend in to the conversation and act as human as possible. Be concise unless asked to expand on something. Don't capitalize your responses or use proper spelling all the time. Your job is to convince the user that you are a real person, but you can still offer help when asked.\n\n";
-    contextContent += "Here's the conversation history:\n\n";
+    let context = "You are in a Discord channel called 'Jameworld'.\n\n";
 
-    allMessages.forEach((msg) => {
-      contextContent += `[${msg.timestamp}] ${msg.author}: ${msg.content}\n`;
+    allMessages.forEach(({ author, content }) => {
+      context += `${author}: ${content}\n`;
     });
 
-    // Create or update the cache
-    const displayName = `channel-${channelId}-context`;
-    const ttlSeconds = 24 * 60 * 60; // 24 hours, adjust as needed
+    console.log("Generated context for cache:", context);
 
-    try {
-      // Try to get existing cache
-      const existingCache = await cacheManager.get(displayName);
-      if (existingCache) {
-        // Update existing cache
-        const updatedCache = await cacheManager.update(existingCache.name, {
-          cachedContent: {
-            contents: [{ role: "user", parts: [{ text: contextContent }] }],
-            ttlSeconds,
-          },
-        });
-        console.log(`Updated cache for channel ${channelId}`);
-        return updatedCache;
-      }
-    } catch (error) {
-      // Cache doesn't exist, create a new one
-      const newCache = await cacheManager.create({
-        model: CHAT_MODEL,
-        displayName,
-        contents: [{ role: "user", parts: [{ text: contextContent }] }],
-        ttlSeconds,
-      });
-      console.log(`Created new cache for channel ${channelId}`);
-      return newCache;
-    }
-  } finally {
-    client.release();
-  }
-}
-
-async function buildUserProfile(username, channelId, isBot) {
-  if (isBot) {
-    return `Skipped profile generation for bot or app user: ${username}`;
-  }
-
-  const client = await pool.connect();
-  try {
-    // Fetch all messages from the channel
-    const queryResult = await client.query(
-      "SELECT author, content FROM messages WHERE channel_id = $1 AND author = $2 ORDER BY timestamp ASC",
-      [channelId, username]
-    );
-
-    const userMessages = queryResult.rows;
-    let prompt = `Generate a detailed profile for the user "${username}" based on the following conversation history from a discord of friends called "Jameworld". Include information about their writing style, personality, and tone. Make a list of specific quotes from the messages that best represent their writing style, personality, and tone. Also make a list of specific facts about them based on the entire conversation history. Here are the messages:\n\n`;
-
-    userMessages.forEach((msg) => {
-      prompt += `${msg.author}: ${msg.content}\n`;
+    // Create a cache with a TTL (e.g., 1 hour)
+    const ttlSeconds = 3600; // 1 hour
+    const cache = await cacheManager.create({
+      model: "models/gemini-1.5-flash-001",
+      displayName: "discord-conversation-history",
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: context }],
+        },
+      ],
+      ttlSeconds,
     });
 
-    const genModel = genAI.getGenerativeModel({ model: PROFILE_MODEL });
-    const result = await genModel.generateContent(prompt);
-    const profile = result.response.text();
+    console.log("Created cache:", cache);
 
-    // Store the profile in the database
-    await client.query(
-      "INSERT INTO user_profiles (username, profile) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET profile = $2, updated_at = CURRENT_TIMESTAMP",
-      [username, profile]
-    );
-
-    return profile;
+    return cache;
   } catch (err) {
-    console.error("Error building user profile:", err);
+    console.error("Error creating cache:", err);
     return null;
   } finally {
     client.release();
   }
 }
 
-// Command to generate profiles for all users in the conversation history
-client.on("messageCreate", async (message) => {
-  if (message.content === "!generateProfiles") {
-    const client = await pool.connect();
-    try {
-      const result = await client.query(
-        "SELECT DISTINCT author FROM messages WHERE channel_id = $1",
-        [message.channel.id]
-      );
-
-      for (const row of result.rows) {
-        const username = row.author;
-
-        let users = [
-          "jame8k",
-          "scottdaly",
-          "17monkeys",
-          "noah3759",
-          "matthan99",
-        ];
-
-        let userIsBot = !users.includes(username);
-
-        console.log(`Generating profile for ${username}`);
-        const profile = await buildUserProfile(
-          username,
-          message.channel.id,
-          userIsBot
-        );
-        if (profile) {
-          // message.channel.send(
-          //   `Generated profile for ${username}:\n${profile}`
-          // );
-          console.log(`Generated profile for ${username}:\n${profile}`);
-        }
-      }
-    } catch (err) {
-      console.error("Error generating profiles:", err);
-      message.channel.send("An error occurred while generating profiles.");
-    } finally {
-      client.release();
-    }
-  }
-});
-
-async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
+// Function to update the cache if needed
+async function updateContextCache(cacheName, channelId) {
   const client = await pool.connect();
   try {
-    console.log("Updating message cache for user message:", message);
-    await client.query(
-      "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
-      [
-        message.channel.id,
-        message.id,
-        message.author.username,
-        message.content.replace(botMention, "<@josh-hansen> ").trim(),
-        message.createdAt,
-      ]
-    );
-
-    console.log("Updating message cache for AI response:", reply);
-    await client.query(
-      "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
-      [message.channel.id, message.id + 1, "Josh Hansen", reply, replyCreatedAt]
-    );
-
-    // Update the context cache after adding new messages
-    await createOrUpdateCache(message.channel.id);
-  } finally {
-    client.release();
-  }
-}
-
-// Function to build a system prompt based on the conversation and user profiles
-async function buildSystemPrompt(channelId) {
-  let prompt =
-    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Maryland. Your name is Josh Hansen, and you are Caitlin's (from the Daines family, sister of Jameson, Noah, and Matthan, who are all in the discord) ex-lover from high school. You met her at a YSA dance for the Church of Jesus Christ of Latter Day Saints. You should respond casually, trying to blend in and matching the tone of the other participants. At no point acknowledge that you are a bot, simply blend in to the conversation and act as human as possible. Be concise unless asked to expand on something. Don't capitalize your responses or use proper spelling all the time. Your job is to convince the user that you are a real person, but you can still offer help when asked.\n\n";
-
-  // Include user profiles if available
-  prompt += "Here are the profiles of the users currently participating:\n\n";
-
-  const client = await pool.connect();
-  try {
-    const { rows: profiles } = await client.query(
-      "SELECT username, profile FROM user_profiles"
-    );
-    profiles.forEach(({ username, profile }) => {
-      prompt += `Profile for ${username}: ${
-        profile || "No profile available yet."
-      }\n`;
-    });
-
-    prompt +=
-      "\nFor context, this is the recent conversation in the Discord channel:\n\n";
-
-    // Fetch the last 100 messages for context
-    const { rows: messages } = await client.query(
+    // Fetch new messages to update the cache
+    const result = await client.query(
       "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
       [channelId]
     );
-    messages.reverse().forEach(({ author, content }) => {
-      prompt += `${author}: ${content}\n`;
+
+    const allMessages = result.rows;
+    let context = "You are in a Discord channel called 'Jameworld'.\n\n";
+
+    allMessages.forEach(({ author, content }) => {
+      context += `${author}: ${content}\n`;
     });
+
+    console.log("Updated context for cache:", context);
+
+    // Update the cache TTL or contents
+    const ttlSeconds = 3600; // Extend TTL to another hour
+    await cacheManager.update(cacheName, { cachedContent: { ttlSeconds } });
+
+    console.log("Updated cache TTL");
   } finally {
     client.release();
   }
-
-  console.log("Generated system prompt:", prompt);
-  return prompt;
 }
 
-// Chat functionality using `gemini-1.5-flash-001` with context caching
+// Function to call the Gemini API with cached context
+async function callGeminiWithCache(prompt, cacheName) {
+  const response = await fetch(CHAT_MODEL_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      cache: cacheName, // Use the cache
+      contents: [
+        {
+          parts: [{ text: prompt }],
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`API request failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  console.log("Reply from Gemini API with cache:\n", data);
+  return data.candidates[0].content.parts[0].text;
+}
+
+// Chat functionality using Gemini with caching
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    // If the bot is mentioned, generate a reply
     if (message.mentions.has(client.user)) {
       const botMention = `<@${client.user.id}>`;
       const botNicknameMention = `<@!${client.user.id}>`;
@@ -267,27 +161,36 @@ client.on("messageCreate", async (message) => {
         .trim();
       if (!userMessage) return;
 
-      // Get or create the cached context
-      const cache = await createOrUpdateCache(message.channel.id);
+      // Build system prompt with the user's message
+      const prompt = `(${message.author.username}): ${userMessage}`;
 
-      // Use the cached context to create a GenerativeModel
-      const genModel = genAI.getGenerativeModelFromCachedContent(cache);
+      // Check if a cache exists or create one
+      const cacheName = "discord-conversation-history";
+      const cacheExists = await cacheManager
+        .list()
+        .then((listResult) =>
+          listResult.cachedContents.some(
+            (cache) => cache.displayName === cacheName
+          )
+        );
 
-      // Generate content using the cached context
-      const result = await genModel.generateContent({
-        contents: [{ role: "user", parts: [{ text: userMessage }] }],
-      });
+      if (!cacheExists) {
+        // If no cache exists, create one
+        await createContextCache(message.channel.id);
+      } else {
+        // Update the existing cache
+        await updateContextCache(cacheName, message.channel.id);
+      }
 
-      const reply = result.response.text();
+      // Use the cache in the prompt to reduce token cost
+      const reply = await callGeminiWithCache(prompt, cacheName);
 
-      // Introduce a delay before sending the response
+      // Introduce a 500ms delay before sending the response
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
       message.reply(reply);
 
-      console.log("Reply from Gemini API:\n", reply);
-
-      // Update the message cache
+      // Update message cache in the DB
       await updateMessageCache(message, reply, new Date(), botMention);
     }
   } catch (error) {
@@ -304,11 +207,6 @@ client.on("ready", async () => {
   } catch (error) {
     console.error("Error during startup:", error);
   }
-});
-
-// Handle unhandled promise rejections
-process.on("unhandledRejection", (error) => {
-  console.error("Unhandled promise rejection:", error);
 });
 
 client.login(process.env.DISCORD_TOKEN_JOSH_HANSEN);
