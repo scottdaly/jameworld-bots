@@ -71,8 +71,13 @@ async function createContextCache(channelId) {
     const maxTokens = 1000000; // Maximum allowed tokens (1M tokens)
 
     for (const { author, content } of allMessages) {
+      console.log(`Author: ${author}`);
+      console.log(`Content: ${content}`);
       const messageText = `${author}: ${content}\n`;
       const messageTokenCount = estimateTokenCount(messageText);
+
+      console.log(`Message token count: ${messageTokenCount}`);
+      console.log(`Token count: ${tokenCount}`);
 
       // Stop adding messages when the token count exceeds the limit
       if (tokenCount + messageTokenCount > maxTokens) {
