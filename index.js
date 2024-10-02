@@ -235,9 +235,10 @@ async function callOpenAIAPI(
 
 client.on("messageCreate", async (message) => {
   if (message.content.toLowerCase() === "!testImageAI") {
+    console.log("Test Image AI command received");
     try {
       const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-4o",
         messages: [
           {
             role: "user",
