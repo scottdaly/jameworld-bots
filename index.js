@@ -235,7 +235,10 @@ client.on("messageCreate", async (message) => {
 
       const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // Get a random number of seconds between 1 and 5
+      let replyTime = Math.floor(Math.random() * 4000) + 1000;
+      // Introduce a delay before sending the response
+      await new Promise((resolve) => setTimeout(resolve, replyTime));
 
       message.reply(reply);
 
