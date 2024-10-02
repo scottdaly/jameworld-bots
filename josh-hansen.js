@@ -166,13 +166,14 @@ client.on("messageCreate", async (message) => {
 
       // Check if a cache exists or create one
       const cacheName = "discord-conversation-history";
-      const cacheExists = await cacheManager
-        .list()
-        .then((listResult) =>
-          listResult.cachedContents.some(
+      const cacheExists = await cacheManager.list().then((listResult) => {
+        if (listResult && Array.isArray(listResult.cachedContents)) {
+          return listResult.cachedContents.some(
             (cache) => cache.displayName === cacheName
-          )
-        );
+          );
+        }
+        return false; // If cachedContents is undefined or not an array, assume cache doesn't exist
+      });
 
       if (!cacheExists) {
         // If no cache exists, create one
