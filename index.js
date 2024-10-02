@@ -100,7 +100,13 @@ async function fetchAndSaveMessages(channel) {
 }
 
 // Function to update the message cache incrementally
-async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
+async function updateMessageCache(
+  message,
+  isReply,
+  reply = null,
+  replyCreatedAt = null,
+  botMention = null
+) {
   const client = await pool.connect();
   try {
     await client.query(
@@ -114,16 +120,18 @@ async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
       ]
     );
 
-    await client.query(
-      "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
-      [
-        message.channel.id,
-        message.id + 1,
-        "Almighty Zuck",
-        reply,
-        replyCreatedAt,
-      ]
-    );
+    if (isReply) {
+      await client.query(
+        "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
+        [
+          message.channel.id,
+          message.id + 1,
+          "Almighty Zuck",
+          reply,
+          replyCreatedAt,
+        ]
+      );
+    }
   } finally {
     client.release();
   }
@@ -322,12 +330,14 @@ client.on("messageCreate", async (message) => {
         const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
         await message.reply(reply);
-        await updateMessageCache(message, reply, new Date(), botMention);
+        await updateMessageCache(message, true, reply, new Date(), botMention);
       }
     } catch (error) {
       console.error("Error handling message:", error);
       message.reply("Sorry, an error occurred while processing your request.");
     }
+  } else {
+    await updateMessageCache(message, false);
   }
 });
 
