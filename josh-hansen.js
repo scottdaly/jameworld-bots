@@ -16,8 +16,8 @@ const client = new Client({
 });
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const CHAT_MODEL = "gemini-1.5-flash-002";
-const PROFILE_MODEL = "gemini-1.5-pro-002";
+const CHAT_MODEL = "gemini-1.5-flash";
+const PROFILE_MODEL = "gemini-1.5-pro-001";
 
 // Initialize GoogleGenerativeAI and GoogleAICacheManager
 const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
