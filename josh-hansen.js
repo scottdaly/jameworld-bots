@@ -16,12 +16,14 @@ const client = new Client({
 });
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const CHAT_MODEL = "gemini-1.5-flash";
+const CHAT_MODEL = "gemini-1.5-flash-001";
 const PROFILE_MODEL = "gemini-1.5-pro-001";
 
 // Initialize GoogleGenerativeAI and GoogleAICacheManager
 const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
 const cacheManager = new GoogleAICacheManager(GOOGLE_API_KEY);
+
+console.log("Models", GoogleGenerativeAI.listModels());
 
 // PostgreSQL connection
 const pool = new Pool({
