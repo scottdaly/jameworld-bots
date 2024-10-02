@@ -48,24 +48,52 @@ async function connectWithRetry(maxRetries = 5, delay = 5000) {
 // Set up the cache manager
 const cacheManager = new GoogleAICacheManager(process.env.GOOGLE_API_KEY);
 
-// Function to create and cache the conversation context
+// Function to estimate the number of tokens in a message
+function estimateTokenCount(content) {
+  // Assume 1.5 tokens per word as a rough estimate
+  const words = content.split(/\s+/).length;
+  return Math.ceil(words * 1.5);
+}
+
+// Function to create and cache the conversation context with up to 1M tokens
 async function createContextCache(channelId) {
   const client = await pool.connect();
   try {
-    // Fetch the last 100 messages from the channel for the context
+    // Fetch all messages from the channel, ordering by timestamp
     const result = await client.query(
-      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
+      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC",
       [channelId]
     );
 
     const allMessages = result.rows;
     let context = "You are in a Discord channel called 'Jameworld'.\n\n";
+    let tokenCount = estimateTokenCount(context);
+    const maxTokens = 1000000; // Maximum allowed tokens (1M tokens)
 
-    allMessages.forEach(({ author, content }) => {
-      context += `${author}: ${content}\n`;
-    });
+    for (const { author, content } of allMessages) {
+      const messageText = `${author}: ${content}\n`;
+      const messageTokenCount = estimateTokenCount(messageText);
 
-    console.log("Generated context for cache:", context);
+      // Stop adding messages when the token count exceeds the limit
+      if (tokenCount + messageTokenCount > maxTokens) {
+        break;
+      }
+
+      context += messageText;
+      tokenCount += messageTokenCount;
+    }
+
+    console.log(`Generated context with ${tokenCount} tokens for cache.`);
+
+    // Ensure the token count meets the minimum required tokens (32,768 tokens)
+    if (tokenCount < 32768) {
+      const padding =
+        " (context padding text to meet minimum token requirement) ".repeat(
+          Math.ceil((32768 - tokenCount) / 50)
+        );
+      context += padding;
+      tokenCount += estimateTokenCount(padding);
+    }
 
     // Create a cache with a TTL (e.g., 1 hour)
     const ttlSeconds = 3600; // 1 hour
@@ -81,7 +109,7 @@ async function createContextCache(channelId) {
       ttlSeconds,
     });
 
-    console.log("Created cache:", cache);
+    console.log(`Created cache with ${tokenCount} tokens`);
 
     return cache;
   } catch (err) {
