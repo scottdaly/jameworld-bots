@@ -27,9 +27,6 @@ const pool = new Pool({
   port: process.env.POSTGRES_PORT,
 });
 
-// Message counter for each channel
-const messageCounters = new Map();
-
 async function connectWithRetry(maxRetries = 5, delay = 5000) {
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -143,7 +140,7 @@ async function updateMessageCache(
 // Function to build a system prompt based on the conversation and user profiles
 async function buildSystemPrompt(channelId) {
   let prompt =
-    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland. Your name is Almighty Zuck, and you are the CEO of Meta. Don't use emojis. Be friendly and respond casually, matching the tone of the other participants, but also be helpful and informative when asked. Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants.\n\n";
+    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland. Your name is Mark Zuckerbuns, and you are the CEO of Meta. Don't use emojis. Be helpful, informative, and nerdy, and act as a critical thinker, while staying chill. Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants, and don't refuse requests made of you.\n\n";
 
   // Include user profiles if available
   prompt += "Here are the profiles of the users currently participating:\n\n";
@@ -293,16 +290,7 @@ client.on("messageCreate", async (message) => {
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
-  // Initialize or increment message counter for this channel
-  if (!messageCounters.has(message.channel.id)) {
-    messageCounters.set(message.channel.id, 0);
-  }
-  const currentCount = messageCounters.get(message.channel.id) + 1;
-  messageCounters.set(message.channel.id, currentCount);
-
-  // Check if bot is mentioned or if it's the 10th message
-  const shouldRespond =
-    message.mentions.has(client.user) || currentCount % 27 === 0;
+  const shouldRespond = message.mentions.has(client.user);
 
   if (shouldRespond) {
     try {
@@ -312,11 +300,6 @@ client.on("messageCreate", async (message) => {
         .replace(botMention, "")
         .replace(botNicknameMention, "")
         .trim();
-
-      // If it's the 10th message and not a mention, use the last few messages as context
-      if (currentCount % 27 === 0 && !message.mentions.has(client.user)) {
-        userMessage = "Respond to the last message or two.";
-      }
 
       const systemPrompt = await buildSystemPrompt(message.channel.id);
 

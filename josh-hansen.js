@@ -26,9 +26,6 @@ const pool = new Pool({
   port: process.env.POSTGRES_PORT,
 });
 
-// Message counter for each channel
-const messageCounters = new Map();
-
 async function connectWithRetry(maxRetries = 5, delay = 5000) {
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -257,16 +254,8 @@ client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    // Initialize or increment message counter for this channel
-    if (!messageCounters.has(message.channel.id)) {
-      messageCounters.set(message.channel.id, 0);
-    }
-    const currentCount = messageCounters.get(message.channel.id) + 1;
-    messageCounters.set(message.channel.id, currentCount);
-
     // Check if bot is mentioned or if it's the 21st message
-    const shouldRespond =
-      message.mentions.has(client.user) || currentCount % 56 === 0;
+    const shouldRespond = message.mentions.has(client.user);
 
     if (shouldRespond) {
       const botMention = `<@${client.user.id}>`;
@@ -275,11 +264,6 @@ client.on("messageCreate", async (message) => {
         .replace(botMention, "")
         .replace(botNicknameMention, "")
         .trim();
-
-      // If it's the 21st message and not a mention, use the last few messages as context
-      if (currentCount % 56 === 0 && !message.mentions.has(client.user)) {
-        userMessage = "Respond to the last message or two.";
-      }
 
       if (!userMessage && !message.mentions.has(client.user)) return;
 
