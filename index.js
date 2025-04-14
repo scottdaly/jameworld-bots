@@ -27,6 +27,9 @@ const pool = new Pool({
   port: process.env.POSTGRES_PORT,
 });
 
+// Message counter for each channel
+const messageCounters = new Map();
+
 async function connectWithRetry(maxRetries = 5, delay = 5000) {
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -183,13 +186,13 @@ async function callOpenAIAPI(
   isProfileGeneration = false,
   imageUrl = null
 ) {
-  const model = isProfileGeneration ? "gpt-4o" : "gpt-4o-mini";
+  const model = isProfileGeneration ? "gpt-4.1" : "gpt-4.1-mini";
   let response;
   if (imageUrl) {
     console.log("Calling OpenAI API with image", imageUrl);
     console.log("Calling OpeanAI API with model", model);
     response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4.1",
       messages: [
         { role: "system", content: systemPrompt },
         {
@@ -244,12 +247,12 @@ client.on("messageCreate", async (message) => {
     console.log("Test Image AI command received");
     try {
       const response = await openai.chat.completions.create({
-        model: "gpt-4o",
+        model: "gpt-4.1",
         messages: [
           {
             role: "user",
             content: [
-              { type: "text", text: "What’s in this image?" },
+              { type: "text", text: "What's in this image?" },
               {
                 type: "image_url",
                 image_url: {
@@ -290,7 +293,18 @@ client.on("messageCreate", async (message) => {
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
-  if (message.mentions.has(client.user)) {
+  // Initialize or increment message counter for this channel
+  if (!messageCounters.has(message.channel.id)) {
+    messageCounters.set(message.channel.id, 0);
+  }
+  const currentCount = messageCounters.get(message.channel.id) + 1;
+  messageCounters.set(message.channel.id, currentCount);
+
+  // Check if bot is mentioned or if it's the 10th message
+  const shouldRespond =
+    message.mentions.has(client.user) || currentCount % 10 === 0;
+
+  if (shouldRespond) {
     try {
       const botMention = `<@${client.user.id}>`;
       const botNicknameMention = `<@!${client.user.id}>`;
@@ -298,6 +312,11 @@ client.on("messageCreate", async (message) => {
         .replace(botMention, "")
         .replace(botNicknameMention, "")
         .trim();
+
+      // If it's the 10th message and not a mention, use the last few messages as context
+      if (currentCount % 10 === 0 && !message.mentions.has(client.user)) {
+        userMessage = "Respond to the recent conversation in a casual way.";
+      }
 
       const systemPrompt = await buildSystemPrompt(message.channel.id);
 
@@ -308,9 +327,6 @@ client.on("messageCreate", async (message) => {
 
         console.log(`Image URL detected: ${imageUrl}`);
 
-        // Call the GPT-4o-mini API for image analysis
-        // const imageAnalysis = await analyzeImage(imageUrl, systemPrompt);
-
         const reply = await callOpenAIAPI(
           systemPrompt,
           userMessage,
@@ -318,18 +334,12 @@ client.on("messageCreate", async (message) => {
           imageUrl
         );
 
-        // Reply with the image analysis result
         await message.reply(reply);
-
-        // Update message cache if needed
         await updateMessageCache(message, true, reply, new Date(), botMention);
       } else if (userMessage) {
-        // If no image, continue with normal text-based interaction
         const reply = await callOpenAIAPI(systemPrompt, userMessage);
 
-        // Get a random number of seconds between 1 and 5
         let replyTime = Math.floor(Math.random() * 4000) + 1000;
-        // Introduce a delay before sending the response
         await new Promise((resolve) => setTimeout(resolve, replyTime));
         await message.reply(reply);
         await updateMessageCache(message, true, reply, new Date(), botMention);

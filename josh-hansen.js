@@ -14,8 +14,8 @@ const client = new Client({
 });
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const CHAT_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
-const PROFILE_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${GOOGLE_API_KEY}`;
+const CHAT_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GOOGLE_API_KEY}`;
+const PROFILE_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GOOGLE_API_KEY}`;
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -25,6 +25,9 @@ const pool = new Pool({
   password: process.env.POSTGRES_PASSWORD,
   port: process.env.POSTGRES_PORT,
 });
+
+// Message counter for each channel
+const messageCounters = new Map();
 
 async function connectWithRetry(maxRetries = 5, delay = 5000) {
   for (let i = 0; i < maxRetries; i++) {
@@ -199,7 +202,6 @@ async function buildSystemPrompt(channelId) {
     client.release();
   }
 
-  console.log("Generated system prompt:", prompt);
   return prompt;
 }
 
@@ -255,22 +257,38 @@ client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    // If the bot is mentioned, generate a reply
-    if (message.mentions.has(client.user)) {
+    // Initialize or increment message counter for this channel
+    if (!messageCounters.has(message.channel.id)) {
+      messageCounters.set(message.channel.id, 0);
+    }
+    const currentCount = messageCounters.get(message.channel.id) + 1;
+    messageCounters.set(message.channel.id, currentCount);
+
+    // Check if bot is mentioned or if it's the 21st message
+    const shouldRespond =
+      message.mentions.has(client.user) || currentCount % 21 === 0;
+
+    if (shouldRespond) {
       const botMention = `<@${client.user.id}>`;
       const botNicknameMention = `<@!${client.user.id}>`;
       let userMessage = message.content
         .replace(botMention, "")
         .replace(botNicknameMention, "")
         .trim();
-      if (!userMessage) return;
+
+      // If it's the 21st message and not a mention, use the last few messages as context
+      if (currentCount % 21 === 0 && !message.mentions.has(client.user)) {
+        userMessage = "Respond to the recent conversation in a casual way.";
+      }
+
+      if (!userMessage && !message.mentions.has(client.user)) return;
+
+      console.log("Bot mentioned by user:", message.author.username);
 
       // Build system prompt with the recent messages and profiles
       const systemPrompt = await buildSystemPrompt(message.channel.id);
 
       const prompt = `${systemPrompt}\n Respond to this specific message: (${message.author.username}): ${userMessage}`;
-
-      console.log("Sending prompt to chat model (gemini-1.5-flash):\n", prompt);
 
       const reply = await callGeminiAPI(prompt, CHAT_MODEL_URL);
 
