@@ -266,7 +266,7 @@ client.on("messageCreate", async (message) => {
 
     // Check if bot is mentioned or if it's the 21st message
     const shouldRespond =
-      message.mentions.has(client.user) || currentCount % 21 === 0;
+      message.mentions.has(client.user) || currentCount % 56 === 0;
 
     if (shouldRespond) {
       const botMention = `<@${client.user.id}>`;
@@ -277,8 +277,8 @@ client.on("messageCreate", async (message) => {
         .trim();
 
       // If it's the 21st message and not a mention, use the last few messages as context
-      if (currentCount % 21 === 0 && !message.mentions.has(client.user)) {
-        userMessage = "Respond to the recent conversation in a casual way.";
+      if (currentCount % 56 === 0 && !message.mentions.has(client.user)) {
+        userMessage = "Respond to the last message or two.";
       }
 
       if (!userMessage && !message.mentions.has(client.user)) return;

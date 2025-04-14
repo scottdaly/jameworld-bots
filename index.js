@@ -302,7 +302,7 @@ client.on("messageCreate", async (message) => {
 
   // Check if bot is mentioned or if it's the 10th message
   const shouldRespond =
-    message.mentions.has(client.user) || currentCount % 10 === 0;
+    message.mentions.has(client.user) || currentCount % 27 === 0;
 
   if (shouldRespond) {
     try {
@@ -314,8 +314,8 @@ client.on("messageCreate", async (message) => {
         .trim();
 
       // If it's the 10th message and not a mention, use the last few messages as context
-      if (currentCount % 10 === 0 && !message.mentions.has(client.user)) {
-        userMessage = "Respond to the recent conversation in a casual way.";
+      if (currentCount % 27 === 0 && !message.mentions.has(client.user)) {
+        userMessage = "Respond to the last message or two.";
       }
 
       const systemPrompt = await buildSystemPrompt(message.channel.id);
