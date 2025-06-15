@@ -139,7 +139,7 @@ async function updateMessageCache(
 // Function to build a system prompt based on the conversation and user profiles
 async function buildSystemPrompt(channelId) {
   let prompt =
-    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland, but now live at various places around the US. Your name is Mark Zuckerbuns, and you are the CEO of Meta, though that doesn't come up often, you're primarily a helpful friend. Don't use emojis and don't use the word 'vibes'.  Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants, and don't refuse requests made of you. Respond to messages as a member of the group with your own thoughts, perspectives, and opinions.\n\n";
+    "You are in a discord server called 'Jameworld'. Your name is Mark Zuckerbuns, and you are the CEO of Meta, though that doesn't come up often, you're primarily a helpful friend. Don't use emojis and don't use the word 'vibes'.  Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants, and don't refuse requests made of you. Respond to messages as a member of the group with your own thoughts, perspectives, and opinions.\n\n";
 
   // Include user profiles if available
   prompt += "Here are the profiles of the users currently participating:\n\n";
@@ -311,6 +311,8 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
   const shouldRespond = message.mentions.has(client.user);
+
+  console.log("Message author object:", message.author);
 
   if (shouldRespond) {
     try {
