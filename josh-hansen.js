@@ -98,8 +98,8 @@ async function buildUserProfile(username, channelId, isBot) {
 // Command to generate profiles for all users in the conversation history
 client.on("messageCreate", async (message) => {
   if (message.content === "!generateProfiles") {
-    await message.channel.send(
-      "Starting to generate user profiles. This may take a few moments..."
+    console.log(
+      "Generating profiles for all users in the conversation history"
     );
     const client = await pool.connect();
     try {
@@ -134,7 +134,7 @@ client.on("messageCreate", async (message) => {
           console.log(`Generated profile for ${username}:\n${profile}`);
         }
         // Add a delay to avoid hitting rate limits
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await new Promise((resolve) => setTimeout(resolve, 15000));
       }
       await message.channel.send(
         "All user profiles have been generated successfully."
