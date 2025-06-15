@@ -176,9 +176,15 @@ async function buildSystemPrompt(channelId) {
 }
 
 // Function to call the Gemini API
-async function callGeminiAPI(systemPrompt, userMessage, imageUrl = null) {
+async function callGeminiAPI(
+  systemPrompt,
+  author,
+  userMessage,
+  imageUrl = null
+) {
+  console.log("Calling Gemini API with author:", author);
   const url = imageUrl ? VISION_MODEL_URL : CHAT_MODEL_URL;
-  const combinedPrompt = `${systemPrompt}\n\n${userMessage}`;
+  const combinedPrompt = `${systemPrompt}\n\n${author}: ${userMessage}`;
   let parts = [{ text: combinedPrompt }];
 
   if (imageUrl) {
@@ -324,7 +330,12 @@ client.on("messageCreate", async (message) => {
 
         console.log(`Image URL detected: ${imageUrl}`);
 
-        const reply = await callGeminiAPI(systemPrompt, userMessage, imageUrl);
+        const reply = await callGeminiAPI(
+          systemPrompt,
+          message.author.username,
+          userMessage,
+          imageUrl
+        );
 
         await message.reply(reply);
         await updateMessageCache(message, true, reply, new Date(), botMention);
