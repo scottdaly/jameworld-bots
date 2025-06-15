@@ -340,7 +340,11 @@ client.on("messageCreate", async (message) => {
         await message.reply(reply);
         await updateMessageCache(message, true, reply, new Date(), botMention);
       } else if (userMessage) {
-        const reply = await callGeminiAPI(systemPrompt, userMessage);
+        const reply = await callGeminiAPI(
+          systemPrompt,
+          message.author.username,
+          userMessage
+        );
 
         let replyTime = Math.floor(Math.random() * 4000) + 1000;
         await new Promise((resolve) => setTimeout(resolve, replyTime));
