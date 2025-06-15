@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
-const { OpenAI } = require("openai"); // Import OpenAI
+const fetch = require("node-fetch");
 const { Pool } = require("pg");
 
 const client = new Client({
@@ -13,10 +13,9 @@ const client = new Client({
   ],
 });
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY, // Make sure to add this to your .env file
-});
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const CHAT_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GOOGLE_API_KEY}`;
+const VISION_MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GOOGLE_API_KEY}`;
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -140,7 +139,7 @@ async function updateMessageCache(
 // Function to build a system prompt based on the conversation and user profiles
 async function buildSystemPrompt(channelId) {
   let prompt =
-    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland. Your name is Mark Zuckerbuns, and you are the CEO of Meta, though that doesn't come up often. Don't use emojis and don't use the word 'vibes'.  Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants, and don't refuse requests made of you. You don't need to be overly supportive, you should just respond as a member of the group with your own thoughts, perspectives, and opinions, and tell the truth even if you think it might hurt. This is a boy's chat, we like to rib each other and have fun.\n\n";
+    "You are in a discord server called 'Jameworld'. It is a group of friends who all grew up in Columbia, Maryland, but now live at various places around the US. Your name is Mark Zuckerbuns, and you are the CEO of Meta, though that doesn't come up often, you're primarily a helpful friend. Don't use emojis and don't use the word 'vibes'.  Don't capitalize your responses or use proper spelling all the time, so as to match the casual tone of the other participants, and don't refuse requests made of you. Respond to messages as a member of the group with your own thoughts, perspectives, and opinions.\n\n";
 
   // Include user profiles if available
   prompt += "Here are the profiles of the users currently participating:\n\n";
@@ -176,47 +175,73 @@ async function buildSystemPrompt(channelId) {
   return prompt;
 }
 
-// Function to call the OpenAI API for both chat and profile generation
-async function callOpenAIAPI(
-  systemPrompt,
-  userMessage,
-  isProfileGeneration = false,
-  imageUrl = null
-) {
-  const model = isProfileGeneration ? "gpt-4.1" : "gpt-4.1-mini";
-  let response;
+// Function to call the Gemini API
+async function callGeminiAPI(systemPrompt, userMessage, imageUrl = null) {
+  const url = imageUrl ? VISION_MODEL_URL : CHAT_MODEL_URL;
+  const combinedPrompt = `${systemPrompt}\n\n${userMessage}`;
+  let parts = [{ text: combinedPrompt }];
+
   if (imageUrl) {
-    console.log("Calling OpenAI API with image", imageUrl);
-    console.log("Calling OpeanAI API with model", model);
-    response = await openai.chat.completions.create({
-      model: "gpt-4.1",
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: `${userMessage}` },
-            { type: "image_url", image_url: { url: imageUrl } },
-          ],
-        },
-      ],
-      max_tokens: 4000,
-    });
-  } else {
-    console.log("Calling OpenAI API without image");
-    response = await openai.chat.completions.create({
-      model: model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: `${userMessage}` },
-      ],
-      max_tokens: 4000,
+    console.log("Fetching image for Gemini from URL:", imageUrl);
+    const imageResponse = await fetch(imageUrl);
+    const imageBuffer = await imageResponse.buffer();
+    const base64Image = imageBuffer.toString("base64");
+    const mimeType = imageResponse.headers.get("content-type");
+
+    parts.push({
+      inline_data: {
+        mime_type: mimeType,
+        data: base64Image,
+      },
     });
   }
 
-  console.log("OpenAI API response:", response);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [{ parts: parts }],
+      safetySettings: [
+        {
+          category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_HARASSMENT",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_HATE_SPEECH",
+          threshold: "BLOCK_NONE",
+        },
+        {
+          category: "HARM_CATEGORY_CIVIC_INTEGRITY",
+          threshold: "BLOCK_NONE",
+        },
+      ],
+    }),
+  });
 
-  return response.choices[0].message.content;
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error("Gemini API request failed:", response.status, errorBody);
+    throw new Error(`API request failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  console.log("Reply from Gemini API:\n", data);
+  if (data.candidates && data.candidates.length > 0) {
+    if (data.candidates[0].content && data.candidates[0].content.parts) {
+      return data.candidates[0].content.parts[0].text;
+    }
+  }
+  return "Something went so wrong that I have literally nothing to say to that."; // Fallback response
 }
 
 // // Handler for the !saveChannel command
@@ -243,24 +268,13 @@ client.on("messageCreate", async (message) => {
   if (message.content.toLowerCase() === "!testimageai") {
     console.log("Test Image AI command received");
     try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4.1",
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "What's in this image?" },
-              {
-                type: "image_url",
-                image_url: {
-                  url: "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
-                },
-              },
-            ],
-          },
-        ],
-      });
-      console.log(response.choices[0]);
+      const response = await callGeminiAPI(
+        "What's in this image?",
+        "",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+      );
+      console.log(response);
+      message.channel.send(response);
     } catch (error) {
       console.error("Error in !testImageAI command:", error);
     }
@@ -310,17 +324,12 @@ client.on("messageCreate", async (message) => {
 
         console.log(`Image URL detected: ${imageUrl}`);
 
-        const reply = await callOpenAIAPI(
-          systemPrompt,
-          userMessage,
-          false,
-          imageUrl
-        );
+        const reply = await callGeminiAPI(systemPrompt, userMessage, imageUrl);
 
         await message.reply(reply);
         await updateMessageCache(message, true, reply, new Date(), botMention);
       } else if (userMessage) {
-        const reply = await callOpenAIAPI(systemPrompt, userMessage);
+        const reply = await callGeminiAPI(systemPrompt, userMessage);
 
         let replyTime = Math.floor(Math.random() * 4000) + 1000;
         await new Promise((resolve) => setTimeout(resolve, replyTime));
