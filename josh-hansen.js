@@ -95,55 +95,42 @@ async function buildUserProfile(username, channelId, isBot) {
   }
 }
 
-// Command to generate profiles for all users in the conversation history
+// Command to generate a profile for a specific user
 client.on("messageCreate", async (message) => {
-  if (message.content === "!generateProfiles") {
-    console.log(
-      "Generating profiles for all users in the conversation history"
-    );
-    const client = await pool.connect();
+  const users = ["jame8k", "scottdaly", "17monkeys", "noah3759", "matthan99"];
+  const command = message.content;
+
+  let targetUser = null;
+  for (const user of users) {
+    if (command === `!generateProfile-${user}`) {
+      targetUser = user;
+      break;
+    }
+  }
+
+  if (targetUser) {
+    await message.channel.send(`Generating profile for ${targetUser}...`);
     try {
-      const result = await client.query(
-        "SELECT DISTINCT author FROM messages WHERE channel_id = $1",
-        [message.channel.id]
+      const profile = await buildUserProfile(
+        targetUser,
+        message.channel.id,
+        false
       );
-
-      for (const row of result.rows) {
-        const username = row.author;
-
-        let users = [
-          "jame8k",
-          "scottdaly",
-          "17monkeys",
-          "noah3759",
-          "matthan99",
-        ];
-
-        let userIsBot = !users.includes(username);
-
-        console.log(`Generating profile for ${username}`);
-        const profile = await buildUserProfile(
-          username,
-          message.channel.id,
-          userIsBot
+      if (profile) {
+        console.log(`Successfully generated profile for ${targetUser}.`);
+        await message.channel.send(
+          `Successfully generated profile for ${targetUser}.`
         );
-        if (profile) {
-          // message.channel.send(
-          //   `Generated profile for ${username}:\n${profile}`
-          // );
-          console.log(`Generated profile for ${username}:\n${profile}`);
-        }
-        // Add a delay to avoid hitting rate limits
-        await new Promise((resolve) => setTimeout(resolve, 15000));
+      } else {
+        await message.channel.send(
+          `An error occurred while generating the profile for ${targetUser}. Check logs for details.`
+        );
       }
-      await message.channel.send(
-        "All user profiles have been generated successfully."
-      );
     } catch (err) {
-      console.error("Error generating profiles:", err);
-      message.channel.send("An error occurred while generating profiles.");
-    } finally {
-      client.release();
+      console.error(`Error generating profile for ${targetUser}:`, err);
+      message.channel.send(
+        `A critical error occurred while generating the profile for ${targetUser}.`
+      );
     }
   }
 });
