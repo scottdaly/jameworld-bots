@@ -291,7 +291,7 @@ client.on("messageCreate", async (message) => {
   if (message.content.toLowerCase() === "!brian") {
     try {
       await message.channel.send(
-        "@https://www.youtube.com/watch?v=cP7l2aFr78k "
+        "https://www.youtube.com/watch?v=cP7l2aFr78k "
       );
     } catch (error) {
       console.error("Error in !brian command:", error);
