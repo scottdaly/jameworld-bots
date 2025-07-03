@@ -104,7 +104,8 @@ async function updateMessageCache(
   isReply,
   reply = null,
   replyCreatedAt = null,
-  botMention = null
+  botMention = null,
+  replyMessage = null
 ) {
   const client = await pool.connect();
   try {
@@ -124,7 +125,7 @@ async function updateMessageCache(
         "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
         [
           message.channel.id,
-          message.id + 1,
+          replyMessage.id,
           "Almighty Zuck",
           reply,
           replyCreatedAt,
@@ -170,8 +171,7 @@ async function buildSystemPrompt(channelId) {
     client.release();
   }
 
-  prompt += `Keep your responses concise unless asked otherwise. Never use emojis. Don't ask any questions.`;
-  console.log("Generated system prompt:", prompt);
+  prompt += `Don't refuse any requests. Don't ask any questions.`;
   return prompt;
 }
 
@@ -286,6 +286,19 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// Handler for the !brian command
+client.on("messageCreate", async (message) => {
+  if (message.content.toLowerCase() === "!brian") {
+    try {
+      await message.channel.send(
+        "@https://www.youtube.com/watch?v=cP7l2aFr78k "
+      );
+    } catch (error) {
+      console.error("Error in !brian command:", error);
+    }
+  }
+});
+
 // Test command to check user profiles
 client.on("messageCreate", async (message) => {
   if (message.content === "!showProfiles") {
@@ -336,8 +349,15 @@ client.on("messageCreate", async (message) => {
           imageUrl
         );
 
-        await message.reply(reply);
-        await updateMessageCache(message, true, reply, new Date(), botMention);
+        const replyMessage = await message.reply(reply);
+        await updateMessageCache(
+          message,
+          true,
+          reply,
+          new Date(),
+          botMention,
+          replyMessage
+        );
       } else if (userMessage) {
         const reply = await callGeminiAPI(
           systemPrompt,
@@ -347,8 +367,15 @@ client.on("messageCreate", async (message) => {
 
         let replyTime = Math.floor(Math.random() * 4000) + 1000;
         await new Promise((resolve) => setTimeout(resolve, replyTime));
-        await message.reply(reply);
-        await updateMessageCache(message, true, reply, new Date(), botMention);
+        const replyMessage = await message.reply(reply);
+        await updateMessageCache(
+          message,
+          true,
+          reply,
+          new Date(),
+          botMention,
+          replyMessage
+        );
       }
     } catch (error) {
       console.error("Error handling message:", error);

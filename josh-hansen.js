@@ -136,7 +136,13 @@ client.on("messageCreate", async (message) => {
 });
 
 // Function to update the message cache incrementally
-async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
+async function updateMessageCache(
+  message,
+  reply,
+  replyCreatedAt,
+  botMention,
+  replyMessage
+) {
   const client = await pool.connect();
   try {
     console.log("Updating message cache for user message:", message);
@@ -154,7 +160,13 @@ async function updateMessageCache(message, reply, replyCreatedAt, botMention) {
     console.log("Updating message cache for AI response:", reply);
     await client.query(
       "INSERT INTO messages (channel_id, message_id, author, content, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
-      [message.channel.id, message.id + 1, "Josh Hansen", reply, replyCreatedAt]
+      [
+        message.channel.id,
+        replyMessage.id,
+        "Josh Hansen",
+        reply,
+        replyCreatedAt,
+      ]
     );
   } finally {
     client.release();
@@ -276,12 +288,18 @@ client.on("messageCreate", async (message) => {
       // Introduce a delay before sending the response
       await new Promise((resolve) => setTimeout(resolve, replyTime));
 
-      message.reply(reply);
+      const replyMessage = await message.reply(reply);
 
       console.log("Reply from Gemini API:\n", message);
 
       // Update the message cache
-      await updateMessageCache(message, reply, new Date(), botMention);
+      await updateMessageCache(
+        message,
+        reply,
+        new Date(),
+        botMention,
+        replyMessage
+      );
     }
   } catch (error) {
     console.error("Error handling message:", error);
