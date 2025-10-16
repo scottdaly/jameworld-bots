@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits } = require("discord.js");
+const { Client, GatewayIntentBits, ChannelType, PermissionsBitField } = require("discord.js");
 const fetch = require("node-fetch");
 const { Pool } = require("pg");
 
@@ -268,6 +268,56 @@ async function callGeminiAPI(
 //     }
 //   }
 // });
+
+// Admin-only command to backfill all text channels in the guild
+client.on("messageCreate", async (message) => {
+  try {
+    if (message.author.bot) return;
+    if (!message.guild) return; // Only in guilds
+
+    if (message.content.trim().toLowerCase() === "!backfill") {
+      // Allow guild owner or admins to run backfill
+      const member = await message.guild.members.fetch(message.author.id);
+      const isOwner = message.guild.ownerId === message.author.id;
+      const isAdmin = member.permissions.has(PermissionsBitField.Flags.Administrator);
+      if (!isOwner && !isAdmin) {
+        return message.reply("You need to be an admin to run backfill.");
+      }
+
+      await message.reply(
+        "Starting backfill of all text channels. This may take a while…"
+      );
+
+      let success = 0;
+      let failed = 0;
+      // Iterate all text channels in the guild
+      const channels = message.guild.channels.cache
+        .filter((ch) => ch.type === ChannelType.GuildText)
+        .map((ch) => ch);
+
+      for (const ch of channels) {
+        try {
+          await message.channel.send(`Backfilling #${ch.name}…`);
+          await fetchAndSaveMessages(ch);
+          success++;
+          // brief delay between channels to be polite to the API
+          await new Promise((r) => setTimeout(r, 1500));
+        } catch (err) {
+          console.error(`Backfill failed for #${ch?.name} (${ch?.id})`, err);
+          failed++;
+          // continue with next channel
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+
+      await message.channel.send(
+        `Backfill complete. Channels succeeded: ${success}, failed: ${failed}.`
+      );
+    }
+  } catch (err) {
+    console.error("Error in !backfill handler:", err);
+  }
+});
 
 client.on("messageCreate", async (message) => {
   if (message.content.toLowerCase() === "!testimageai") {
