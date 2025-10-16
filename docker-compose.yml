@@ -84,6 +84,8 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - PORT=3000
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
     ports:
       - "3000:3000"
     depends_on:

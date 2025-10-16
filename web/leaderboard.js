@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
+const fetch = require('node-fetch');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -13,6 +14,49 @@ const pool = new Pool({
   password: process.env.POSTGRES_PASSWORD,
   port: process.env.POSTGRES_PORT,
 });
+
+// Optional Discord channel name cache
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN_LEADERBOARD || process.env.DISCORD_TOKEN || '';
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '';
+let CHANNEL_NAME_MAP = {};
+let CHANNEL_CACHE_TS = 0;
+const CHANNEL_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+async function loadDiscordChannels() {
+  if (!DISCORD_TOKEN || !DISCORD_GUILD_ID) return;
+  try {
+    const resp = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/channels`, {
+      headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      console.warn('Failed to fetch Discord channels:', resp.status, t);
+      return;
+    }
+    const data = await resp.json();
+    const map = {};
+    for (const ch of data) {
+      if (ch && ch.id && ch.name) map[ch.id] = `#${ch.name}`;
+    }
+    CHANNEL_NAME_MAP = map;
+    CHANNEL_CACHE_TS = Date.now();
+  } catch (e) {
+    console.warn('Error fetching Discord channels:', e.message);
+  }
+}
+
+async function ensureChannelCacheFresh() {
+  if (!DISCORD_TOKEN || !DISCORD_GUILD_ID) return; // optional
+  if (Date.now() - CHANNEL_CACHE_TS > CHANNEL_CACHE_TTL_MS) {
+    await loadDiscordChannels();
+  }
+}
+
+function channelLabel(id) {
+  return CHANNEL_NAME_MAP[id] || `#${id}`;
+}
+
+// (Channel names are fetched from Discord API if token+guild are provided.)
 
 // Simple health endpoint
 app.get('/health', async (_req, res) => {
@@ -56,23 +100,39 @@ function rangeWhereClause(rangeKey) {
   }
 }
 
+function buildWhere(rangeKey, channelId) {
+  const parts = [];
+  const params = [];
+  if (rangeKey && rangeKey !== 'all') parts.push(rangeWhereClause(rangeKey));
+  if (channelId) {
+    params.push(channelId);
+    parts.push(`channel_id = $${params.length}`);
+  }
+  const sql = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
+  return { sql, params };
+}
+
+// buildWhere and channelLabel defined above
+
 // JSON API for leaderboard data
 app.get('/api/leaderboard', async (req, res) => {
   const range = normalizeRange(req.query.range);
-  const where = rangeWhereClause(range);
-  const whereSql = where ? `WHERE ${where}` : '';
+  await ensureChannelCacheFresh();
+  const channel = req.query.channel ? String(req.query.channel) : '';
+  const { sql, params } = buildWhere(range, channel);
   try {
     const client = await pool.connect();
     try {
       const { rows } = await client.query(
         `SELECT author, COUNT(*)::int AS message_count
          FROM messages
-         ${whereSql}
+         ${sql}
          GROUP BY author
          ORDER BY message_count DESC, author ASC
-         LIMIT 100`
+         LIMIT 100`,
+        params
       );
-      res.json({ data: rows, meta: { range } });
+      res.json({ data: rows, meta: { range, channel: channel || null } });
     } finally {
       client.release();
     }
@@ -82,11 +142,40 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
+// JSON API for channels list (by message count)
+app.get('/api/channels', async (req, res) => {
+  const range = normalizeRange(req.query.range);
+  await ensureChannelCacheFresh();
+  const { sql, params } = buildWhere(range, '');
+  try {
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query(
+        `SELECT channel_id, COUNT(*)::int AS message_count
+         FROM messages
+         ${sql}
+         GROUP BY channel_id
+         ORDER BY message_count DESC, channel_id ASC
+         LIMIT 200`,
+        params
+      );
+      const data = rows.map(r => ({ id: r.channel_id, name: channelLabel(r.channel_id), message_count: r.message_count }));
+      res.json({ data, meta: { range } });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Error fetching channels:', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // HTML page
 app.get('/', async (req, res) => {
   const range = normalizeRange(req.query.range);
-  const where = rangeWhereClause(range);
-  const whereSql = where ? `WHERE ${where}` : '';
+  await ensureChannelCacheFresh();
+  const channel = req.query.channel ? String(req.query.channel) : '';
+  const { sql, params } = buildWhere(range, channel);
   try {
     const client = await pool.connect();
     let rows;
@@ -95,14 +184,16 @@ app.get('/', async (req, res) => {
       const result = await client.query(
         `SELECT author, COUNT(*)::int AS message_count
          FROM messages
-         ${whereSql}
+         ${sql}
          GROUP BY author
          ORDER BY message_count DESC, author ASC
-         LIMIT 100`
+         LIMIT 100`,
+        params
       );
       rows = result.rows;
       const totalRes = await client.query(
-        `SELECT COUNT(*)::int AS total FROM messages ${whereSql}`
+        `SELECT COUNT(*)::int AS total FROM messages ${sql}`,
+        params
       );
       totals.messages = totalRes.rows[0]?.total || 0;
     } finally {
@@ -118,8 +209,31 @@ app.get('/', async (req, res) => {
     ];
 
     const tabs = ranges
-      .map(r => `<a class="tab ${r.key === range ? 'active' : ''}" href="/?range=${r.key}">${r.label}</a>`) 
+      .map(r => `<a class="tab ${r.key === range ? 'active' : ''}" href="/?range=${r.key}${channel ? `&channel=${encodeURIComponent(channel)}` : ''}">${r.label}</a>`) 
       .join('');
+
+    // Fetch channels list for the selector (top by count in selected range)
+    let channels = [];
+    try {
+      const client = await pool.connect();
+      const { sql: chSql, params: chParams } = buildWhere(range, '');
+      const q = await client.query(
+        `SELECT channel_id, COUNT(*)::int AS message_count
+         FROM messages
+         ${chSql}
+         GROUP BY channel_id
+         ORDER BY message_count DESC, channel_id ASC
+         LIMIT 200`,
+        chParams
+      );
+      channels = q.rows.map(r => ({ id: r.channel_id, name: channelLabel(r.channel_id), count: r.message_count }));
+      // Ensure selected channel is present in the list
+      if (channel && !channels.find(c => c.id === channel)) {
+        channels.unshift({ id: channel, name: channelLabel(channel), count: null });
+      }
+    } catch (e) {
+      console.error('Error loading channels for selector:', e);
+    }
 
     const html = `
       <!doctype html>
@@ -141,18 +255,23 @@ app.get('/', async (req, res) => {
               var(--bg);
             color: var(--fg); font: 15px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
           }
-          .wrap { max-width: 980px; margin: 0 auto; padding: clamp(20px, 4vw, 32px); }
-          .header { display:flex; align-items:center; justify-content:space-between; gap: 16px; margin-bottom: 18px; }
+          .wrap { max-width: 980px; margin: 0 auto; padding: clamp(16px, 4vw, 28px); }
+          .header { display:flex; align-items:center; justify-content:space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
           .brand { display:flex; align-items:center; gap: 10px; }
           .logo { width: 12px; height: 12px; border-radius: 999px; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: 0 0 0 6px rgba(91,140,255,0.10); }
           h1 { font-size: clamp(20px, 2.2vw, 24px); margin: 0; letter-spacing: 0.2px; }
           .sub { color: var(--muted); margin: 4px 0 18px; }
           .tabs { display:inline-flex; gap:8px; background: color-mix(in srgb, var(--card), transparent 5%); border:1px solid var(--border); padding:6px; border-radius: 12px; backdrop-filter: blur(6px); }
-          .tab { text-decoration:none; color: var(--muted); padding:8px 12px; border-radius: 8px; transition: background .2s ease, color .2s ease, box-shadow .2s ease; }
+          .tab { text-decoration:none; color: var(--muted); padding:10px 14px; border-radius: 10px; transition: background .2s ease, color .2s ease, box-shadow .2s ease; }
           .tab:hover { color: var(--fg); background: rgba(91,140,255,0.12); }
           .tab.active { color:#fff; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: 0 2px 10px rgba(47,109,246,0.35); }
+          .controls { display:flex; align-items:center; gap: 10px; flex-wrap: wrap; }
+          .select { appearance:none; -webkit-appearance:none; -moz-appearance:none; border:1px solid var(--border); background: var(--card); color: var(--fg); padding: 9px 36px 9px 12px; border-radius: 10px; font: inherit; cursor: pointer; position: relative; }
+          .select-wrap { position: relative; display:inline-block; }
+          .select-wrap:after { content:""; position:absolute; right: 12px; top:50%; width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent; border-top:6px solid var(--muted); transform: translateY(-25%); pointer-events: none; }
           .card { background: color-mix(in srgb, var(--card), transparent 0%); border:1px solid var(--border); border-radius: 16px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.18), 0 6px 18px rgba(0,0,0,0.10); }
-          table { border-collapse: collapse; width: 100%; }
+          .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 16px; }
+          table { border-collapse: collapse; width: 100%; min-width: 520px; }
           thead th { position: sticky; top:0; background: linear-gradient(0deg, var(--card), var(--card)); z-index:1; font-weight: 600; font-size: 13px; color: var(--muted); }
           th, td { text-align: left; padding: 14px 16px; border-bottom: 1px solid var(--border); }
           tbody tr:hover { background: color-mix(in srgb, var(--acc), transparent 93%); }
@@ -168,9 +287,28 @@ app.get('/', async (req, res) => {
           .fill { height: 100%; background: linear-gradient(90deg, var(--acc), var(--acc2)); }
           .footer { color: var(--muted); margin-top: 14px; font-size: 12px; }
           .metrics { color: var(--muted); }
-          @media (max-width: 640px) {
+          @media (max-width: 720px) {
+            .tab { padding: 10px 12px; }
+            .select { padding: 10px 36px 10px 12px; }
             .meter { display:none; }
             th, td { padding: 12px; }
+            table { min-width: 420px; }
+          }
+          @media (max-width: 480px) {
+            .wrap { padding: 12px; }
+            .brand { gap: 8px; }
+            h1 { font-size: 18px; }
+            .sub { font-size: 12px; }
+            .rank { width: 2.5ch; }
+            /* Stack rows for extra-small screens */
+            thead { display: none; }
+            table { min-width: 0; }
+            tbody tr { display: grid; grid-template-columns: 1fr auto; align-items: center; row-gap: 8px; padding: 8px 12px; }
+            tbody tr td { border-bottom: none; padding: 4px 0; }
+            tbody tr td.rank { grid-column: 2; justify-self: end; }
+            tbody tr td.usercell { grid-column: 1 / span 2; padding-top: 0; }
+            tbody tr td.right::before { content: 'Messages'; color: var(--muted); font-size: 12px; margin-right: 8px; }
+            .card { border-radius: 14px; }
           }
         </style>
       </head>
@@ -184,9 +322,22 @@ app.get('/', async (req, res) => {
                 <div class="sub">Top 100 by messages · <span class="metrics">${rows.length} users · ${Number(totals.messages).toLocaleString()} messages</span></div>
               </div>
             </div>
-            <div class="tabs">${tabs}</div>
+            <div class="controls">
+              <div class="tabs">${tabs}</div>
+              <form method="GET" action="/">
+                <input type="hidden" name="range" value="${range}" />
+                <span class="select-wrap">
+                  <select class="select" name="channel" onchange="this.form.submit()">
+                    <option value="" ${channel ? '' : 'selected'}>All channels</option>
+                    ${channels
+                      .map(c => `<option value="${escapeHtml(c.id)}" ${channel===c.id?'selected':''}>${escapeHtml(c.name)}${c.count!==null?` · ${Number(c.count).toLocaleString()}`:''}</option>`)
+                      .join('')}
+                  </select>
+                </span>
+              </form>
+            </div>
           </div>
-          <div class="card">
+          <div class="card table-wrap">
             <table>
               <thead>
                 <tr>
@@ -205,9 +356,9 @@ app.get('/', async (req, res) => {
                     return `
                       <tr>
                         <td class="rank ${badge}">${i + 1}</td>
-                        <td><div class="user"><div class="avatar">${initials}</div><div>${escapeHtml(r.author)}</div></div></td>
+                        <td class="usercell"><div class="user"><div class="avatar">${initials}</div><div>${escapeHtml(r.author)}</div></div></td>
                         <td class="meter"><div class="track"><div class="fill" style="width:${pct}%"></div></div></td>
-                        <td class="right">${Number(r.message_count).toLocaleString()}</td>
+                        <td class="right" data-label="Messages">${Number(r.message_count).toLocaleString()}</td>
                       </tr>
                     `;
                   })
@@ -215,7 +366,7 @@ app.get('/', async (req, res) => {
               </tbody>
             </table>
           </div>
-          <div class="footer">API: <code>/api/leaderboard?range=${range}</code></div>
+          <div class="footer">API: <code>/api/leaderboard?range=${range}${channel?`&channel=${encodeURIComponent(channel)}`:''}</code> · Channels: <code>/api/channels?range=${range}</code></div>
         </div>
       </body>
       </html>
