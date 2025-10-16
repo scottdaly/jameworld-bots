@@ -243,6 +243,7 @@ app.get('/', async (req, res) => {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Jameworld Leaderboard</title>
         <style>
+          *, *::before, *::after { box-sizing: border-box; }
           :root { color-scheme: light dark; --bg:#0a0b0d; --fg:#e9ecf1; --muted:#8a909b; --card:#14161a; --border:#22252b; --acc:#5b8cff; --acc2:#8aa9ff; }
           @media (prefers-color-scheme: light) {
             :root { --bg:#f7f8fb; --fg:#0f1220; --muted:#5b6270; --card:#ffffff; --border:#e7e9ee; --acc:#2f6df6; --acc2:#75a2ff; }
@@ -280,8 +281,9 @@ app.get('/', async (req, res) => {
           .rank.badge-1 { color:#f2c200; font-weight: 700; }
           .rank.badge-2 { color:#c0c6cf; font-weight: 650; }
           .rank.badge-3 { color:#d19a66; font-weight: 650; }
-          .user { display:flex; align-items:center; gap: 12px; }
-          .avatar { width: 28px; height: 28px; border-radius: 50%; display:grid; place-items:center; font-weight:700; font-size: 12px; color:#fff; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: inset 0 -10px 20px rgba(0,0,0,0.12); }
+          .user { display:flex; align-items:center; gap: 12px; min-width: 0; }
+          .user div:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .avatar { width: 28px; height: 28px; border-radius: 50%; display:grid; place-items:center; font-weight:700; font-size: 12px; color:#fff; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: inset 0 -10px 20px rgba(0,0,0,0.12); flex: 0 0 28px; }
           .meter { min-width: 160px; }
           .track { height: 6px; background: color-mix(in srgb, var(--fg), transparent 92%); border-radius: 999px; overflow: hidden; margin-top: 6px; }
           .fill { height: 100%; background: linear-gradient(90deg, var(--acc), var(--acc2)); }
@@ -294,21 +296,25 @@ app.get('/', async (req, res) => {
             th, td { padding: 12px; }
             table { min-width: 420px; }
           }
-          @media (max-width: 480px) {
+          @media (max-width: 560px) {
             .wrap { padding: 12px; }
             .brand { gap: 8px; }
             h1 { font-size: 18px; }
             .sub { font-size: 12px; }
             .rank { width: 2.5ch; }
-            /* Stack rows for extra-small screens */
+            /* Turn rows into cards and remove outer card chrome */
+            .card.table-wrap { background: transparent; border: 0; box-shadow: none; }
             thead { display: none; }
-            table { min-width: 0; }
-            tbody tr { display: grid; grid-template-columns: 1fr auto; align-items: center; row-gap: 8px; padding: 8px 12px; }
-            tbody tr td { border-bottom: none; padding: 4px 0; }
-            tbody tr td.rank { grid-column: 2; justify-self: end; }
-            tbody tr td.usercell { grid-column: 1 / span 2; padding-top: 0; }
-            tbody tr td.right::before { content: 'Messages'; color: var(--muted); font-size: 12px; margin-right: 8px; }
-            .card { border-radius: 14px; }
+            table { min-width: 0; border-collapse: separate; border-spacing: 0 10px; }
+            tbody tr { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+            tbody tr td { border-bottom: 0; padding: 10px 12px; }
+            /* Layout row content */
+            tbody tr { display: grid; grid-template-columns: 1fr auto; align-items: center; }
+            tbody tr td.rank { grid-column: 2; justify-self: end; padding-right: 12px; }
+            tbody tr td.usercell { grid-column: 1 / span 2; padding-bottom: 4px; }
+            tbody tr td.right { grid-column: 1 / span 2; justify-self: start; color: var(--fg); }
+            tbody tr td.right::before { content: 'Msgs'; color: var(--muted); font-size: 12px; margin-right: 8px; }
+            .avatar { width: 26px; height: 26px; font-size: 11px; }
           }
         </style>
       </head>
