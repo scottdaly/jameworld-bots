@@ -301,18 +301,18 @@ app.get('/', async (req, res) => {
             .brand { gap: 8px; }
             h1 { font-size: 18px; }
             .sub { font-size: 12px; }
-            .rank { width: 2.5ch; }
+            .rank { width: auto; text-align: left; font-size: 18px; padding-right: 14px; }
             /* Turn rows into cards and remove outer card chrome */
             .card.table-wrap { background: transparent; border: 0; box-shadow: none; }
             thead { display: none; }
             table { min-width: 0; border-collapse: separate; border-spacing: 0 10px; }
             tbody tr { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
             tbody tr td { border-bottom: 0; padding: 10px 12px; }
-            /* Layout row content */
-            tbody tr { display: grid; grid-template-columns: 1fr auto; align-items: center; }
-            tbody tr td.rank { grid-column: 2; justify-self: end; padding-right: 12px; }
-            tbody tr td.usercell { grid-column: 1 / span 2; padding-bottom: 4px; }
-            tbody tr td.right { grid-column: 1 / span 2; justify-self: start; color: var(--fg); }
+            /* Layout row content with rank on left */
+            tbody tr { display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto auto; align-items: center; gap: 0; }
+            tbody tr td.rank { grid-column: 1; grid-row: 1 / span 2; align-self: center; padding-left: 14px; }
+            tbody tr td.usercell { grid-column: 2 / span 2; grid-row: 1; padding-bottom: 4px; padding-top: 12px; }
+            tbody tr td.right { grid-column: 2 / span 2; grid-row: 2; justify-self: start; color: var(--fg); padding-top: 0; padding-bottom: 12px; }
             tbody tr td.right::before { content: 'Msgs'; color: var(--muted); font-size: 12px; margin-right: 8px; }
             .avatar { width: 26px; height: 26px; font-size: 11px; }
           }
