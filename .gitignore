@@ -1,3 +1,5 @@
 # Backups created by the postgres backup sidecar
 backups/
+node_modules/
+.env
 
