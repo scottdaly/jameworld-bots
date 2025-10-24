@@ -368,6 +368,76 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (!message.guild) return;
+
+  if (message.content.trim().toLowerCase() === "!weeklyreport") {
+    let dbClient;
+    try {
+      dbClient = await pool.connect();
+      await message.channel.send("Generating weekly highlights…");
+
+      const { rows: recentMessages } = await dbClient.query(
+        `SELECT author, content, timestamp
+         FROM messages
+         WHERE channel_id = $1
+           AND timestamp >= NOW() - INTERVAL '7 days'
+         ORDER BY timestamp ASC`,
+        [message.channel.id]
+      );
+
+      if (recentMessages.length === 0) {
+        await message.channel.send(
+          "No messages from the last 7 days to summarize."
+        );
+        return;
+      }
+
+      const MAX_CONTEXT_CHARS = 15000;
+      const formattedLog = recentMessages
+        .map(({ author, content, timestamp }) => {
+          const safeContent = (content || "").replace(/\s+/g, " ").trim();
+          const safeTimestamp = new Date(timestamp).toISOString();
+          return `${safeTimestamp} - ${author}: ${safeContent}`.trim();
+        })
+        .filter(Boolean)
+        .join("\n");
+
+      let context = formattedLog;
+      let truncationNote = "";
+
+      if (context.length > MAX_CONTEXT_CHARS) {
+        context = context.slice(-MAX_CONTEXT_CHARS);
+        truncationNote =
+          "Note: Context truncated to the most recent messages to fit model limits.\n\n";
+      }
+
+      const systemPrompt =
+        "You are an analytical yet concise community manager for a Discord server. Summarize the last week of conversation, highlighting notable events, discussion themes, sentiment trends, and any follow-up actions. Use bullet points and keep it under 250 words.";
+
+      const summaryPrompt = `${truncationNote}Here are the conversation logs from the last 7 days for channel ${message.channel.name}:\n\n${context}\n\nWrite a weekly report with clear sections for Highlights, Themes, and Action Items (if any). If there's nothing significant for a section, say 'None'.`;
+
+      const summary = await callGeminiAPI(
+        systemPrompt,
+        "Community Analyst",
+        summaryPrompt
+      );
+
+      await message.channel.send(summary);
+    } catch (err) {
+      console.error("Error generating weekly report:", err);
+      await message.channel.send(
+        "Sorry, I couldn't generate the weekly report just now."
+      );
+    } finally {
+      if (dbClient) {
+        dbClient.release();
+      }
+    }
+  }
+});
+
 // Function to handle text and image messages
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
