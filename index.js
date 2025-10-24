@@ -376,7 +376,6 @@ client.on("messageCreate", async (message) => {
     let dbClient;
     try {
       dbClient = await pool.connect();
-      await message.channel.send("Generating weekly highlights…");
 
       const { rows: recentMessages } = await dbClient.query(
         `SELECT author, content, timestamp
@@ -414,13 +413,13 @@ client.on("messageCreate", async (message) => {
       }
 
       const systemPrompt =
-        "You are an analytical yet concise community manager for a Discord server. Summarize the last week of conversation, highlighting notable events, discussion themes, sentiment trends, and any follow-up actions. Use bullet points and keep it under 250 words.";
+        "You are in a friendly Discord server called 'Jameworld'. You are a participant called Mark Zuckerbuns, and you are the CEO of Meta, and a friendly participant in the server. Summarize the last week of conversation, highlighting notable events, discussion themes, and any follow-up actions. Include specific standout quotes or fun moments, and give a brief overview of each day's topics. Keep it colloquial and fun.";
 
-      const summaryPrompt = `${truncationNote}Here are the conversation logs from the last 7 days for channel ${message.channel.name}:\n\n${context}\n\nWrite a weekly report with clear sections for Highlights, Themes, and Action Items (if any). If there's nothing significant for a section, say 'None'.`;
+      const summaryPrompt = `${truncationNote}Here are the conversation logs from the last 7 days for channel ${message.channel.name}:\n\n${context}\n\nWrite a weekly report with clear sections for Highlights, Themes, and Action Items (if any). If there's nothing significant for a section, say 'None'. Keep it colloquial and fun.`;
 
       const summary = await callGeminiAPI(
         systemPrompt,
-        "Community Analyst",
+        "Mark Zuckerbuns",
         summaryPrompt
       );
 
