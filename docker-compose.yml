@@ -7,6 +7,7 @@ services:
       db:
         condition: service_healthy
     environment:
+      - NODE_OPTIONS=--dns-result-order=ipv4first
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -24,6 +25,7 @@ services:
       db:
         condition: service_healthy
     environment:
+      - NODE_OPTIONS=--dns-result-order=ipv4first
       - DISCORD_TOKEN=${DISCORD_TOKEN_JOSH_HANSEN}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - POSTGRES_USER=${POSTGRES_USER}
