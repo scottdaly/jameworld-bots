@@ -1,102 +1,99 @@
 services:
-    discord-bot-1:
-      build:
-        context: .
-        dockerfile: Dockerfile.jameworld
-      # use host network instead of compose bridge
-      network_mode: host
-      # we can't use depends_on + healthcheck with host networking reliably, let the bot retry DB itself
-      environment:
-        - NODE_OPTIONS=--dns-result-order=ipv4first
-        - DISCORD_TOKEN=${DISCORD_TOKEN}
-        - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-        - POSTGRES_USER=${POSTGRES_USER}
-        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-        - POSTGRES_DB=${POSTGRES_DB}
-        - POSTGRES_HOST=127.0.0.1     # 👈 changed from db
-        - POSTGRES_PORT=5432
-      restart: unless-stopped
-
-
-    discord-bot-josh-hansen:
-      build:
-        context: .
-        dockerfile: Dockerfile.josh-hansen
-      network_mode: host
-      environment:
-        - NODE_OPTIONS=--dns-result-order=ipv4first
-        - DISCORD_TOKEN=${DISCORD_TOKEN_JOSH_HANSEN}
-        - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-        - POSTGRES_USER=${POSTGRES_USER}
-        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-        - POSTGRES_DB=${POSTGRES_DB}
-        - POSTGRES_HOST=127.0.0.1     # 👈 changed from db
-        - POSTGRES_PORT=5432
-      restart: unless-stopped
-
-
-    db:
-      image: postgres:13
-      volumes:
-        - postgres_data:/var/lib/postgresql/data
-        - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-      environment:
-        - POSTGRES_USER=${POSTGRES_USER}
-        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-        - POSTGRES_DB=${POSTGRES_DB}
-      healthcheck:
-        test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-        interval: 10s
-        timeout: 5s
-        retries: 5
-      ports:
-        - "127.0.0.1:5432:5432" 
-      restart: unless-stopped
-      
-    adminer:
-      image: adminer
-      restart: always
-      ports:
-        - "127.0.0.1:8081:8080"
-      depends_on:
-        - db
-
-    db-backup:
-      image: prodrigestivill/postgres-backup-local
-      environment:
-        - POSTGRES_HOST=db
-        - POSTGRES_DB=${POSTGRES_DB}
-        - POSTGRES_USER=${POSTGRES_USER}
-        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-        - SCHEDULE=@daily
-        - BACKUP_KEEP_DAYS=7
-        - BACKUP_KEEP_WEEKS=4
-        - BACKUP_KEEP_MONTHS=6
-      volumes:
-        - ./backups:/backups
-      depends_on:
-        - db
-      restart: unless-stopped
-    leaderboard:
-      build:
-        context: .
-        dockerfile: Dockerfile.leaderboard
-      environment:
-        - POSTGRES_USER=${POSTGRES_USER}
-        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-        - POSTGRES_DB=${POSTGRES_DB}
-        - POSTGRES_HOST=db
-        - POSTGRES_PORT=5432
-        - PORT=3000
-        - DISCORD_TOKEN=${DISCORD_TOKEN}
-        - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
-      ports:
-        - "3000:3000"
-      depends_on:
-        db:
-          condition: service_healthy
-      restart: unless-stopped
-
+  db:
+    image: postgres:13
     volumes:
-      postgres_data:
-        name: jameworld-bots_postgres_data
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+
+  discord-bot-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.jameworld
+    environment:
+      - NODE_OPTIONS=--dns-result-order=ipv4first
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=127.0.0.1
+      - POSTGRES_PORT=5432
+    network_mode: host
+    restart: unless-stopped
+
+  discord-bot-josh-hansen:
+    build:
+      context: .
+      dockerfile: Dockerfile.josh-hansen
+    environment:
+      - NODE_OPTIONS=--dns-result-order=ipv4first
+      - DISCORD_TOKEN=${DISCORD_TOKEN_JOSH_HANSEN}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=127.0.0.1
+      - POSTGRES_PORT=5432
+    network_mode: host
+    restart: unless-stopped
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      - db
+
+  db-backup:
+    image: prodrigestivill/postgres-backup-local
+    environment:
+      - POSTGRES_HOST=db
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - SCHEDULE=@daily
+      - BACKUP_KEEP_DAYS=7
+      - BACKUP_KEEP_WEEKS=4
+      - BACKUP_KEEP_MONTHS=6
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  leaderboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.leaderboard
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - PORT=3000
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: jameworld-bots_postgres_data
