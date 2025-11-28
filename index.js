@@ -510,7 +510,6 @@ client.on("messageCreate", async (message) => {
 process.on("unhandledRejection", (error) => {
   console.error("Unhandled promise rejection:", error);
 });
-
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -522,5 +521,30 @@ client.once("ready", async () => {
   }
 });
 
+// much more detailed unhandled rejection handler
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled promise rejection:", {
+    reason,
+    code: reason?.code,
+    name: reason?.name,
+    message: reason?.message,
+    stack: reason?.stack,
+  });
+});
 
-client.login(process.env.DISCORD_TOKEN);
+// wrap login so we see token/intents errors instead of silence
+(async () => {
+  try {
+    console.log("Starting Discord login…");
+    await client.login(process.env.DISCORD_TOKEN);
+    console.log("Discord login() resolved");
+  } catch (err) {
+    console.error("Discord login failed:", {
+      code: err.code,
+      name: err.name,
+      message: err.message,
+      stack: err.stack,
+    });
+  }
+})();
+
