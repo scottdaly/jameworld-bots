@@ -511,4 +511,16 @@ process.on("unhandledRejection", (error) => {
   console.error("Unhandled promise rejection:", error);
 });
 
+client.once("ready", async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  try {
+    await connectWithRetry();
+    console.log("DB connection verified on startup");
+  } catch (err) {
+    console.error("DB connection failed on startup:", err);
+  }
+});
+
+
 client.login(process.env.DISCORD_TOKEN);
