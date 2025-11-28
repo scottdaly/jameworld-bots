@@ -1,55 +1,58 @@
 services:
-  discord-bot-1:
-    build:
-      context: .
-      dockerfile: Dockerfile.jameworld
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - NODE_OPTIONS=--dns-result-order=ipv4first
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_HOST=db
-      - POSTGRES_PORT=5432
-    restart: unless-stopped
+    discord-bot-1:
+      build:
+        context: .
+        dockerfile: Dockerfile.jameworld
+      # use host network instead of compose bridge
+      network_mode: host
+      # we can't use depends_on + healthcheck with host networking reliably, let the bot retry DB itself
+      environment:
+        - NODE_OPTIONS=--dns-result-order=ipv4first
+        - DISCORD_TOKEN=${DISCORD_TOKEN}
+        - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+        - POSTGRES_USER=${POSTGRES_USER}
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+        - POSTGRES_DB=${POSTGRES_DB}
+        - POSTGRES_HOST=127.0.0.1     # 👈 changed from db
+        - POSTGRES_PORT=5432
+      restart: unless-stopped
 
-  discord-bot-josh-hansen:
-    build:
-      context: .
-      dockerfile: Dockerfile.josh-hansen
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - NODE_OPTIONS=--dns-result-order=ipv4first
-      - DISCORD_TOKEN=${DISCORD_TOKEN_JOSH_HANSEN}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_HOST=db
-      - POSTGRES_PORT=5432
-    restart: unless-stopped
 
-  db:
-    image: postgres:13
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+    discord-bot-josh-hansen:
+      build:
+        context: .
+        dockerfile: Dockerfile.josh-hansen
+      network_mode: host
+      environment:
+        - NODE_OPTIONS=--dns-result-order=ipv4first
+        - DISCORD_TOKEN=${DISCORD_TOKEN_JOSH_HANSEN}
+        - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+        - POSTGRES_USER=${POSTGRES_USER}
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+        - POSTGRES_DB=${POSTGRES_DB}
+        - POSTGRES_HOST=127.0.0.1     # 👈 changed from db
+        - POSTGRES_PORT=5432
+      restart: unless-stopped
+
+
+    db:
+      image: postgres:13
+      volumes:
+        - postgres_data:/var/lib/postgresql/data
+        - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      environment:
+        - POSTGRES_USER=${POSTGRES_USER}
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+        - POSTGRES_DB=${POSTGRES_DB}
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+      ports:
+        - "127.0.0.1:5432:5432" 
+      restart: unless-stopped
+
 
   adminer:
     image: adminer
