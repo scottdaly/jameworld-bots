@@ -97,6 +97,6 @@ services:
           condition: service_healthy
       restart: unless-stopped
 
-  volumes:
-    postgres_data:
-      name: jameworld-bots_postgres_data
+    volumes:
+      postgres_data:
+        name: jameworld-bots_postgres_data
