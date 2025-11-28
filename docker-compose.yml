@@ -52,52 +52,51 @@ services:
       ports:
         - "127.0.0.1:5432:5432" 
       restart: unless-stopped
+      
+    adminer:
+      image: adminer
+      restart: always
+      ports:
+        - "127.0.0.1:8081:8080"
+      depends_on:
+        - db
 
+    db-backup:
+      image: prodrigestivill/postgres-backup-local
+      environment:
+        - POSTGRES_HOST=db
+        - POSTGRES_DB=${POSTGRES_DB}
+        - POSTGRES_USER=${POSTGRES_USER}
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+        - SCHEDULE=@daily
+        - BACKUP_KEEP_DAYS=7
+        - BACKUP_KEEP_WEEKS=4
+        - BACKUP_KEEP_MONTHS=6
+      volumes:
+        - ./backups:/backups
+      depends_on:
+        - db
+      restart: unless-stopped
+    leaderboard:
+      build:
+        context: .
+        dockerfile: Dockerfile.leaderboard
+      environment:
+        - POSTGRES_USER=${POSTGRES_USER}
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+        - POSTGRES_DB=${POSTGRES_DB}
+        - POSTGRES_HOST=db
+        - POSTGRES_PORT=5432
+        - PORT=3000
+        - DISCORD_TOKEN=${DISCORD_TOKEN}
+        - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+      ports:
+        - "3000:3000"
+      depends_on:
+        db:
+          condition: service_healthy
+      restart: unless-stopped
 
-  adminer:
-    image: adminer
-    restart: always
-    ports:
-      - "127.0.0.1:8081:8080"
-    depends_on:
-      - db
-
-  db-backup:
-    image: prodrigestivill/postgres-backup-local
-    environment:
-      - POSTGRES_HOST=db
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - SCHEDULE=@daily
-      - BACKUP_KEEP_DAYS=7
-      - BACKUP_KEEP_WEEKS=4
-      - BACKUP_KEEP_MONTHS=6
-    volumes:
-      - ./backups:/backups
-    depends_on:
-      - db
-    restart: unless-stopped
-  leaderboard:
-    build:
-      context: .
-      dockerfile: Dockerfile.leaderboard
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_HOST=db
-      - POSTGRES_PORT=5432
-      - PORT=3000
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
-    ports:
-      - "3000:3000"
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-
-volumes:
-  postgres_data:
-    name: jameworld-bots_postgres_data
+  volumes:
+    postgres_data:
+      name: jameworld-bots_postgres_data
