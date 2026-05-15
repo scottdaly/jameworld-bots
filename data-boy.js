@@ -423,23 +423,32 @@ discord.on("messageCreate", async (message) => {
   const placeholder = await message.reply("Data Boy is researching…");
   const startedAt = Date.now();
   let progressSnippet = null;
+  let lastProgressEdit = 0;
 
-  const stillWorkingInterval = setInterval(async () => {
+  async function editProgress() {
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
-    let status = `Data Boy is still researching… (${elapsed}s)`;
-    if (elapsed >= 90 && progressSnippet) {
-      const snippet = progressSnippet.replace(/\n+/g, " ").slice(0, 200);
-      status += `\n> ${snippet}`;
+    let status;
+    if (progressSnippet) {
+      const snippet = progressSnippet.replace(/\n+/g, " ").slice(0, 300);
+      status = `_(still working… ${elapsed}s)_\n> ${snippet}`;
+    } else {
+      status = `Data Boy is still researching… (${elapsed}s)`;
     }
     try {
       await placeholder.edit(status);
+      lastProgressEdit = Date.now();
     } catch {}
-  }, 30_000);
+  }
+
+  // Fallback heartbeat in case Claude emits no text for a long stretch.
+  const stillWorkingInterval = setInterval(editProgress, 30_000);
 
   try {
     const systemPrompt = await buildSystemPrompt();
     const result = await answer(question, systemPrompt, (text) => {
       progressSnippet = text;
+      // Update immediately when Claude says something, but throttle to 5s.
+      if (Date.now() - lastProgressEdit > 5_000) editProgress();
     });
     clearInterval(stillWorkingInterval);
     const attachments = collectAttachments(WORK_DIR);
