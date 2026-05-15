@@ -420,9 +420,17 @@ discord.on("messageCreate", async (message) => {
   const placeholder = await message.reply("Data Boy is researching…");
   const startedAt = Date.now();
 
+  const stillWorkingInterval = setInterval(async () => {
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    try {
+      await placeholder.edit(`Data Boy is still researching… (${elapsed}s)`);
+    } catch {}
+  }, 30_000);
+
   try {
     const systemPrompt = await buildSystemPrompt();
     const result = await answer(question, systemPrompt);
+    clearInterval(stillWorkingInterval);
     const attachments = collectAttachments(WORK_DIR);
     if (attachments.length > 0) {
       console.log(`Attaching ${attachments.length} file(s): ${attachments.map((a) => a.name).join(", ")}`);
@@ -442,6 +450,7 @@ discord.on("messageCreate", async (message) => {
       duration_ms: duration,
     });
   } catch (err) {
+    clearInterval(stillWorkingInterval);
     console.error("Error in answer():", err);
     await placeholder.edit(`Data Boy hit an error: \`${err.message}\``);
     await logQuery({
