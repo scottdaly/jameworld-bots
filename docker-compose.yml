@@ -49,6 +49,25 @@ services:
     network_mode: host
     restart: unless-stopped
 
+  discord-bot-data-boy:
+    build:
+      context: .
+      dockerfile: Dockerfile.data-boy
+    environment:
+      - NODE_OPTIONS=--dns-result-order=ipv4first
+      - DISCORD_TOKEN_DATA_BOY=${DISCORD_TOKEN_DATA_BOY}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=127.0.0.1
+      - POSTGRES_PORT=5432
+      - POSTGRES_READONLY_USER=${POSTGRES_READONLY_USER}
+      - POSTGRES_READONLY_PASSWORD=${POSTGRES_READONLY_PASSWORD}
+      - PGCONN=postgresql://${POSTGRES_READONLY_USER}:${POSTGRES_READONLY_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
+    network_mode: host
+    restart: unless-stopped
+
   adminer:
     image: adminer
     restart: always

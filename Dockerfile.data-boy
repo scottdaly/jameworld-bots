@@ -1,0 +1,31 @@
+FROM node:20-bullseye
+
+# psql for Claude's Bash tool to query the read-only DB role.
+# python + pandas/matplotlib for ad-hoc analysis.
+# jq for shaping JSON in shell pipelines.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      postgresql-client \
+      python3 \
+      python3-pip \
+      jq \
+ && pip3 install --no-cache-dir \
+      pandas \
+      matplotlib \
+      tabulate \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+
+# Data Boy has its own package.json to avoid peer-dep conflicts with
+# the other bots' openai dependency (which pins zod@3, while the
+# Agent SDK requires zod@4).
+COPY package-data-boy.json ./package.json
+RUN npm install --omit=dev
+
+COPY data-boy.js data-boy-prompt.md ./
+
+# Scratch dir Claude works in. Wiped per query by data-boy.js.
+RUN mkdir -p /tmp/data-boy-work
+
+CMD ["node", "data-boy.js"]
