@@ -74,14 +74,43 @@ function stripMention(content, botUserId) {
     .trim();
 }
 
-async function postChunked(channel, text, placeholder) {
+const MAX_ATTACHMENTS = 5;
+const MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
+
+function collectAttachments(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of entries) {
+    if (!/\.(png|jpe?g)$/i.test(name)) continue;
+    const full = path.join(dir, name);
+    let stat;
+    try {
+      stat = fs.statSync(full);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    if (stat.size > MAX_ATTACHMENT_BYTES) continue;
+    out.push({ path: full, name, size: stat.size, mtime: stat.mtimeMs });
+  }
+  // Newest first; cap.
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out.slice(0, MAX_ATTACHMENTS).map((a) => ({ attachment: a.path, name: a.name }));
+}
+
+async function postChunked(channel, text, placeholder, files = []) {
   const trimmed = text.trim();
-  if (trimmed.length === 0) {
+  if (trimmed.length === 0 && files.length === 0) {
     await placeholder.edit("(Data Boy returned no answer.)");
     return;
   }
   if (trimmed.length <= DISCORD_MAX_LEN) {
-    await placeholder.edit(trimmed);
+    await placeholder.edit({ content: trimmed || " ", files });
     return;
   }
   const parts = [];
@@ -92,6 +121,9 @@ async function postChunked(channel, text, placeholder) {
     const labeled = `${parts[i]}\n*(part ${i + 1}/${parts.length})*`;
     if (i === 0) {
       await placeholder.edit(labeled);
+    } else if (i === parts.length - 1) {
+      // Attach files on the final chunk so the reader sees them after the prose.
+      await channel.send({ content: labeled, files });
     } else {
       await channel.send(labeled);
     }
@@ -303,10 +335,63 @@ async function logQuery(row) {
   }
 }
 
+async function handleStats(message) {
+  try {
+    const summary = await adminPool.query(`
+      WITH recent AS (
+        SELECT * FROM data_boy_logs WHERE asked_at > now() - interval '7 days'
+      )
+      SELECT
+        (SELECT count(*) FROM recent) AS total,
+        (SELECT count(*) FROM recent WHERE error IS NOT NULL) AS errors,
+        (SELECT COALESCE(sum(input_tokens), 0) FROM recent) AS in_tok,
+        (SELECT COALESCE(sum(output_tokens), 0) FROM recent) AS out_tok,
+        (SELECT COALESCE(avg(duration_ms), 0)::int FROM recent) AS avg_dur,
+        (SELECT COALESCE(avg(turns), 0)::numeric(10,1) FROM recent) AS avg_turns
+    `);
+    const top = await adminPool.query(`
+      SELECT discord_user, count(*) AS n
+      FROM data_boy_logs
+      WHERE asked_at > now() - interval '7 days'
+      GROUP BY discord_user
+      ORDER BY n DESC
+      LIMIT 5
+    `);
+    const all = await adminPool.query(
+      `SELECT count(*) AS n FROM data_boy_logs`
+    );
+    const s = summary.rows[0];
+    const lines = [
+      "**Data Boy — last 7 days**",
+      "```",
+      `Total questions:  ${s.total}`,
+      `Errors:           ${s.errors}`,
+      `Tokens:           ${Number(s.in_tok).toLocaleString()} in / ${Number(s.out_tok).toLocaleString()} out`,
+      `Avg duration:     ${(s.avg_dur / 1000).toFixed(1)}s`,
+      `Avg turns:        ${s.avg_turns}`,
+      "",
+      `Top askers:`,
+      ...top.rows.map((r) => `  ${r.discord_user.padEnd(28)} ${r.n}`),
+      "```",
+      `_Lifetime total: ${all.rows[0].n} questions._`,
+    ];
+    await message.reply(lines.join("\n"));
+  } catch (err) {
+    console.error("Stats command failed:", err);
+    await message.reply(`Couldn't pull stats: \`${err.message}\``);
+  }
+}
+
 // ── Discord event handling ─────────────────────────────────────────────────
 discord.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!message.guild) return;
+
+  if (message.content.trim().toLowerCase() === "!datastats") {
+    await handleStats(message);
+    return;
+  }
+
   if (!message.mentions.has(discord.user)) return;
 
   const question = stripMention(message.content, discord.user.id);
@@ -332,13 +417,17 @@ discord.on("messageCreate", async (message) => {
   }
 
   inFlight.add(userId);
-  const placeholder = await message.reply("Data Boy is thinking…");
+  const placeholder = await message.reply("Data Boy is researching…");
   const startedAt = Date.now();
 
   try {
     const systemPrompt = await buildSystemPrompt();
     const result = await answer(question, systemPrompt);
-    await postChunked(message.channel, result.text, placeholder);
+    const attachments = collectAttachments(WORK_DIR);
+    if (attachments.length > 0) {
+      console.log(`Attaching ${attachments.length} file(s): ${attachments.map((a) => a.name).join(", ")}`);
+    }
+    await postChunked(message.channel, result.text, placeholder, attachments);
     const duration = Date.now() - startedAt;
     console.log(
       `Answered "${question.slice(0, 60)}" in ${duration}ms (${result.turns} turns, ${result.inputTokens}+${result.outputTokens} tokens)`
