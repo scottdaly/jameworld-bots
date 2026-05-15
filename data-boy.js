@@ -99,6 +99,44 @@ function stripMention(content, botUserId) {
     .trim();
 }
 
+// Discord doesn't preserve session state across @-mentions, so each question
+// arrives without memory of prior turns. Pull the last N channel messages and
+// hand them to Claude as conversation context — this lets follow-ups like
+// "expand on 7" or "no the one about X" actually resolve.
+const RECENT_CONTEXT_LIMIT = 20;
+const RECENT_CONTEXT_MAX_CHARS_PER_MSG = 600;
+
+async function fetchRecentContext(channel, beforeMessageId, botUserId) {
+  try {
+    const fetched = await channel.messages.fetch({
+      limit: RECENT_CONTEXT_LIMIT,
+      before: beforeMessageId,
+    });
+    const ordered = [...fetched.values()].reverse(); // oldest first
+    const lines = [];
+    for (const m of ordered) {
+      let content = (m.cleanContent || m.content || "").trim();
+      if (!content) continue;
+      // Skip Data Boy's own progress placeholders — they're noise.
+      if (
+        m.author.id === botUserId &&
+        /^(Data Boy is (still )?researching|_\(still working)/i.test(content)
+      ) {
+        continue;
+      }
+      if (content.length > RECENT_CONTEXT_MAX_CHARS_PER_MSG) {
+        content = content.slice(0, RECENT_CONTEXT_MAX_CHARS_PER_MSG) + " …[truncated]";
+      }
+      const author = m.author.id === botUserId ? "Data Boy" : m.author.username;
+      lines.push(`${author}: ${content}`);
+    }
+    return lines.join("\n");
+  } catch (err) {
+    console.error("Failed to fetch recent context:", err.message);
+    return "";
+  }
+}
+
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
 
@@ -499,8 +537,16 @@ discord.on("messageCreate", async (message) => {
   const model = depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
   const askerUsername = message.author.username;
   const askerLine = `**Asker:** Discord user \`${askerUsername}\` (look them up in the People table to use their friendly name when addressing them).\n\n`;
-  const enrichedQuestion = askerLine + question;
-  console.log(`Classified "${question.slice(0, 60)}" as ${depth} → ${model} (asker: ${askerUsername})`);
+  const recentContext = await fetchRecentContext(
+    message.channel,
+    message.id,
+    discord.user.id
+  );
+  const contextBlock = recentContext
+    ? `**Recent channel conversation** (last ~${RECENT_CONTEXT_LIMIT} messages, chronological; use to resolve follow-ups like "expand on #N", "the one about X", "no, the other one", etc.):\n\n${recentContext}\n\n---\n\n`
+    : "";
+  const enrichedQuestion = `${askerLine}${contextBlock}**Current question:**\n${question}`;
+  console.log(`Classified "${question.slice(0, 60)}" as ${depth} → ${model} (asker: ${askerUsername}, ctx: ${recentContext.length} chars)`);
 
   try {
     const systemPrompt = await buildSystemPrompt(depth);
