@@ -3,13 +3,13 @@
 ### Identity
 Jake Daly. Lives in **Concord / Charlotte, NC** (Eastern time). Married to **Aubrey**. **Scott's younger brother** — they grew up together and are still tight, gaming together remotely and visiting in person. Used to live in Idaho ("From ID to NC"). Devout **LDS/Mormon** — references general conference, stake conference ("It's stake conference boys… *steak* conference nano banana memes welcome"), his bishop, mission talk, and Living Scriptures subscription show up routinely.
 
-Works in **software sales** (supply chain industry — high base + commission). Travels for work; mentioned a Spain trip and impact on the UK. Previously worked at a company called Wheel and has tried to recruit friends to apply: *"You should apply. Put that you know me."* Has a coworker who tried to friend him on Discord — *"i feel like i can't accept becuase then he'll know how much i game during work."*
+Works in **account management / client success** (supply chain industry). He spent years in **software sales** in this industry before switching to AM/CS — that's where most of the "software sales recruiting" lore in older chat history comes from. Travels for work; mentioned a Spain trip and impact on the UK. Has a coworker who tried to friend him on Discord — *"i feel like i can't accept becuase then he'll know how much i game during work."*
 
-Drives a **Ford Fusion** ("I've got a ford fusion in my garage with a dent just begging for some love"). Owns a house with a yard, a garage, and a Christmas tree lighting setup that has gone sideways.
+**Gamer handle: Valryk.**
 
-Pregnancy timeline: announced his wife had a **miscarriage** on 2025-09-23 (returning from a long absence — *"Unfortunately my wife had a miscarriage"*). Came back on 2025-11-21 with a triumphant *"BABYYYYYYYYYYY"* — appears to be a new pregnancy. Has floated the name **Valryk** for a boy ("Do I tell my wife that or do I just say that I like the name?").
+**Cars:** Recently bought a **new Kia Sportage**. His old **Ford Fusion** ("I've got a ford fusion in my garage with a dent just begging for some love") is still sitting in his garage — he needs to get rid of it but keeps procrastinating. Owns a house with a yard, a garage, and a Christmas tree lighting setup that has gone sideways.
 
-He has parents and a grandma nearby — both involved in chat lore (*"me and my wife and my parents all bullied scott saying he'll never pick up chicks with a prius"*; grandma being shown AI-generated content and believing it's real). **Has never met Matthan IRL** as of late 2025.
+**Family nearby:** His parents recently **moved from Pueblo, CO to Dallas, TX**. His **only living grandma still lives in Pueblo**. Both parents and grandma come up in chat lore (*"me and my wife and my parents all bullied scott saying he'll never pick up chicks with a prius"*; grandma being shown AI-generated content and believing it's real). **Has never met Matthan IRL** as of late 2025.
 
 ### Writing style
 Jake is the **quietest profanity-user and lowest-volume poster among the core four** (2,507 messages, ~109 per 1k server messages). Recent meta-analysis he himself ran flagged him as the *only* core member who has **never said "lol" or "lmao"** in 2,391 messages. His profanity score (26) is roughly 1/50th of Scott's.
@@ -29,7 +29,7 @@ But the signature Jake move is the **high-effort dramatic essay** dropped into a
 - *"The sands of time have weathered my brow, but here I remain, whole. We've moved homes since the last time my text has echoed in the illustrious halls of Jameworld."*
 
 Other style tics:
-- Stretched all-caps for excitement: **"BABYYYYYYYYYYY"**, **"LFGGGGG"**, **"CLAUDDDEEE"**, **"GET MIXIN JAME"**.
+- Stretched all-caps for excitement: **"LFGGGGG"**, **"CLAUDDDEEE"**, **"GET MIXIN JAME"**.
 - Loves **"tbh"** and **"ngl"** — *"A prius-shaped cup holder sounds gas tbh"*; *"Ngl I thought this might be the case…"*
 - Vocatives are vintage / formal: **"boys," "brothers," "lads," "brethren," "chat,"** and the half-ironic **"my guy."**
 - TikTok-link dumps with no comment.
@@ -39,7 +39,7 @@ Other style tics:
 ### Personality
 **Outwardly buttoned-up, internally extremely weird.** Jake projects the cleanest persona on the server — Mormon, married, sales career, doesn't swear, doesn't use "lol" — but the bits he chooses to drop are the most chaotic. He'll spend a paragraph being eloquent and then ask Zuckerbuns to *"create a detailed itinerary for a party where we hunt Jake for sport"*-style nonsense. The contrast is the joke.
 
-**Sales-brain, always.** He's the chat's hustler. Tries to recruit Matthan into software sales (*"Get into software sales you get a high base salary + commission"*), tries to start side businesses (a bumper sticker company; later a *"$50k energy drink business"* — *"Chat how can I convince my wife to let me spend $50k to start an energy drink business?"*), keeps a meticulous list of monthly subscriptions to cancel (renter's insurance × 3, Freepik, Shopify, Suno, Living Scriptures, etc.), brags about commission, "passive income grind," *"Landed a whale."* Jame ribs him: *"Jake what do they say in the sales world as a metaphor for closing big deals."*
+**Sales-brain, always.** He's the chat's hustler. Spent years in software sales before recently switching to account management / client success — but the sales-brain residue is permanent. Tried to recruit Matthan into software sales (*"Get into software sales you get a high base salary + commission"*), tries to start side businesses (a bumper sticker company; later a *"$50k energy drink business"* — *"Chat how can I convince my wife to let me spend $50k to start an energy drink business?"*), keeps a meticulous list of monthly subscriptions to cancel (renter's insurance × 3, Freepik, Shopify, Suno, Living Scriptures, etc.), brags about closing deals, "passive income grind," *"Landed a whale."* Jame ribs him: *"Jake what do they say in the sales world as a metaphor for closing big deals."*
 
 **Family-man wholesome with a dry edge.** His wife is the most frequently referenced character in his messages. Bits:
 - *"My wife had to let em know"*
@@ -92,7 +92,6 @@ Other style tics:
 - **The Onion Ranking (Dec 2025).** *"Jake is the most power obsessed, seeking to use his newfound shallot strength to overtake the world. Scott is most susceptible to the onion, letting it take total control of him and his being."*
 - **Subscription audit (Dec 2025).** Posted a fully itemized list of monthly subs he was cancelling — 16 line items including three different renter's insurances.
 - **The Concord NC Christmas tree shooting (Nov 22, 2025).** *"Well my christmas tree lighting didn't go as planned…"* + linked the WCNC article. Confirms the city.
-- **The miscarriage → "BABYYYYY" arc (Sept–Nov 2025).** Major emotional turn; group rallied.
 - **"I am the terrorist" airport story (Jan 2026).** Recounts a dude at his MT-bound gate yelling *"STOP LOOKING AT YOUR PHONES AND LOOK AT ME AI SHEEP." "I AM THE TERRORIST, I WILL DESTORY YOU ALL."*
 - **The Satisfactory pitch (March 2026).** Three-bullet essay convincing Jame to buy the game, ending with offering his soul as collateral.
 - **"Hunt Jake for sport" (Dec 2025).** Jame's bit, but it's now a Jake-coded lore item.
@@ -102,7 +101,7 @@ Other style tics:
 
 ### Catchphrases
 - **"King Jame"** / **"King JAME"** / **"king jaMe"** — his personal liturgy.
-- **"BABYYYYYYY"** / **"LFGGGGG"** / **"CLAUDDDEEE"** — stretched-cap excitement.
+- **"LFGGGGG"** / **"CLAUDDDEEE"** — stretched-cap excitement.
 - **"Respect brother."**
 - **"boys" / "brothers" / "lads" / "brethren" / "chat" / "Jameworld"** — vocatives.
 - **"tbh" / "ngl" / "tbt."**
@@ -116,6 +115,6 @@ Other style tics:
 
 **Late 2024:** Persona crystallizes. Starts dropping the in-character monologues (Jamaican ACV sermon), the elaborate bits about No Man's Sky, the political-centrist riffs. Engages more with Scott about gaming.
 
-**2025:** Marriage life is firmly center-stage. Sales recruiting pitches begin in earnest (~May 2025). Big year for King Jame mythology — codifies the pronouns bit, the King-Jame-only-appears-in-Jameson's-broken-moments theory. **Sept–Nov 2025: miscarriage, then move (new house), then pregnancy announcement.** Comes back with the *"sands of time have weathered my brow"* re-entry monologue and from then on shows up in bursts with high-effort posts.
+**2025:** Marriage life is firmly center-stage. Sales recruiting pitches begin in earnest (~May 2025). Big year for King Jame mythology — codifies the pronouns bit, the King-Jame-only-appears-in-Jameson's-broken-moments theory. Moved into a new house in fall 2025. Came back from a long absence with the *"sands of time have weathered my brow"* re-entry monologue and from then on shows up in bursts with high-effort posts.
 
-**Late 2025–2026:** Settles into a rhythm of being **the rare-but-spectacular poster**. He says it himself: *"I come to Jameworld so rarely nowadays that I feel the need I make a dramatic entrance every time."* Starts working the AI bots harder for analysis bits — by May 2026 he's pulling chat datasets and posting Claude-generated tables (slur scoring, "lol/lmao/bro" counts, support-phrase rankings). He notices, and posts, that he's the only one who has **never said "lol."** Gaming with Scott picks back up (Battlefield, Counterstrike, The Finals, Arc Raiders). The energy-drink-business pitch to his wife is the latest hustle iteration. Distance from Matthan/Noah hasn't really closed — *"Noah what's your job?"* in January 2026 is telling — but the warmth with Jame and Scott has only deepened.
+**Late 2025–2026:** Settles into a rhythm of being **the rare-but-spectacular poster**. He says it himself: *"I come to Jameworld so rarely nowadays that I feel the need I make a dramatic entrance every time."* Starts working the AI bots harder for analysis bits — by May 2026 he's pulling chat datasets and posting Claude-generated tables (slur scoring, "lol/lmao/bro" counts, support-phrase rankings). He notices, and posts, that he's the only one who has **never said "lol."** Gaming with Scott picks back up (Battlefield, Counterstrike, The Finals, Arc Raiders). **Career shift: moved from software sales into account management / client success.** Also recently swapped the Ford Fusion for a new Kia Sportage (Fusion is still parked in the garage waiting to be sold). The energy-drink-business pitch to his wife is the latest hustle iteration. Distance from Matthan/Noah hasn't really closed — *"Noah what's your job?"* in January 2026 is telling — but the warmth with Jame and Scott has only deepened.
