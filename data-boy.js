@@ -249,7 +249,7 @@ async function buildSystemPrompt() {
 }
 
 // ── The core: run one question through the SDK ─────────────────────────────
-async function answer(question, systemPrompt) {
+async function answer(question, systemPrompt, onProgress = null) {
   // Fresh scratch dir per question.
   fs.rmSync(WORK_DIR, { recursive: true, force: true });
   fs.mkdirSync(WORK_DIR, { recursive: true });
@@ -296,7 +296,10 @@ async function answer(question, systemPrompt) {
         .filter((b) => b.type === "text")
         .map((b) => b.text)
         .join("\n");
-      if (textBlocks) lastAssistantText = textBlocks;
+      if (textBlocks) {
+        lastAssistantText = textBlocks;
+        onProgress?.(textBlocks);
+      }
     } else if (msg.type === "result") {
       resultText = msg.result || null;
       turns = msg.num_turns ?? turns;
@@ -419,17 +422,25 @@ discord.on("messageCreate", async (message) => {
   inFlight.add(userId);
   const placeholder = await message.reply("Data Boy is researching…");
   const startedAt = Date.now();
+  let progressSnippet = null;
 
   const stillWorkingInterval = setInterval(async () => {
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    let status = `Data Boy is still researching… (${elapsed}s)`;
+    if (elapsed >= 90 && progressSnippet) {
+      const snippet = progressSnippet.replace(/\n+/g, " ").slice(0, 200);
+      status += `\n> ${snippet}`;
+    }
     try {
-      await placeholder.edit(`Data Boy is still researching… (${elapsed}s)`);
+      await placeholder.edit(status);
     } catch {}
   }, 30_000);
 
   try {
     const systemPrompt = await buildSystemPrompt();
-    const result = await answer(question, systemPrompt);
+    const result = await answer(question, systemPrompt, (text) => {
+      progressSnippet = text;
+    });
     clearInterval(stillWorkingInterval);
     const attachments = collectAttachments(WORK_DIR);
     if (attachments.length > 0) {
