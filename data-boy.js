@@ -487,11 +487,14 @@ discord.on("messageCreate", async (message) => {
 
   const depth = classifyDepth(question);
   const model = depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
-  console.log(`Classified "${question.slice(0, 60)}" as ${depth} → ${model}`);
+  const askerUsername = message.author.username;
+  const askerLine = `**Asker:** Discord user \`${askerUsername}\` (look them up in the People table to use their friendly name when addressing them).\n\n`;
+  const enrichedQuestion = askerLine + question;
+  console.log(`Classified "${question.slice(0, 60)}" as ${depth} → ${model} (asker: ${askerUsername})`);
 
   try {
     const systemPrompt = await buildSystemPrompt(depth);
-    const result = await answer(question, systemPrompt, model, (text) => {
+    const result = await answer(enrichedQuestion, systemPrompt, model, (text) => {
       progressSnippet = text;
       // Update immediately when Claude says something, but throttle to 5s.
       if (Date.now() - lastProgressEdit > 5_000) editProgress();
