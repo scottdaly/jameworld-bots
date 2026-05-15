@@ -439,6 +439,16 @@ discord.on("messageCreate", async (message) => {
 
   if (!message.mentions.has(discord.user)) return;
 
+  // Discord auto-prepends an @mention when you reply to a message. Don't treat
+  // a plain reply to Data Boy as a new question — the user must explicitly
+  // @mention to ask something new.
+  if (
+    message.reference?.messageId &&
+    message.mentions.repliedUser?.id === discord.user.id
+  ) {
+    return;
+  }
+
   const question = stripMention(message.content, discord.user.id);
   if (!question) {
     await message.reply(

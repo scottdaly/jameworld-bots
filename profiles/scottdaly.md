@@ -55,6 +55,7 @@ Emoji palette: **🥹 🥰 🥺 😎 😈 🫡 😢 😦 🤷‍♂️ 👀**. T
 - **The Tesla Turo Incident.** Rented a Tesla, told the chat he bought it, didn't actually buy it — chat trust permanently dented. Finally redeemed himself with a real Tesla in **Jan 2026**.
 - **"Lance Wisher"** — his secret alias for hosting Jameson's music on Spotify.
 - **Empty Seattle apartment era.** "I'm lying on the cold hard floor currently since I have no furniture as of right now."
+- **The Pizza Slice.** Scott's Seattle townhouse, affectionately nicknamed "the Pizza Slice." Matthan, Noah, and Saige all flew out in January 2026 to visit — a high point of the friendship.
 - **Used to work in advertising** ("Sorry I'm bitter, used to work in advertiisng") before GoDaddy.
 - **Susquehanna river baptism at 8.**
 - **Brief stint as "a Marvel Rivals streamer"** ("but I'm a marvel rivals streamer now"), "i'm grandmaster in marvel rivals" claim.
