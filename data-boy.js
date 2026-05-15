@@ -14,7 +14,32 @@ const {
 const DISCORD_MAX_LEN = 2000;
 const REPLY_CHUNK_LEN = 1900;
 const MAX_TURNS = 30;
-const MODEL = "claude-sonnet-4-6";
+const MODEL_SHALLOW = "claude-sonnet-4-6";
+const MODEL_DEEP = "claude-opus-4-7";
+
+// Keywords that signal a question requires deeper analysis/synthesis.
+// On a hit, we route to Opus and tell the model to pull larger samples.
+const DEEP_KEYWORDS = [
+  "lore",
+  "personality",
+  "personalities",
+  "analyze",
+  "analysis",
+  "analyse",
+  "psychoanal",
+  "characteriz",
+  "profile",
+  "tell me about",
+  "deep dive",
+  "writing style",
+  "summarize each",
+  "summary of each",
+];
+
+function classifyDepth(question) {
+  const lower = question.toLowerCase();
+  return DEEP_KEYWORDS.some((kw) => lower.includes(kw)) ? "deep" : "shallow";
+}
 
 const PROMPT_PATH = path.join(__dirname, "data-boy-prompt.md");
 const WORK_DIR = "/tmp/data-boy-work";
@@ -213,7 +238,7 @@ const mcpServer = createSdkMcpServer({
 });
 
 // ── Startup context ────────────────────────────────────────────────────────
-async function buildSystemPrompt() {
+async function buildSystemPrompt(depth = "shallow") {
   const template = fs.readFileSync(PROMPT_PATH, "utf8");
 
   const stats = await adminPool.query(`
@@ -239,6 +264,11 @@ async function buildSystemPrompt() {
     channelLines.push(`- \`${id}\` → #${name}`);
   }
 
+  const depthGuidance =
+    depth === "deep"
+      ? "**Depth tier: DEEP.** This question requires synthesis across many messages. Pull a substantial sample — scale with the user's total message count (aim for `min(2000, total/8)` messages, well-spread across the date range). Take your time; multiple passes are fine. Verify relationship claims (girlfriend vs sister, roommate vs brother, etc.) before asserting them."
+      : "**Depth tier: SHALLOW.** This is a counting/stats/lookup question. One or two SQL queries should be enough. Don't over-sample.";
+
   const context = [
     "",
     "---",
@@ -250,6 +280,8 @@ async function buildSystemPrompt() {
     `- Distinct authors: ${s.author_count}`,
     `- Distinct channels: ${s.channel_count}`,
     "",
+    depthGuidance,
+    "",
     "### Channel ID → name",
     "",
     ...channelLines,
@@ -259,7 +291,7 @@ async function buildSystemPrompt() {
 }
 
 // ── The core: run one question through the SDK ─────────────────────────────
-async function answer(question, systemPrompt, onProgress = null) {
+async function answer(question, systemPrompt, model, onProgress = null) {
   // Fresh scratch dir per question.
   fs.rmSync(WORK_DIR, { recursive: true, force: true });
   fs.mkdirSync(WORK_DIR, { recursive: true });
@@ -273,7 +305,7 @@ async function answer(question, systemPrompt, onProgress = null) {
   for await (const msg of sdkQuery({
     prompt: question,
     options: {
-      model: MODEL,
+      model,
       maxTurns: MAX_TURNS,
       cwd: WORK_DIR,
       systemPrompt,
@@ -453,9 +485,13 @@ discord.on("messageCreate", async (message) => {
   // Fallback heartbeat in case Claude emits no text for a long stretch.
   const stillWorkingInterval = setInterval(editProgress, 30_000);
 
+  const depth = classifyDepth(question);
+  const model = depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
+  console.log(`Classified "${question.slice(0, 60)}" as ${depth} → ${model}`);
+
   try {
-    const systemPrompt = await buildSystemPrompt();
-    const result = await answer(question, systemPrompt, (text) => {
+    const systemPrompt = await buildSystemPrompt(depth);
+    const result = await answer(question, systemPrompt, model, (text) => {
       progressSnippet = text;
       // Update immediately when Claude says something, but throttle to 5s.
       if (Date.now() - lastProgressEdit > 5_000) editProgress();
@@ -468,7 +504,7 @@ discord.on("messageCreate", async (message) => {
     await postChunked(message.channel, result.text, placeholder, attachments);
     const duration = Date.now() - startedAt;
     console.log(
-      `Answered "${question.slice(0, 60)}" in ${duration}ms (${result.turns} turns, ${result.inputTokens}+${result.outputTokens} tokens)`
+      `Answered "${question.slice(0, 60)}" in ${duration}ms (${depth}/${model}, ${result.turns} turns, ${result.inputTokens}+${result.outputTokens} tokens)`
     );
     await logQuery({
       discord_user: userTag,
