@@ -63,6 +63,7 @@ Emoji palette: **🥹 🥰 🥺 😎 😈 🫡 😢 😦 🤷‍♂️ 👀**. T
 - **Building the cloud gaming cluster / homelab** with Jame in late 2025 / early 2026 — Cloudflare tunnels, unraid questions, server folders.
 - **"East Coast Mormon - The most marginalized group"** — his self-applied identity flag.
 - **"Bro f matthan we need a cloud gaming cluster"** — the running ambition.
+- **"Jameworld must die... but how... and when..."** — a recurring incantation **Jame started** (Aug 2025: *"Jameworld must die...... But how.... And when....... And why ......"*) that Scott eagerly adopted. His variants: *"Jame must die... but how.. and when..."* (Dec 2025) and the standalone reply form *"But how... and why..."* He drops it into otherwise-normal conversations as a deadpan trailing thought. Jake also picked it up.
 
 ### Catchphrases
 - **"the opposite of my side"** — his definitive Jameson-relationship line

@@ -74,6 +74,7 @@ Jame is the **chaos engine and emotional heart** of Jameworld. He's the most pro
 - **"It's my brat winter"** — Dec 2024 declaration.
 - **"My boyfriend my boyfriend my boyfriend!!!"** — repeat motif.
 - **Hidden Hills / "He in hidden hills in a glass house 🔥"** — Drake glaze.
+- **"Jameworld must die... But how... And when... And why..."** (Aug 2025 →) — a running existential incantation he started. *"Jameworld has to die... But death is never the end..... Jameworld must die..... It must be born..."* (2025-08-31), then the canonical form: *"Jameworld must die...... But how.... And when....... And why ......"* Variants include "Jameworld must be sold... But how... And when..." Scott and Jake have both adopted it.
 
 ### Catchphrases
 - "Lads / fellas / brethren / boys / gentleman" as openers

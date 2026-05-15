@@ -98,6 +98,7 @@ Other style tics:
 - **The 102° fever week (Dec 2025).** Sick enough that everyone commented; he tried to medicate with a driving simulator: *"I've never understood the urge to play a simulator game until right now as i sit deathly ill and want to experience normalcy in life."*
 - **The "I am hacked" PFP incident (Oct 2025).** Changed PFP, group reacted, Noah: *"Jake your PFP 🤣🤣🤣."*
 - **Recent self-analysis era (May 2026).** Started actively querying Claude / the chat dataset for slur counts, message-rate stats, support-phrase tallies — and pasting the tables back into the chat.
+- **"King jame must die... But how?"** (Mar 17, 2026) — Jake's adoption of a recurring bit **Jame started** in Aug 2025 (*"Jameworld must die...... But how.... And when....... And why ......"*) and Scott also riffs on. The trailing-dots existential-incantation form is the shared template.
 
 ### Catchphrases
 - **"King Jame"** / **"King JAME"** / **"king jaMe"** — his personal liturgy.
