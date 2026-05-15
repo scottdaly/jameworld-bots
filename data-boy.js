@@ -114,8 +114,18 @@ async function postChunked(channel, text, placeholder, files = []) {
     return;
   }
   const parts = [];
-  for (let i = 0; i < trimmed.length; i += REPLY_CHUNK_LEN) {
-    parts.push(trimmed.slice(i, i + REPLY_CHUNK_LEN));
+  let remaining = trimmed;
+  while (remaining.length > 0) {
+    if (remaining.length <= REPLY_CHUNK_LEN) {
+      parts.push(remaining);
+      break;
+    }
+    // Prefer splitting at a newline, fall back to a space, hard-cut only if needed.
+    let splitAt = remaining.lastIndexOf("\n", REPLY_CHUNK_LEN);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf(" ", REPLY_CHUNK_LEN);
+    if (splitAt <= 0) splitAt = REPLY_CHUNK_LEN;
+    parts.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
   }
   for (let i = 0; i < parts.length; i++) {
     const labeled = `${parts[i]}\n*(part ${i + 1}/${parts.length})*`;
