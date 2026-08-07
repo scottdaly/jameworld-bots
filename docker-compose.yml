@@ -109,8 +109,11 @@ services:
       context: .
       dockerfile: Dockerfile.leaderboard
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      # Public-facing web app → connect as the read-only role (SELECT only,
+      # default_transaction_read_only, 10s statement timeout). A compromise of
+      # this service can't write or drop anything.
+      - POSTGRES_USER=${POSTGRES_READONLY_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_READONLY_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432

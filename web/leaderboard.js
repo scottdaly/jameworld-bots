@@ -1,9 +1,15 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
 const fetch = require('node-fetch');
 
 const app = express();
+app.disable('x-powered-by');
+// Only Caddy (on 127.0.0.1) sits in front of us, so trust loopback for
+// X-Forwarded-For. This makes req.ip the real client IP for rate limiting
+// without letting a client spoof it (only the loopback hop is trusted).
+app.set('trust proxy', 'loopback');
 const port = process.env.PORT || 3000;
 
 // PostgreSQL connection
@@ -63,6 +69,65 @@ function channelLabel(id) {
 }
 
 // (Channel names are fetched from Discord API if token+guild are provided.)
+
+// ── Security middleware ─────────────────────────────────────────────────────
+// Per-request CSP nonce + hardening headers. default-src 'none' denies
+// everything not explicitly allowed; scripts must carry the nonce (no
+// unsafe-inline), and framing is forbidden (clickjacking). style-src allows
+// inline because the page ships one <style> block and inline width bars.
+app.use((req, res, next) => {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  res.locals.cspNonce = nonce;
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  // Served exclusively via Caddy over HTTPS. No includeSubDomains/preload so
+  // this can't affect sibling *.rsdaly.com projects.
+  res.set('Strict-Transport-Security', 'max-age=31536000');
+  res.set(
+    'Content-Security-Policy',
+    [
+      "default-src 'none'",
+      "img-src 'self' data:",
+      "style-src 'self' 'unsafe-inline'",
+      `script-src 'nonce-${nonce}'`,
+      "form-action 'self'",
+      "base-uri 'none'",
+      "frame-ancestors 'none'",
+    ].join('; ')
+  );
+  next();
+});
+
+// ── Simple in-memory per-IP rate limiter ───────────────────────────────────
+// Fixed window; enough to blunt scraping / cheap DoS of the aggregation
+// queries without a dependency. /health is exempt so monitors aren't limited.
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = 120; // requests per IP per minute
+const rateHits = new Map(); // ip → { count, resetAt }
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  let entry = rateHits.get(ip);
+  if (!entry || entry.resetAt < now) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateHits.set(ip, entry);
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+    return res.status(429).send('Too many requests');
+  }
+  next();
+});
+// Prune expired buckets so the map can't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateHits) {
+    if (entry.resetAt < now) rateHits.delete(ip);
+  }
+}, 5 * 60 * 1000).unref();
 
 // Simple health endpoint
 app.get('/health', async (_req, res) => {
@@ -178,6 +243,7 @@ app.get('/api/channels', async (req, res) => {
 
 // HTML page
 app.get('/', async (req, res) => {
+  const nonce = res.locals.cspNonce;
   const range = normalizeRange(req.query.range);
   await ensureChannelCacheFresh();
   const channel = req.query.channel ? String(req.query.channel) : '';
@@ -343,7 +409,7 @@ app.get('/', async (req, res) => {
               <form method="GET" action="/">
                 <input type="hidden" name="range" value="${range}" />
                 <span class="select-wrap">
-                  <select class="select" name="channel" onchange="this.form.submit()">
+                  <select class="select" name="channel" id="channel-select">
                     <option value="" ${channel ? '' : 'selected'}>All channels</option>
                     ${channels
                       .map(c => `<option value="${escapeHtml(c.id)}" ${channel===c.id?'selected':''}>${escapeHtml(c.name)}${c.count!==null?` · ${Number(c.count).toLocaleString()}`:''}</option>`)
@@ -384,6 +450,10 @@ app.get('/', async (req, res) => {
           </div>
           <div class="footer">API: <code>/api/leaderboard?range=${range}${channel?`&channel=${encodeURIComponent(channel)}`:''}</code> · Channels: <code>/api/channels?range=${range}</code></div>
         </div>
+        <script nonce="${nonce}">
+          document.getElementById('channel-select')
+            .addEventListener('change', function () { this.form.submit(); });
+        </script>
       </body>
       </html>
     `;
