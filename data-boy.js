@@ -147,6 +147,10 @@ const WORK_DIR = "/tmp/data-boy-work";
 // Per-user in-flight question lock (Discord user id → boolean).
 const inFlight = new Set();
 
+// Discord message ids of "thinking…" placeholders belonging to a query that is
+// still running. The janitor (cleanupStalePlaceholders) excludes these so it
+// can never delete a live placeholder out from under a slow query.
+const livePlaceholderIds = new Set();
 
 // Per-user rate limit: count of starts in the last hour.
 const recentStarts = new Map(); // userId → [timestampsMs]
@@ -933,14 +937,39 @@ discord.on("messageCreate", async (message) => {
   inFlight.add(userId);
   const startedAt = Date.now();
 
-  // Show Discord's native "Data Boy is typing…" indicator while we work,
-  // instead of posting a placeholder message. A single sendTyping() lasts
-  // ~10s, so we refresh it on an interval until the answer is posted (sending
-  // any message clears the indicator automatically).
+  // A "thinking…" placeholder message that we edit with live progress, plus
+  // Discord's native typing indicator. Unlike before, the placeholder is NOT
+  // edited into the final answer — the answer is posted as separate new
+  // message(s), and the placeholder is edited one last time into a quiet
+  // "Data Boy thought for Ns" line (see the success path below).
+  const placeholder = await message.reply("Data Boy is thinking… 🧠");
+  livePlaceholderIds.add(placeholder.id);
+
+  // Native "Data Boy is typing…" indicator. A single sendTyping() lasts ~10s,
+  // so refresh it on an interval until we post the answer.
   message.channel.sendTyping().catch(() => {});
   const typingInterval = setInterval(() => {
     message.channel.sendTyping().catch(() => {});
   }, 8_000);
+
+  let progressSnippet = null;
+  let lastProgressEdit = 0;
+  async function editProgress() {
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    let status;
+    if (progressSnippet) {
+      const snippet = progressSnippet.replace(/\n+/g, " ").slice(0, 300);
+      status = `_(still thinking… ${elapsed}s)_\n> ${snippet}`;
+    } else {
+      status = `Data Boy is still thinking… (${elapsed}s) 🧠`;
+    }
+    try {
+      await placeholder.edit(status);
+      lastProgressEdit = Date.now();
+    } catch {}
+  }
+  // Heartbeat so the elapsed timer ticks even when the model is quiet.
+  const progressInterval = setInterval(editProgress, 15_000);
 
   const depth = classifyDepth(question);
   const model = depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
@@ -966,11 +995,16 @@ discord.on("messageCreate", async (message) => {
       content: enrichedQuestion,
       systemPrompt,
     });
+    const onProgress = (text) => {
+      progressSnippet = text;
+      // Update immediately when the model says something, throttled to 5s.
+      if (Date.now() - lastProgressEdit > 5_000) editProgress();
+    };
     let result;
     let capacityRetries = 0;
     while (true) {
       try {
-        result = await answer(enrichedQuestion, systemPrompt, model, null, maxTurns);
+        result = await answer(enrichedQuestion, systemPrompt, model, onProgress, maxTurns);
         break;
       } catch (err) {
         if (!isCapacityError(err) || capacityRetries >= CAPACITY_RETRY_DELAYS_MS.length) {
@@ -981,21 +1015,27 @@ discord.on("messageCreate", async (message) => {
         console.warn(
           `Capacity error on ${model} (attempt ${capacityRetries}/${CAPACITY_RETRY_DELAYS_MS.length}): ${err.message}. Retrying in ${waitMs}ms.`
         );
-        // Tell the asker we're waiting out a capacity blip — once, as its own
-        // message (the typing indicator keeps ticking between retries).
-        if (capacityRetries === 1) {
-          await message.channel.send(CAPACITY_RETRY_MESSAGE).catch(() => {});
-        }
+        // Surface the capacity blip in the placeholder itself.
+        try {
+          await placeholder.edit(CAPACITY_RETRY_MESSAGE);
+        } catch {}
         await new Promise((r) => setTimeout(r, waitMs));
       }
     }
+    clearInterval(progressInterval);
     clearInterval(typingInterval);
+    const duration = Date.now() - startedAt;
     const attachments = collectAttachments(WORK_DIR);
     if (attachments.length > 0) {
       console.log(`Attaching ${attachments.length} file(s): ${attachments.map((a) => a.name).join(", ")}`);
     }
+    // Convert the placeholder into a quiet "thought for Ns" line, then post the
+    // actual answer as separate new message(s).
+    const secs = Math.round(duration / 1000);
+    await placeholder
+      .edit(`-# 🧠 Data Boy thought for ${secs} second${secs === 1 ? "" : "s"}`)
+      .catch(() => {});
     await postChunked(message, result.text, attachments);
-    const duration = Date.now() - startedAt;
     const retryTag = capacityRetries > 0 ? ` [after ${capacityRetries} capacity retr${capacityRetries === 1 ? "y" : "ies"}]` : "";
     const isEmpty = (result.text || "").trim().length === 0 && attachments.length === 0;
     console.log(
@@ -1010,12 +1050,16 @@ discord.on("messageCreate", async (message) => {
       status: result.status,
     });
   } catch (err) {
+    clearInterval(progressInterval);
     clearInterval(typingInterval);
     console.error("Error in answer():", err);
+    // Turn the placeholder into the error message; if it's gone, reply fresh.
     try {
-      await replyOrSend(message, formatUserFacingError(err));
-    } catch (replyErr) {
-      console.error("Failed to deliver error message:", replyErr.message);
+      await placeholder.edit(formatUserFacingError(err));
+    } catch {
+      await replyOrSend(message, formatUserFacingError(err)).catch((replyErr) =>
+        console.error("Failed to deliver error message:", replyErr.message)
+      );
     }
     await finalizeQuery(logRowId, {
       error: err.message,
@@ -1023,6 +1067,7 @@ discord.on("messageCreate", async (message) => {
     });
   } finally {
     inFlight.delete(userId);
+    livePlaceholderIds.delete(placeholder.id);
   }
 });
 
@@ -1043,15 +1088,18 @@ async function logPlaceholderDeletion({ channelId, messageId, ageMs, content }) 
   }
 }
 
-// Delete stale "researching..." / "still working..." placeholders left in any
-// channel by an OLDER version of Data Boy (before we switched to the typing
-// indicator + new-message replies). The current bot no longer posts these, so
-// this is a one-way sweeper for legacy stragglers and post-redeploy orphans;
-// once the channels are clean it has nothing to do. STALE_MS stays well above
-// the observed max query duration (~306s) as a safety margin.
+// Delete stale "thinking…" / "still thinking…" placeholders (and legacy
+// "researching…" / "still working…" ones from older builds) that got orphaned
+// when the bot was killed mid-flight — e.g. during a redeploy — so they don't
+// sit in the channel forever. Runs at startup and every 90s. A live query's
+// placeholder is protected via livePlaceholderIds; STALE_MS is a backstop well
+// above the observed max query duration (~306s). Note the final "thought for
+// Ns" line and the answer messages don't match these patterns, so they're safe.
 async function cleanupStalePlaceholders() {
   const STALE_MS = 15 * 60 * 1000; // 15 min — safely above the slowest real query
   const PATTERNS = [
+    /^Data Boy is (still )?thinking/i,
+    /^_\(still thinking/i,
     /^Data Boy is (still )?researching/i,
     /^_\(still working/i,
   ];
@@ -1066,6 +1114,8 @@ async function cleanupStalePlaceholders() {
           const recent = await channel.messages.fetch({ limit: 50 });
           for (const m of recent.values()) {
             if (m.author.id !== discord.user.id) continue;
+            // Never touch a placeholder for a query still running here.
+            if (livePlaceholderIds.has(m.id)) continue;
             const ageMs = Date.now() - m.createdTimestamp;
             if (ageMs < STALE_MS) continue;
             if (!PATTERNS.some((re) => re.test(m.content || ""))) continue;
