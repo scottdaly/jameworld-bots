@@ -467,7 +467,6 @@ app.get('/', async (req, res) => {
               </tbody>
             </table>
           </div>
-          <div class="footer">API: <code>/api/leaderboard?range=${range}${channel?`&channel=${encodeURIComponent(channel)}`:''}</code> · Channels: <code>/api/channels?range=${range}</code></div>
         </div>
         <script nonce="${nonce}">
           document.getElementById('channel-select')
