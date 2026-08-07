@@ -356,7 +356,11 @@ const queryDbTool = tool(
   "Run a read-only SELECT/WITH SQL query against the jameworld database. " +
     "Returns up to 1000 rows as JSON. Hard 10s statement timeout. " +
     "Available tables: messages(id, channel_id, message_id, author, content, timestamp), " +
-    "user_profiles(username, profile, updated_at).",
+    "user_profiles(username, profile, updated_at), " +
+    "author_aliases(alias, canonical). " +
+    "Prefer the messages_canonical view (same columns as messages, but author " +
+    "resolved through author_aliases) whenever counting/grouping by author, so " +
+    "renamed users like 'Almighty Zuck'/'Zuckerbuns' aren't split.",
   { sql: z.string().describe("A single SELECT or WITH query.") },
   async ({ sql }) => {
     const trimmed = sql.trim().replace(/;+\s*$/, "");
@@ -608,7 +612,11 @@ function buildVercelAiSdkTools(aiTool, workDir) {
         "Returns up to 1000 rows as JSON. Hard 10s statement timeout. " +
         "Tables: messages(id, channel_id, message_id, author, content, timestamp), " +
         "user_profiles(username, profile, updated_at), " +
-        "episodes(channel_id, start_ts, end_ts, kind, sentiment, intensity, topic, summary, representative_quote, arc, participants, ...).",
+        "author_aliases(alias, canonical), " +
+        "episodes(channel_id, start_ts, end_ts, kind, sentiment, intensity, topic, summary, representative_quote, arc, participants, ...). " +
+        "Prefer the messages_canonical view (messages with author resolved via " +
+        "author_aliases) when counting/grouping by author so renamed users like " +
+        "'Almighty Zuck'/'Zuckerbuns' aren't split.",
       inputSchema: z.object({ sql: z.string().describe("A single SELECT or WITH query.") }),
       execute: async ({ sql }) => {
         const trimmed = sql.trim().replace(/;+\s*$/, "");
