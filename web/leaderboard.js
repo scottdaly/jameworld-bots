@@ -15,6 +15,12 @@ const pool = new Pool({
   port: process.env.POSTGRES_PORT,
 });
 
+// Without this, an error on an idle pooled connection (e.g. the DB restarting)
+// is emitted as an 'error' event with no listener and crashes the process.
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle pg client:', err.message);
+});
+
 // Optional Discord channel name cache
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN_LEADERBOARD || process.env.DISCORD_TOKEN || '';
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '';
@@ -212,24 +218,28 @@ app.get('/', async (req, res) => {
       .map(r => `<a class="tab ${r.key === range ? 'active' : ''}" href="/?range=${r.key}${channel ? `&channel=${encodeURIComponent(channel)}` : ''}">${r.label}</a>`) 
       .join('');
 
-    // Fetch channels list for the selector (top by count in selected range)
+    // Fetch channels list for the selector (top by count in selected range).
     let channels = [];
     try {
-      const client = await pool.connect();
-      const { sql: chSql, params: chParams } = buildWhere(range, '');
-      const q = await client.query(
-        `SELECT channel_id, COUNT(*)::int AS message_count
-         FROM messages
-         ${chSql}
-         GROUP BY channel_id
-         ORDER BY message_count DESC, channel_id ASC
-         LIMIT 200`,
-        chParams
-      );
-      channels = q.rows.map(r => ({ id: r.channel_id, name: channelLabel(r.channel_id), count: r.message_count }));
-      // Ensure selected channel is present in the list
-      if (channel && !channels.find(c => c.id === channel)) {
-        channels.unshift({ id: channel, name: channelLabel(channel), count: null });
+      const chClient = await pool.connect();
+      try {
+        const { sql: chSql, params: chParams } = buildWhere(range, '');
+        const q = await chClient.query(
+          `SELECT channel_id, COUNT(*)::int AS message_count
+           FROM messages
+           ${chSql}
+           GROUP BY channel_id
+           ORDER BY message_count DESC, channel_id ASC
+           LIMIT 200`,
+          chParams
+        );
+        channels = q.rows.map(r => ({ id: r.channel_id, name: channelLabel(r.channel_id), count: r.message_count }));
+        // Ensure selected channel is present in the list
+        if (channel && !channels.find(c => c.id === channel)) {
+          channels.unshift({ id: channel, name: channelLabel(channel), count: null });
+        }
+      } finally {
+        chClient.release(); // was leaking a pooled connection on every page load
       }
     } catch (e) {
       console.error('Error loading channels for selector:', e);

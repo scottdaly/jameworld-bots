@@ -118,7 +118,9 @@ services:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
     ports:
-      - "3000:3000"
+      # Bind localhost-only: Caddy reverse-proxies to 127.0.0.1:3000, so the
+      # container never needs to be reachable on the public interface.
+      - "127.0.0.1:3000:3000"
     depends_on:
       db:
         condition: service_healthy
