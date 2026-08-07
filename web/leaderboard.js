@@ -34,34 +34,48 @@ pool.on('error', (err) => {
 // the main bot keeps up to date. This service holds NO Discord token — it just
 // reads names out of the DB via its read-only role.
 let CHANNEL_NAME_MAP = {};
-let CHANNEL_CACHE_TS = 0;
-const CHANNEL_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+let AVATAR_MAP = {};
+let CACHE_TS = 0;
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-async function loadChannelNames() {
+async function loadCaches() {
   try {
     const client = await pool.connect();
     try {
-      const { rows } = await client.query('SELECT id, name FROM discord_channels');
-      const map = {};
-      for (const r of rows) map[r.id] = `#${r.name}`;
-      CHANNEL_NAME_MAP = map;
-      CHANNEL_CACHE_TS = Date.now();
+      const ch = await client.query('SELECT id, name FROM discord_channels');
+      const chMap = {};
+      for (const r of ch.rows) chMap[r.id] = `#${r.name}`;
+      CHANNEL_NAME_MAP = chMap;
+
+      const us = await client.query(
+        'SELECT username, avatar_url FROM discord_users WHERE avatar_url IS NOT NULL'
+      );
+      const avMap = {};
+      for (const r of us.rows) avMap[r.username] = r.avatar_url;
+      AVATAR_MAP = avMap;
+
+      CACHE_TS = Date.now();
     } finally {
       client.release();
     }
   } catch (e) {
-    console.warn('Error loading channel names from DB:', e.message);
+    console.warn('Error loading caches from DB:', e.message);
   }
 }
 
+// Keeps the old name so the route handlers don't change; refreshes both maps.
 async function ensureChannelCacheFresh() {
-  if (Date.now() - CHANNEL_CACHE_TS > CHANNEL_CACHE_TTL_MS) {
-    await loadChannelNames();
+  if (Date.now() - CACHE_TS > CACHE_TTL_MS) {
+    await loadCaches();
   }
 }
 
 function channelLabel(id) {
   return CHANNEL_NAME_MAP[id] || `#${id}`;
+}
+
+function avatarFor(author) {
+  return AVATAR_MAP[author] || null;
 }
 
 // (Channel names are fetched from Discord API if token+guild are provided.)
@@ -84,7 +98,7 @@ app.use((req, res, next) => {
     'Content-Security-Policy',
     [
       "default-src 'none'",
-      "img-src 'self' data:",
+      "img-src 'self' data: https://cdn.discordapp.com",
       "style-src 'self' 'unsafe-inline'",
       `script-src 'nonce-${nonce}'`,
       "form-action 'self'",
@@ -358,6 +372,7 @@ app.get('/', async (req, res) => {
           .user { display:flex; align-items:center; gap: 12px; min-width: 0; }
           .user div:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
           .avatar { width: 28px; height: 28px; border-radius: 50%; display:grid; place-items:center; font-weight:700; font-size: 12px; color:#fff; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: inset 0 -10px 20px rgba(0,0,0,0.12); flex: 0 0 28px; }
+          img.avatar { object-fit: cover; background: var(--card); }
           .meter { min-width: 160px; }
           .track { height: 6px; background: color-mix(in srgb, var(--fg), transparent 92%); border-radius: 999px; overflow: hidden; margin-top: 6px; }
           .fill { height: 100%; background: linear-gradient(90deg, var(--acc), var(--acc2)); }
@@ -433,10 +448,14 @@ app.get('/', async (req, res) => {
                     const pct = maxCount ? Math.round((r.message_count / maxCount) * 100) : 0;
                     const badge = i === 0 ? 'badge-1' : i === 1 ? 'badge-2' : i === 2 ? 'badge-3' : '';
                     const initials = escapeHtml(String(r.author || '?').slice(0,1).toUpperCase());
+                    const avatarUrl = avatarFor(r.author);
+                    const avatarHtml = avatarUrl
+                      ? `<img class="avatar" src="${escapeHtml(avatarUrl)}" alt="" width="28" height="28" loading="lazy" referrerpolicy="no-referrer" />`
+                      : `<div class="avatar">${initials}</div>`;
                     return `
                       <tr>
                         <td class="rank ${badge}">${i + 1}</td>
-                        <td class="usercell"><div class="user"><div class="avatar">${initials}</div><div>${escapeHtml(r.author)}</div></div></td>
+                        <td class="usercell"><div class="user">${avatarHtml}<div>${escapeHtml(r.author)}</div></div></td>
                         <td class="meter"><div class="track"><div class="fill" style="width:${pct}%"></div></div></td>
                         <td class="right" data-label="Messages">${Number(r.message_count).toLocaleString()}</td>
                       </tr>

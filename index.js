@@ -625,6 +625,46 @@ async function refreshChannelNames() {
   }
 }
 
+// Upsert guild members' avatar URLs so the leaderboard can show real photos.
+// Keyed on username to match messages.author. Requires the GuildMembers intent
+// (already enabled). Users who have since left / renamed simply won't match and
+// fall back to the letter placeholder on the page.
+async function refreshUserAvatars() {
+  if (!LEADERBOARD_GUILD_ID) return;
+  try {
+    const guild =
+      client.guilds.cache.get(LEADERBOARD_GUILD_ID) ||
+      (await client.guilds.fetch(LEADERBOARD_GUILD_ID).catch(() => null));
+    if (!guild) return;
+    const members = await guild.members.fetch();
+    const rows = [];
+    for (const m of members.values()) {
+      if (!m?.user?.username) continue;
+      // member.displayAvatarURL respects a server-specific avatar, falling back
+      // to the account avatar (or Discord's default) — png so it's not animated.
+      const url = m.displayAvatarURL({ extension: "png", size: 128 });
+      rows.push([m.user.username, url]);
+    }
+    if (!rows.length) return;
+    const dbClient = await pool.connect();
+    try {
+      for (const [username, avatarUrl] of rows) {
+        await dbClient.query(
+          `INSERT INTO discord_users (username, avatar_url, updated_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT (username) DO UPDATE SET avatar_url = EXCLUDED.avatar_url, updated_at = now()`,
+          [username, avatarUrl]
+        );
+      }
+    } finally {
+      dbClient.release();
+    }
+    console.log(`Refreshed ${rows.length} user avatars into discord_users.`);
+  } catch (err) {
+    console.error("refreshUserAvatars failed:", err.message);
+  }
+}
+
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -635,10 +675,12 @@ client.once("ready", async () => {
     console.error("DB connection failed on startup:", err);
   }
 
-  // Populate channel names now, then keep them fresh.
+  // Populate channel names + user avatars now, then keep them fresh.
   await refreshChannelNames();
+  await refreshUserAvatars();
   setInterval(() => {
     refreshChannelNames().catch(() => {});
+    refreshUserAvatars().catch(() => {});
   }, CHANNEL_REFRESH_INTERVAL_MS);
 });
 
