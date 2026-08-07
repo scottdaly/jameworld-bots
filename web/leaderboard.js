@@ -205,10 +205,11 @@ app.get('/api/leaderboard', async (req, res) => {
     const client = await pool.connect();
     try {
       const { rows } = await client.query(
-        `SELECT author, COUNT(*)::int AS message_count
-         FROM messages
+        `SELECT COALESCE(a.canonical, m.author) AS author, COUNT(*)::int AS message_count
+         FROM messages m
+         LEFT JOIN author_aliases a ON a.alias = m.author
          ${sql}
-         GROUP BY author
+         GROUP BY 1
          HAVING COUNT(*) >= ${MIN_MESSAGES}
          ORDER BY message_count DESC, author ASC
          LIMIT 100`,
@@ -265,10 +266,11 @@ app.get('/', async (req, res) => {
     let totals = { messages: 0 };
     try {
       const result = await client.query(
-        `SELECT author, COUNT(*)::int AS message_count
-         FROM messages
+        `SELECT COALESCE(a.canonical, m.author) AS author, COUNT(*)::int AS message_count
+         FROM messages m
+         LEFT JOIN author_aliases a ON a.alias = m.author
          ${sql}
-         GROUP BY author
+         GROUP BY 1
          HAVING COUNT(*) >= ${MIN_MESSAGES}
          ORDER BY message_count DESC, author ASC
          LIMIT 100`,
@@ -371,7 +373,7 @@ app.get('/', async (req, res) => {
           .rank.badge-3 { color:#d19a66; font-weight: 650; }
           .user { display:flex; align-items:center; gap: 12px; min-width: 0; }
           .user div:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-          .avatar { width: 28px; height: 28px; border-radius: 50%; display:grid; place-items:center; font-weight:700; font-size: 12px; color:#fff; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: inset 0 -10px 20px rgba(0,0,0,0.12); flex: 0 0 28px; }
+          .avatar { width: 36px; height: 36px; border-radius: 50%; display:grid; place-items:center; font-weight:700; font-size: 14px; color:#fff; background: linear-gradient(135deg, var(--acc), var(--acc2)); box-shadow: inset 0 -10px 20px rgba(0,0,0,0.12); flex: 0 0 36px; }
           img.avatar { object-fit: cover; background: var(--card); }
           .meter { min-width: 160px; }
           .track { height: 6px; background: color-mix(in srgb, var(--fg), transparent 92%); border-radius: 999px; overflow: hidden; margin-top: 6px; }
@@ -403,7 +405,7 @@ app.get('/', async (req, res) => {
             tbody tr td.usercell { grid-column: 2 / span 2; grid-row: 1; padding-bottom: 4px; padding-top: 12px; }
             tbody tr td.right { grid-column: 2 / span 2; grid-row: 2; justify-self: start; color: var(--fg); padding-top: 0; padding-bottom: 12px; }
             tbody tr td.right::before { content: 'Msgs'; color: var(--muted); font-size: 12px; margin-right: 8px; }
-            .avatar { width: 26px; height: 26px; font-size: 11px; }
+            .avatar { width: 32px; height: 32px; font-size: 12px; flex: 0 0 32px; }
           }
         </style>
       </head>
@@ -450,7 +452,7 @@ app.get('/', async (req, res) => {
                     const initials = escapeHtml(String(r.author || '?').slice(0,1).toUpperCase());
                     const avatarUrl = avatarFor(r.author);
                     const avatarHtml = avatarUrl
-                      ? `<img class="avatar" src="${escapeHtml(avatarUrl)}" alt="" width="28" height="28" loading="lazy" referrerpolicy="no-referrer" />`
+                      ? `<img class="avatar" src="${escapeHtml(avatarUrl)}" alt="" width="36" height="36" loading="lazy" referrerpolicy="no-referrer" />`
                       : `<div class="avatar">${initials}</div>`;
                     return `
                       <tr>
