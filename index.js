@@ -476,6 +476,21 @@ function startTyping(channel) {
   return () => clearInterval(interval);
 }
 
+// Lightweight de-dup + concurrency guard: a redelivered messageCreate can't
+// double-respond, and one user can't stack overlapping requests.
+const processedMessageIds = new Map(); // message id → expiresAt
+const PROCESSED_TTL_MS = 5 * 60 * 1000;
+const inFlightUsers = new Set();
+function alreadyHandled(message) {
+  const now = Date.now();
+  for (const [id, exp] of processedMessageIds) {
+    if (exp < now) processedMessageIds.delete(id);
+  }
+  if (processedMessageIds.has(message.id)) return true;
+  processedMessageIds.set(message.id, now + PROCESSED_TTL_MS);
+  return false;
+}
+
 // Function to handle text and image messages
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
@@ -483,6 +498,9 @@ client.on("messageCreate", async (message) => {
   const shouldRespond = message.mentions.has(client.user);
 
   if (shouldRespond) {
+    if (alreadyHandled(message)) return;
+    if (inFlightUsers.has(message.author.id)) return; // ignore stacked request
+    inFlightUsers.add(message.author.id);
     // Show "Zuckerbuns is typing…" while we formulate the response.
     const stopTyping = startTyping(message.channel);
     try {
@@ -546,13 +564,21 @@ client.on("messageCreate", async (message) => {
       }
     } catch (error) {
       console.error("Error handling message:", error);
-      message.reply("Sorry, an error occurred while processing your request.");
+      await message
+        .reply("Sorry, an error occurred while processing your request.")
+        .catch(() => {});
     } finally {
+      inFlightUsers.delete(message.author.id);
       stopTyping();
     }
-  } else {
-    console.log("Message not mentioned, saving message to cache");
-    await updateMessageCache(message, false);
+  } else if (message.guild) {
+    // Cache guild messages for context. Guard it so a DB hiccup can't crash
+    // the handler (DMs are skipped — nothing to cache there).
+    try {
+      await updateMessageCache(message, false);
+    } catch (err) {
+      console.error("Failed to cache message:", err.message);
+    }
   }
 });
 

@@ -195,9 +195,12 @@ async function buildSystemPrompt(channelId) {
     prompt +=
       "\nFor context, this is the recent conversation in the Discord channel:\n\n";
 
-    // Fetch the last 100 messages for context
+    // Fetch the last 100 messages from THIS channel for context. Without the
+    // channel_id filter Josh mixes context across every channel and references
+    // unrelated conversations.
     const { rows: messages } = await client.query(
-      "SELECT author, content FROM messages ORDER BY timestamp DESC LIMIT 100"
+      "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
+      [channelId]
     );
     messages.reverse().forEach(({ author, content }) => {
       prompt += `${author}: ${content}\n`;
@@ -266,60 +269,74 @@ function startTyping(channel) {
   return () => clearInterval(interval);
 }
 
+// Lightweight de-dup + concurrency guard: a redelivered messageCreate can't
+// double-respond, and one user can't stack overlapping requests.
+const processedMessageIds = new Map(); // message id → expiresAt
+const PROCESSED_TTL_MS = 5 * 60 * 1000;
+const inFlightUsers = new Set();
+function alreadyHandled(message) {
+  const now = Date.now();
+  for (const [id, exp] of processedMessageIds) {
+    if (exp < now) processedMessageIds.delete(id);
+  }
+  if (processedMessageIds.has(message.id)) return true;
+  processedMessageIds.set(message.id, now + PROCESSED_TTL_MS);
+  return false;
+}
+
 // Chat functionality using `gemini-1.5-flash`
 client.on("messageCreate", async (message) => {
-  let stopTyping = null;
+  if (message.author.bot) return;
+  if (!message.mentions.has(client.user)) return;
+  if (alreadyHandled(message)) return;
+  if (inFlightUsers.has(message.author.id)) return; // ignore stacked request
+
+  inFlightUsers.add(message.author.id);
+  const stopTyping = startTyping(message.channel);
   try {
-    if (message.author.bot) return;
+    const botMention = `<@${client.user.id}>`;
+    const botNicknameMention = `<@!${client.user.id}>`;
+    let userMessage = message.content
+      .replace(botMention, "")
+      .replace(botNicknameMention, "")
+      .trim();
 
-    // Check if bot is mentioned or if it's the 21st message
-    const shouldRespond = message.mentions.has(client.user);
+    if (!userMessage) return;
 
-    if (shouldRespond) {
-      const botMention = `<@${client.user.id}>`;
-      const botNicknameMention = `<@!${client.user.id}>`;
-      let userMessage = message.content
-        .replace(botMention, "")
-        .replace(botNicknameMention, "")
-        .trim();
+    console.log("Bot mentioned by user:", message.author.username);
 
-      if (!userMessage && !message.mentions.has(client.user)) return;
+    // Build system prompt with the recent messages and profiles
+    const systemPrompt = await buildSystemPrompt(message.channel.id);
 
-      console.log("Bot mentioned by user:", message.author.username);
+    const prompt = `${systemPrompt}\n Respond to this specific message: (${message.author.username}): ${userMessage}`;
 
-      // Show "Josh Hansen is typing…" while we formulate the response.
-      stopTyping = startTyping(message.channel);
+    const reply = await callGeminiAPI(prompt, CHAT_MODEL_URL);
 
-      // Build system prompt with the recent messages and profiles
-      const systemPrompt = await buildSystemPrompt(message.channel.id);
+    // Get a random number of seconds between 1 and 5
+    let replyTime = Math.floor(Math.random() * 4000) + 1000;
+    // Introduce a delay before sending the response
+    await new Promise((resolve) => setTimeout(resolve, replyTime));
 
-      const prompt = `${systemPrompt}\n Respond to this specific message: (${message.author.username}): ${userMessage}`;
+    const replyMessage = await message.reply(reply);
 
-      const reply = await callGeminiAPI(prompt, CHAT_MODEL_URL);
+    console.log("Reply from Gemini API:\n", message);
 
-      // Get a random number of seconds between 1 and 5
-      let replyTime = Math.floor(Math.random() * 4000) + 1000;
-      // Introduce a delay before sending the response
-      await new Promise((resolve) => setTimeout(resolve, replyTime));
-
-      const replyMessage = await message.reply(reply);
-
-      console.log("Reply from Gemini API:\n", message);
-
-      // Update the message cache
-      await updateMessageCache(
-        message,
-        reply,
-        new Date(),
-        botMention,
-        replyMessage
-      );
-    }
+    // Update the message cache
+    await updateMessageCache(
+      message,
+      reply,
+      new Date(),
+      botMention,
+      replyMessage
+    );
   } catch (error) {
     console.error("Error handling message:", error);
-    message.reply("Sorry, an error occurred while processing your request.");
+    await message
+      .reply("Sorry, an error occurred while processing your request.")
+      .catch(() => {});
   } finally {
-    if (stopTyping) stopTyping();
+    inFlightUsers.delete(message.author.id);
+    stopTyping();
   }
 });
 

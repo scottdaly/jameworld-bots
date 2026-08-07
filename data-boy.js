@@ -142,7 +142,11 @@ function classifyDepth(question) {
 }
 
 const PROMPT_PATH = path.join(__dirname, "data-boy-prompt.md");
-const WORK_DIR = "/tmp/data-boy-work";
+// Base dir for per-question scratch space. Each invocation gets its own
+// subdirectory (keyed on the Discord message id) so concurrent questions from
+// different users can't wipe each other's files or pick up each other's
+// generated attachments.
+const WORK_ROOT = "/tmp/data-boy-work";
 
 // Per-user in-flight question lock (Discord user id → boolean).
 const inFlight = new Set();
@@ -370,6 +374,10 @@ const queryDbTool = tool(
     }
     const client = await readonlyPool.connect();
     try {
+      // NB: `LIMIT 1000` appends to the model's SQL textually. Writes are
+      // impossible regardless (readonly role + default_transaction_read_only),
+      // but if the model ever sends a multi-statement query the LIMIT only
+      // binds to the final statement. Acceptable given the role sandbox.
       const result = await client.query(`${trimmed} LIMIT 1000`);
       return {
         content: [
@@ -475,21 +483,21 @@ async function buildSystemPrompt(depth = "shallow") {
 }
 
 // ── The core: run one question through the SDK ─────────────────────────────
-async function answer(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS) {
-  // Fresh scratch dir per question.
-  fs.rmSync(WORK_DIR, { recursive: true, force: true });
-  fs.mkdirSync(WORK_DIR, { recursive: true });
+async function answer(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir) {
+  // Fresh scratch dir per question (unique per invocation — see WORK_ROOT).
+  fs.rmSync(workDir, { recursive: true, force: true });
+  fs.mkdirSync(workDir, { recursive: true });
 
   if (MODEL_PROVIDER === "gemini") {
-    return answerWithGemini(question, systemPrompt, model, onProgress, maxTurns);
+    return answerWithGemini(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }
   if (MODEL_PROVIDER === "gemini-api") {
-    return answerWithGeminiApi(question, systemPrompt, model, onProgress, maxTurns);
+    return answerWithGeminiApi(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }
-  return answerWithAnthropic(question, systemPrompt, model, onProgress, maxTurns);
+  return answerWithAnthropic(question, systemPrompt, model, onProgress, maxTurns, workDir);
 }
 
-async function answerWithAnthropic(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS) {
+async function answerWithAnthropic(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir) {
   let lastAssistantText = "";
   let resultText = null;
   let turns = 0;
@@ -502,7 +510,7 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
     options: {
       model,
       maxTurns,
-      cwd: WORK_DIR,
+      cwd: workDir,
       systemPrompt,
       mcpServers: {
         "data-boy-db": mcpServer,
@@ -588,7 +596,7 @@ async function getAiSdk() {
 // and API-key flows can't drift. Caller passes the `tool` factory from
 // whichever `ai` import they have so the tool objects bind to the right
 // module instance.
-function buildVercelAiSdkTools(aiTool) {
+function buildVercelAiSdkTools(aiTool, workDir) {
   const env = {
     ...process.env,
     PGCONN: `postgresql://${encodeURIComponent(process.env.POSTGRES_READONLY_USER)}:${encodeURIComponent(process.env.POSTGRES_READONLY_PASSWORD)}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT}/${process.env.POSTGRES_DB}`,
@@ -610,6 +618,8 @@ function buildVercelAiSdkTools(aiTool) {
         }
         const client = await readonlyPool.connect();
         try {
+          // See note in the MCP query_db tool: LIMIT is textual; safe under the
+          // readonly role even if the model emits a multi-statement query.
           const result = await client.query(`${trimmed} LIMIT 1000`);
           return {
             rowCount: result.rowCount,
@@ -635,7 +645,7 @@ function buildVercelAiSdkTools(aiTool) {
           const { exec } = require("child_process");
           exec(
             command,
-            { cwd: WORK_DIR, env, timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+            { cwd: workDir, env, timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
             (err, stdout, stderr) =>
               resolve({
                 stdout: String(stdout || "").slice(0, 50_000),
@@ -653,7 +663,7 @@ function buildVercelAiSdkTools(aiTool) {
         content: z.string(),
       }),
       execute: async ({ path: p, content }) => {
-        const full = path.join(WORK_DIR, p);
+        const full = path.join(workDir, p);
         fs.mkdirSync(path.dirname(full), { recursive: true });
         fs.writeFileSync(full, content);
         return { wrote: full, bytes: Buffer.byteLength(content) };
@@ -664,7 +674,7 @@ function buildVercelAiSdkTools(aiTool) {
       inputSchema: z.object({ path: z.string() }),
       execute: async ({ path: p }) => {
         try {
-          const full = path.join(WORK_DIR, p);
+          const full = path.join(workDir, p);
           return { content: fs.readFileSync(full, "utf8").slice(0, 100_000) };
         } catch (err) {
           return { error: err.message };
@@ -678,9 +688,9 @@ function buildVercelAiSdkTools(aiTool) {
 // already-constructed model handle (provider(modelName, ...)) and optional
 // providerOptions; this fn does the streaming, token accounting, and return
 // shape that the rest of the bot expects.
-async function runVercelAiSdkAnswer({ modelHandle, providerOptions, systemPrompt, question, onProgress, maxTurns = MAX_TURNS }) {
+async function runVercelAiSdkAnswer({ modelHandle, providerOptions, systemPrompt, question, onProgress, maxTurns = MAX_TURNS, workDir }) {
   const { generateText, tool: aiTool, stepCountIs } = await getAiSdk();
-  const tools = buildVercelAiSdkTools(aiTool);
+  const tools = buildVercelAiSdkTools(aiTool, workDir);
   let lastText = "";
   let stepCount = 0;
   let inputTokens = 0;
@@ -716,7 +726,7 @@ async function runVercelAiSdkAnswer({ modelHandle, providerOptions, systemPrompt
   };
 }
 
-async function answerWithGemini(question, systemPrompt, modelName, onProgress = null, maxTurns = MAX_TURNS) {
+async function answerWithGemini(question, systemPrompt, modelName, onProgress = null, maxTurns = MAX_TURNS, workDir) {
   const gemini = await getGeminiOauthProvider();
   // Gemini 3 thinking config. Signatures on outgoing functionCall parts are
   // handled by our patch (see patch-gemini-provider.js), so we can let the
@@ -732,10 +742,11 @@ async function answerWithGemini(question, systemPrompt, modelName, onProgress = 
     question,
     onProgress,
     maxTurns,
+    workDir,
   });
 }
 
-async function answerWithGeminiApi(question, systemPrompt, modelName, onProgress = null, maxTurns = MAX_TURNS) {
+async function answerWithGeminiApi(question, systemPrompt, modelName, onProgress = null, maxTurns = MAX_TURNS, workDir) {
   const google = await getGoogleApiProvider();
   // @ai-sdk/google takes thinkingConfig via providerOptions.google on the
   // generateText call rather than on the model factory. thinkingBudget=-1
@@ -751,6 +762,7 @@ async function answerWithGeminiApi(question, systemPrompt, modelName, onProgress
     question,
     onProgress,
     maxTurns,
+    workDir,
   });
 }
 
@@ -936,6 +948,8 @@ discord.on("messageCreate", async (message) => {
 
   inFlight.add(userId);
   const startedAt = Date.now();
+  // Per-question scratch dir, unique to this Discord message.
+  const workDir = path.join(WORK_ROOT, String(message.id));
 
   // A "thinking…" placeholder message that we edit with live progress, plus
   // Discord's native typing indicator. Unlike before, the placeholder is NOT
@@ -1004,7 +1018,7 @@ discord.on("messageCreate", async (message) => {
     let capacityRetries = 0;
     while (true) {
       try {
-        result = await answer(enrichedQuestion, systemPrompt, model, onProgress, maxTurns);
+        result = await answer(enrichedQuestion, systemPrompt, model, onProgress, maxTurns, workDir);
         break;
       } catch (err) {
         if (!isCapacityError(err) || capacityRetries >= CAPACITY_RETRY_DELAYS_MS.length) {
@@ -1025,7 +1039,7 @@ discord.on("messageCreate", async (message) => {
     clearInterval(progressInterval);
     clearInterval(typingInterval);
     const duration = Date.now() - startedAt;
-    const attachments = collectAttachments(WORK_DIR);
+    const attachments = collectAttachments(workDir);
     if (attachments.length > 0) {
       console.log(`Attaching ${attachments.length} file(s): ${attachments.map((a) => a.name).join(", ")}`);
     }
@@ -1068,6 +1082,8 @@ discord.on("messageCreate", async (message) => {
   } finally {
     inFlight.delete(userId);
     livePlaceholderIds.delete(placeholder.id);
+    // Remove this question's scratch dir so /tmp doesn't accumulate.
+    fs.rmSync(workDir, { recursive: true, force: true });
   }
 });
 
@@ -1168,7 +1184,7 @@ discord.once("ready", async () => {
   console.log(`Provider: ${MODEL_PROVIDER}. Models — shallow: ${MODEL_SHALLOW}, deep: ${MODEL_DEEP}.`);
   await waitForDb(adminPool, "admin");
   await waitForDb(readonlyPool, "readonly");
-  fs.mkdirSync(WORK_DIR, { recursive: true });
+  fs.mkdirSync(WORK_ROOT, { recursive: true });
   await discord.login(process.env.DISCORD_TOKEN_DATA_BOY);
 })().catch((err) => {
   console.error("Startup failed:", err);
