@@ -11,6 +11,10 @@ app.disable('x-powered-by');
 app.set('trust proxy', 'loopback');
 const port = process.env.PORT || 3000;
 
+// Hide low-activity users from the ranking (applied within the selected
+// range/channel). Plain integer constant — safe to inline into SQL.
+const MIN_MESSAGES = 30;
+
 // PostgreSQL connection
 const pool = new Pool({
   user: process.env.POSTGRES_USER,
@@ -191,6 +195,7 @@ app.get('/api/leaderboard', async (req, res) => {
          FROM messages
          ${sql}
          GROUP BY author
+         HAVING COUNT(*) >= ${MIN_MESSAGES}
          ORDER BY message_count DESC, author ASC
          LIMIT 100`,
         params
@@ -250,6 +255,7 @@ app.get('/', async (req, res) => {
          FROM messages
          ${sql}
          GROUP BY author
+         HAVING COUNT(*) >= ${MIN_MESSAGES}
          ORDER BY message_count DESC, author ASC
          LIMIT 100`,
         params
