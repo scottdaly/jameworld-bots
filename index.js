@@ -466,6 +466,16 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// Show the native "Zuckerbuns is typing…" indicator until the returned stop()
+// is called. A single sendTyping() lasts ~10s, so refresh it on an interval.
+function startTyping(channel) {
+  channel.sendTyping().catch(() => {});
+  const interval = setInterval(() => {
+    channel.sendTyping().catch(() => {});
+  }, 8000);
+  return () => clearInterval(interval);
+}
+
 // Function to handle text and image messages
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
@@ -473,6 +483,8 @@ client.on("messageCreate", async (message) => {
   const shouldRespond = message.mentions.has(client.user);
 
   if (shouldRespond) {
+    // Show "Zuckerbuns is typing…" while we formulate the response.
+    const stopTyping = startTyping(message.channel);
     try {
       const botMention = `<@${client.user.id}>`;
       const botNicknameMention = `<@!${client.user.id}>`;
@@ -535,6 +547,8 @@ client.on("messageCreate", async (message) => {
     } catch (error) {
       console.error("Error handling message:", error);
       message.reply("Sorry, an error occurred while processing your request.");
+    } finally {
+      stopTyping();
     }
   } else {
     console.log("Message not mentioned, saving message to cache");

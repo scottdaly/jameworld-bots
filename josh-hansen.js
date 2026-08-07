@@ -256,8 +256,19 @@ async function callGeminiAPI(prompt, apiUrl) {
   return data.candidates[0].content.parts[0].text;
 }
 
+// Show the native "Josh Hansen is typing…" indicator until the returned stop()
+// is called. A single sendTyping() lasts ~10s, so refresh it on an interval.
+function startTyping(channel) {
+  channel.sendTyping().catch(() => {});
+  const interval = setInterval(() => {
+    channel.sendTyping().catch(() => {});
+  }, 8000);
+  return () => clearInterval(interval);
+}
+
 // Chat functionality using `gemini-1.5-flash`
 client.on("messageCreate", async (message) => {
+  let stopTyping = null;
   try {
     if (message.author.bot) return;
 
@@ -275,6 +286,9 @@ client.on("messageCreate", async (message) => {
       if (!userMessage && !message.mentions.has(client.user)) return;
 
       console.log("Bot mentioned by user:", message.author.username);
+
+      // Show "Josh Hansen is typing…" while we formulate the response.
+      stopTyping = startTyping(message.channel);
 
       // Build system prompt with the recent messages and profiles
       const systemPrompt = await buildSystemPrompt(message.channel.id);
@@ -304,6 +318,8 @@ client.on("messageCreate", async (message) => {
   } catch (error) {
     console.error("Error handling message:", error);
     message.reply("Sorry, an error occurred while processing your request.");
+  } finally {
+    if (stopTyping) stopTyping();
   }
 });
 
