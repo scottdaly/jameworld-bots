@@ -586,6 +586,45 @@ client.on("messageCreate", async (message) => {
 process.on("unhandledRejection", (error) => {
   console.error("Unhandled promise rejection:", error);
 });
+// Upsert the guild's channel id → name map into discord_channels so the public
+// leaderboard can render "#channel" names WITHOUT ever holding a Discord token.
+// We're already in the server with the token, so this is the trusted place to
+// do it. Runs on startup and on a timer; channel names change rarely.
+const LEADERBOARD_GUILD_ID = process.env.DISCORD_GUILD_ID || "";
+const CHANNEL_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+
+async function refreshChannelNames() {
+  if (!LEADERBOARD_GUILD_ID) return;
+  try {
+    const guild =
+      client.guilds.cache.get(LEADERBOARD_GUILD_ID) ||
+      (await client.guilds.fetch(LEADERBOARD_GUILD_ID).catch(() => null));
+    if (!guild) return;
+    const channels = await guild.channels.fetch();
+    const rows = [];
+    for (const ch of channels.values()) {
+      if (ch && ch.id && ch.name) rows.push([ch.id, ch.name]);
+    }
+    if (!rows.length) return;
+    const dbClient = await pool.connect();
+    try {
+      for (const [id, name] of rows) {
+        await dbClient.query(
+          `INSERT INTO discord_channels (id, name, updated_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()`,
+          [id, name]
+        );
+      }
+    } finally {
+      dbClient.release();
+    }
+    console.log(`Refreshed ${rows.length} channel names into discord_channels.`);
+  } catch (err) {
+    console.error("refreshChannelNames failed:", err.message);
+  }
+}
+
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -595,6 +634,12 @@ client.once("ready", async () => {
   } catch (err) {
     console.error("DB connection failed on startup:", err);
   }
+
+  // Populate channel names now, then keep them fresh.
+  await refreshChannelNames();
+  setInterval(() => {
+    refreshChannelNames().catch(() => {});
+  }, CHANNEL_REFRESH_INTERVAL_MS);
 });
 
 // much more detailed unhandled rejection handler

@@ -2,7 +2,6 @@ require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
-const fetch = require('node-fetch');
 
 const app = express();
 app.disable('x-powered-by');
@@ -27,40 +26,33 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle pg client:', err.message);
 });
 
-// Optional Discord channel name cache
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN_LEADERBOARD || process.env.DISCORD_TOKEN || '';
-const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '';
+// Channel id → "#name" map. Names come from the discord_channels table, which
+// the main bot keeps up to date. This service holds NO Discord token — it just
+// reads names out of the DB via its read-only role.
 let CHANNEL_NAME_MAP = {};
 let CHANNEL_CACHE_TS = 0;
 const CHANNEL_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-async function loadDiscordChannels() {
-  if (!DISCORD_TOKEN || !DISCORD_GUILD_ID) return;
+async function loadChannelNames() {
   try {
-    const resp = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/channels`, {
-      headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
-    });
-    if (!resp.ok) {
-      const t = await resp.text();
-      console.warn('Failed to fetch Discord channels:', resp.status, t);
-      return;
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query('SELECT id, name FROM discord_channels');
+      const map = {};
+      for (const r of rows) map[r.id] = `#${r.name}`;
+      CHANNEL_NAME_MAP = map;
+      CHANNEL_CACHE_TS = Date.now();
+    } finally {
+      client.release();
     }
-    const data = await resp.json();
-    const map = {};
-    for (const ch of data) {
-      if (ch && ch.id && ch.name) map[ch.id] = `#${ch.name}`;
-    }
-    CHANNEL_NAME_MAP = map;
-    CHANNEL_CACHE_TS = Date.now();
   } catch (e) {
-    console.warn('Error fetching Discord channels:', e.message);
+    console.warn('Error loading channel names from DB:', e.message);
   }
 }
 
 async function ensureChannelCacheFresh() {
-  if (!DISCORD_TOKEN || !DISCORD_GUILD_ID) return; // optional
   if (Date.now() - CHANNEL_CACHE_TS > CHANNEL_CACHE_TTL_MS) {
-    await loadDiscordChannels();
+    await loadChannelNames();
   }
 }
 

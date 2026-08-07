@@ -24,6 +24,8 @@ services:
     environment:
       - NODE_OPTIONS=--dns-result-order=ipv4first
       - DISCORD_TOKEN=${DISCORD_TOKEN}
+      # Used to refresh the discord_channels name table for the leaderboard.
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -118,8 +120,8 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - PORT=3000
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+      # No Discord token here — channel names are read from the discord_channels
+      # table (kept fresh by the main bot). The public service holds no token.
     ports:
       # Bind localhost-only: Caddy reverse-proxies to 127.0.0.1:3000, so the
       # container never needs to be reachable on the public interface.
