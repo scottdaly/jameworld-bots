@@ -57,6 +57,9 @@ services:
       - NODE_OPTIONS=--dns-result-order=ipv4first
       - DISCORD_TOKEN_DATA_BOY=${DISCORD_TOKEN_DATA_BOY}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
+      - HOME=/root
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
@@ -65,6 +68,14 @@ services:
       - POSTGRES_READONLY_USER=${POSTGRES_READONLY_USER}
       - POSTGRES_READONLY_PASSWORD=${POSTGRES_READONLY_PASSWORD}
       - PGCONN=postgresql://${POSTGRES_READONLY_USER}:${POSTGRES_READONLY_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
+      # Headless container — fail fast if OAuth refresh wants a browser instead
+      # of hanging 5 min waiting for a tab that doesn't exist.
+      - NO_BROWSER=true
+    volumes:
+      # OAuth creds for Gemini provider. Mounted RW so the provider can write
+      # refreshed access tokens back to oauth_creds.json on the host.
+      # Harmless when MODEL_PROVIDER=anthropic.
+      - /root/.gemini:/root/.gemini
     network_mode: host
     restart: unless-stopped
 

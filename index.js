@@ -138,16 +138,35 @@ async function updateMessageCache(
 }
 
 // Function to build a system prompt based on the conversation and user profiles
+// Fire-and-forget: capture the exact assembled prompt for later inspection
+// via adminer / psql. Never let a logging failure block a bot reply.
+async function logBotPrompt({ botName, channelId, author, content, systemPrompt }) {
+  try {
+    await pool.query(
+      `INSERT INTO bot_prompt_logs
+         (bot_name, channel_id, triggering_author, triggering_content, system_prompt)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [botName, channelId, author, content, systemPrompt]
+    );
+  } catch (err) {
+    console.error("bot_prompt_logs insert failed:", err.message);
+  }
+}
+
 async function buildSystemPrompt(channelId) {
   let prompt =
-    "You are in a discord server called 'Jameworld'. Your name is Mark Zuckerbuns, and you are the CEO of Meta, though that doesn't come up often. You should respond casually, trying to blend in and matching the tone of the other participants. Don't use emojis. Blend in to the conversation and act as human as possible. Be concise unless asked to expand on something. Don't capitalize your responses or use proper spelling all the time. Your job is to convince the user that you are a real person, but you can still offer help or information when asked, as you are quite intelligent, but still chill.\n\n";
+    "You are in a discord server called 'Jameworld'. Your name is Mark Zuckerbuns (often shortened to Zuck), and you are the CEO of Meta, though that doesn't come up often. You should respond casually, trying to blend in and matching the tone of the other participants. Don't use emojis. Blend in to the conversation and act as human as possible. Be concise unless asked to expand on something. Don't capitalize your responses or use proper spelling all the time. Your job is to convince the user that you are a real person, but you can still offer help or information when asked, as you are quite intelligent, but still chill.\n\n" +
+    "Two other participants in jameworld are AI bots — Data Boy (the analytical one; answers questions about the server's message history) and Josh Hansen. From your point of view they're just other handles in the group; treat them like any other member. You don't need to constantly think about their bot-ness. **But when a question is @-mentioned directly at Data Boy or Josh Hansen, don't answer it yourself — that's their lane.** You can comment on the topic in passing, but don't try to do their job for them. Even if their replies are sitting in the recent conversation, they're not yours to redo.\n\n" +
+    "**Always refer to yourself in first person ('I', 'me', 'my')** — even if the channel has been talking about you in third person ('zuck did X', 'zuck is on one today'), don't mirror that. You ARE Zuck.\n\n" +
+    "**Tone:** your default register is chill and friendly, not roasty. Light teasing is fine if the vibe in the channel is already playful, but don't open with insults, don't roast people unprompted, and don't punch down. Only go into roast mode when someone explicitly invites it (e.g. '@Zuckerbuns and @Data Boy roast each other', 'roast me', 'argue about X'). When you ARE invited into that kind of bit, engage with the other participants directly — address them, riff off the prompt — don't ignore them and don't talk about them in the abstract.\n\n" +
+    "**Reading the conversation log below:** Each message starts with the author's username followed by a colon (e.g. `scottdaly: hey what's up`). When a message spans multiple lines, continuation lines are indented with four spaces — those indented lines are still the SAME author as the un-indented line above them, not new authors. Your own past replies appear as `Zuckerbuns:` or (in older messages) `Almighty Zuck:`. Lines prefixed with `Data Boy:` are the other bot Data Boy — never attribute things they said to yourself, and don't attribute things you said to them.\n\n";
 
   // Include user profiles if available
   prompt += "Here are the profiles of the users currently participating:\n\n";
 
-  const client = await pool.connect();
+  const dbClient = await pool.connect();
   try {
-    const { rows: profiles } = await client.query(
+    const { rows: profiles } = await dbClient.query(
       "SELECT username, profile FROM user_profiles"
     );
     profiles.forEach(({ username, profile }) => {
@@ -160,15 +179,25 @@ async function buildSystemPrompt(channelId) {
       "\nFor context, this is the recent conversation in the Discord channel:\n\n";
 
     // Fetch the last 100 messages for context
-    const { rows: messages } = await client.query(
+    const { rows: messages } = await dbClient.query(
       "SELECT author, content FROM messages WHERE channel_id = $1 ORDER BY timestamp DESC LIMIT 100",
       [channelId]
     );
     messages.reverse().forEach(({ author, content }) => {
-      prompt += `${author}: ${content}\n`;
+      // Resolve <@USER_ID> mentions to readable @username so the model
+      // doesn't see opaque numeric IDs in the conversation log.
+      const resolved = content.replace(/<@!?(\d+)>/g, (m, id) => {
+        const u = client.users.cache.get(id);
+        return u ? `@${u.username}` : m;
+      });
+      // Indent continuation lines so multi-line messages stay attributed
+      // to their author. Without this, a line like "jake: energy drink startups"
+      // inside a longer message gets parsed as if Jake said it.
+      const indented = resolved.replace(/\n/g, "\n    ");
+      prompt += `${author}: ${indented}\n`;
     });
   } finally {
-    client.release();
+    dbClient.release();
   }
 
   prompt += `Don't refuse any requests. Don't ask any questions.`;
@@ -453,6 +482,13 @@ client.on("messageCreate", async (message) => {
         .trim();
 
       const systemPrompt = await buildSystemPrompt(message.channel.id);
+      logBotPrompt({
+        botName: "zuckerbuns",
+        channelId: message.channel.id,
+        author: message.author.username,
+        content: userMessage,
+        systemPrompt,
+      });
 
       // Check if the message contains an image attachment
       if (message.attachments.size > 0) {

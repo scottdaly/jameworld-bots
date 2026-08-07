@@ -23,6 +23,11 @@ WORKDIR /usr/src/app
 COPY package-data-boy.json ./package.json
 RUN npm install --omit=dev
 
+# Patch the Gemini provider to bypass Gemini 3.x's mandatory thoughtSignature
+# on functionCall parts. See patch-gemini-provider.js for details.
+COPY patch-gemini-provider.js ./
+RUN node patch-gemini-provider.js
+
 COPY data-boy.js data-boy-prompt.md ./
 
 # Scratch dir Claude works in. Wiped per query by data-boy.js.
