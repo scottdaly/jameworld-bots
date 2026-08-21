@@ -5,6 +5,7 @@ const path = require("path");
 const { Client, GatewayIntentBits, ChannelType } = require("discord.js");
 const { Pool } = require("pg");
 const { z } = require("zod");
+const { execFile } = require("child_process");
 const {
   query: sdkQuery,
   tool,
@@ -141,7 +142,78 @@ function classifyDepth(question) {
   return DEEP_KEYWORDS.some((kw) => lower.includes(kw)) ? "deep" : "shallow";
 }
 
+// ── Route: which DOMAIN is this question about? ────────────────────────────
+// Orthogonal to depth (how hard). "chat" = the jameworld message history, the
+// original and default behaviour. "code" = Scott's GitHub repos.
+//
+// A chat-routed question builds a prompt byte-identical to the pre-GitHub bot,
+// so adding code mode cannot regress existing answers.
+const CODE_KEYWORDS = [
+  "repo", "repos", "repository", "github", "commit", "commits", "codebase",
+  "branch", "pull request", "merge", "pushed", "deployed", "deploy",
+  "source code", "the code", "his code", "your code", "scott's code",
+  "implemented", "implementation", "refactor", "bug fix", "bugfix",
+  "what is lumen", "how does lumen", "working on lately", "been working on",
+  "been building", "been coding", "what has scott", "what's scott been",
+  "api", "endpoint", "schema", "migration", "dependency", "package.json",
+  "function", "class", "module", "architecture", "stack", "framework",
+  "written in", "built with", "how does it work", "how did he build",
+  "how did scott", "link to that project", "send me a link",
+];
+
+// Explicit override beats the classifier: "@Data Boy code: <question>".
+const ROUTE_PREFIX = /^(code|chat|db|github|gh)\s*[:\-]\s*/i;
+
+// Repo names are the strongest signal there is — a bare "how does lumen render"
+// should route to code even with no keyword. Filled in at startup from gh.
+let KNOWN_REPO_NAMES = [];
+
+// Whole-word containment, deliberately regex-free. A repo named "lumen" must
+// not match inside "volumendata", but building the pattern with a template
+// literal is a known footgun here (an escaped word-boundary silently becomes a
+// backspace character), so this does the boundary check directly.
+function containsWord(haystack, word) {
+  const w = word.toLowerCase();
+  const isWordChar = (c) => c !== undefined && /[a-z0-9]/i.test(c);
+  let i = haystack.indexOf(w);
+  while (i !== -1) {
+    if (!isWordChar(haystack[i - 1]) && !isWordChar(haystack[i + w.length])) {
+      return true;
+    }
+    i = haystack.indexOf(w, i + 1);
+  }
+  return false;
+}
+
+function parseRoute(rawQuestion) {
+  const raw = (rawQuestion || "").trim();
+  const m = raw.match(ROUTE_PREFIX);
+  if (m) {
+    const tag = m[1].toLowerCase();
+    return {
+      route: tag === "chat" || tag === "db" ? "chat" : "code",
+      question: raw.slice(m[0].length).trim(),
+      forced: true,
+    };
+  }
+  const lower = raw.toLowerCase();
+  const hit =
+    CODE_KEYWORDS.some((kw) => lower.includes(kw)) ||
+    KNOWN_REPO_NAMES.some((r) => r.length > 3 && containsWord(lower, r));
+  return { route: hit ? "code" : "chat", question: raw, forced: false };
+}
+
 const PROMPT_PATH = path.join(__dirname, "data-boy-prompt.md");
+// Code-mode prompt. Separate file, not an append — a code question must not
+// carry the 20KB of Postgres/message-history instructions, and vice versa.
+const CODE_PROMPT_PATH = path.join(__dirname, "code-prompt.md");
+// Code questions clone and grep real repos, so they need more headroom than a
+// SQL lookup, but the terse-answer rules keep output short regardless.
+const MAX_TURNS_CODE = 40;
+const MAX_TURNS_CODE_DEEP = 60;
+// Persistent clone cache (see Dockerfile.data-boy). Survives between questions.
+const REPO_CACHE = process.env.REPO_CACHE || "/var/cache/repos";
+const GITHUB_OWNER = process.env.GITHUB_OWNER || "scottdaly";
 // Base dir for per-question scratch space. Each invocation gets its own
 // subdirectory (keyed on the Discord message id) so concurrent questions from
 // different users can't wipe each other's files or pick up each other's
@@ -434,7 +506,89 @@ async function logBotPrompt({ channelId, author, content, systemPrompt }) {
 }
 
 // ── Startup context ────────────────────────────────────────────────────────
-async function buildSystemPrompt(depth = "shallow") {
+// Repo index, cached so we don't shell out to gh on every code question.
+let repoIndexCache = { at: 0, text: "" };
+const REPO_INDEX_TTL_MS = 10 * 60 * 1000;
+
+function ghJson(args) {
+  return new Promise((resolve) => {
+    execFile("gh", args, { timeout: 20_000, maxBuffer: 4 << 20 }, (err, stdout) => {
+      if (err) {
+        console.error("gh failed:", err.message);
+        return resolve(null);
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        console.error("gh returned non-JSON:", e.message);
+        resolve(null);
+      }
+    });
+  });
+}
+
+// Inject the repo list into the code prompt so the model doesn't burn a turn
+// listing them, and refresh KNOWN_REPO_NAMES so routing can recognise bare
+// repo names like "lumen".
+async function fetchRepoIndex() {
+  if (Date.now() - repoIndexCache.at < REPO_INDEX_TTL_MS) return repoIndexCache.text;
+  const repos = await ghJson([
+    "repo", "list", GITHUB_OWNER,
+    "--limit", "60", "--source",
+    "--json", "name,description,pushedAt,visibility,primaryLanguage,url",
+  ]);
+  if (!repos || !repos.length) {
+    // Don't cache a failure for 10 minutes — retry on the next question.
+    return "(Repo list unavailable — run `gh repo list` yourself to see what exists.)";
+  }
+  KNOWN_REPO_NAMES = repos.map((r) => r.name.toLowerCase());
+  const lines = repos
+    .slice()
+    .sort((a, b) => (b.pushedAt || "").localeCompare(a.pushedAt || ""))
+    .map((r) => {
+      const when = (r.pushedAt || "").slice(0, 10);
+      const lang = r.primaryLanguage?.name ? `, ${r.primaryLanguage.name}` : "";
+      const vis = (r.visibility || "").toLowerCase();
+      const desc = r.description ? ` — ${r.description}` : "";
+      return `- **${r.name}** (${vis}${lang}, last push ${when})${desc}`;
+    });
+  const text = lines.join("\n");
+  repoIndexCache = { at: Date.now(), text };
+  return text;
+}
+
+async function buildCodeSystemPrompt(depth) {
+  const template = fs.readFileSync(CODE_PROMPT_PATH, "utf8");
+  const repoIndex = await fetchRepoIndex();
+  const depthGuidance =
+    depth === "deep"
+      ? "**Depth tier: DEEP.** Read the actual source before answering — clone and grep rather than relying on commit messages. You still answer concisely; depth applies to your investigation, NOT to your reply length."
+      : "**Depth tier: SHALLOW.** A repo listing or a commit log is probably enough. Don't clone unless the question really needs the source.";
+  return [
+    template,
+    "",
+    "---",
+    "",
+    "## Runtime context (injected per question)",
+    "",
+    `- GitHub owner: **${GITHUB_OWNER}**`,
+    `- Clone cache: \`${REPO_CACHE}\` (persists between questions)`,
+    `- Today: **${new Date().toISOString().slice(0, 10)}**`,
+    "",
+    depthGuidance,
+    "",
+    "### Repos (most recently pushed first)",
+    "",
+    repoIndex,
+  ].join("\n");
+}
+
+async function buildSystemPrompt(depth = "shallow", route = "chat") {
+  // Code questions get a completely separate prompt — no message-history
+  // instructions, no DB stats, no channel map. Chat questions fall through to
+  // the original path below, byte-identical to before GitHub support existed.
+  if (route === "code") return buildCodeSystemPrompt(depth);
+
   const template = fs.readFileSync(PROMPT_PATH, "utf8");
 
   const stats = await adminPool.query(`
@@ -534,6 +688,11 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
         ...process.env,
         PGCONN: `postgresql://${encodeURIComponent(process.env.POSTGRES_READONLY_USER)}:${encodeURIComponent(process.env.POSTGRES_READONLY_PASSWORD)}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT}/${process.env.POSTGRES_DB}`,
         CLAUDE_CODE_AUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_AUTH_TOKEN,
+        // Read-only GitHub access for code-mode questions. gh reads GH_TOKEN
+        // itself; git picks it up via the system credential helper.
+        GH_TOKEN: process.env.GH_TOKEN || "",
+        GITHUB_OWNER,
+        REPO_CACHE,
         // The container is an isolated sandbox already; tell Claude Code so it
         // doesn't refuse to use bypassPermissions just because we're root.
         IS_SANDBOX: "1",
@@ -600,6 +759,19 @@ async function getAiSdk() {
 // and API-key flows can't drift. Caller passes the `tool` factory from
 // whichever `ai` import they have so the tool objects bind to the right
 // module instance.
+// Cloning a real repo blows straight through the 60s default. Widen the budget
+// only for commands that actually fetch over the network, so message-history
+// questions keep exactly the timeout they always had.
+function bashTimeoutFor(command) {
+  const c = String(command || "").toLowerCase();
+  // Deliberately no word-boundary escapes here: this file is edited through a
+  // shell layer that silently turns an escaped backslash-b into a literal backspace
+  // byte, which matches nothing. Explicit character classes are safe.
+  const usesGit = /(^|[^a-z0-9_-])(git|gh)([^a-z0-9_-]|$)/.test(c);
+  const isNetworkOp = /(^|[^a-z0-9_-])(clone|fetch|pull)([^a-z0-9_-]|$)/.test(c);
+  return usesGit && isNetworkOp ? 300_000 : 60_000;
+}
+
 function buildVercelAiSdkTools(aiTool, workDir) {
   const env = {
     ...process.env,
@@ -653,7 +825,7 @@ function buildVercelAiSdkTools(aiTool, workDir) {
           const { exec } = require("child_process");
           exec(
             command,
-            { cwd: workDir, env, timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+            { cwd: workDir, env, timeout: bashTimeoutFor(command), maxBuffer: 10 * 1024 * 1024 },
             (err, stdout, stderr) =>
               resolve({
                 stdout: String(stdout || "").slice(0, 50_000),
@@ -922,7 +1094,11 @@ discord.on("messageCreate", async (message) => {
     return;
   }
 
-  const question = stripMention(message.content, discord.user.id, message);
+  const rawQuestion = stripMention(message.content, discord.user.id, message);
+  // Route BEFORE anything else so an explicit "code:"/"chat:" prefix is
+  // stripped before the question reaches logging, context enrichment, or the
+  // model. Chat is the default and behaves exactly as it always has.
+  const { route, question, forced: routeForced } = parseRoute(rawQuestion);
   if (!question) {
     await message.reply(
       "Ask me something! e.g. `@Data Boy who said \"lol\" the most?`"
@@ -995,7 +1171,16 @@ discord.on("messageCreate", async (message) => {
 
   const depth = classifyDepth(question);
   const model = depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
-  const maxTurns = depth === "deep" ? MAX_TURNS_DEEP : MAX_TURNS;
+  // Code questions clone and grep real repos, so they get a higher turn cap
+  // than a SQL lookup. Reply length is governed by the prompt, not by turns.
+  const maxTurns =
+    route === "code"
+      ? depth === "deep"
+        ? MAX_TURNS_CODE_DEEP
+        : MAX_TURNS_CODE
+      : depth === "deep"
+        ? MAX_TURNS_DEEP
+        : MAX_TURNS;
   const askerUsername = message.author.username;
   const askerLine = `**Asker:** Discord user \`${askerUsername}\` (look them up in the People table to use their friendly name when addressing them).\n\n`;
   const recentContext = await fetchRecentContext(
@@ -1007,10 +1192,10 @@ discord.on("messageCreate", async (message) => {
     ? `**Recent channel conversation** (last ~${RECENT_CONTEXT_LIMIT} messages, chronological; use to resolve follow-ups like "expand on #N", "the one about X", "no, the other one", etc.):\n\n${recentContext}\n\n---\n\n`
     : "";
   const enrichedQuestion = `${askerLine}${contextBlock}**Current question:**\n${question}`;
-  console.log(`Classified "${question.slice(0, 60)}" as ${depth} → ${model} (maxTurns=${maxTurns}, asker: ${askerUsername}, ctx: ${recentContext.length} chars)`);
+  console.log(`Classified "${question.slice(0, 60)}" as ${route}/${depth}${routeForced ? " (forced)" : ""} → ${model} (maxTurns=${maxTurns}, asker: ${askerUsername}, ctx: ${recentContext.length} chars)`);
 
   try {
-    const systemPrompt = await buildSystemPrompt(depth);
+    const systemPrompt = await buildSystemPrompt(depth, route);
     logBotPrompt({
       channelId: message.channel.id,
       author: askerUsername,
@@ -1169,6 +1354,20 @@ discord.once("ready", async () => {
   // Run cleanup periodically so stranded placeholders self-clean.
   setInterval(() => { cleanupStalePlaceholders().catch(() => {}); }, 90 * 1000);
   await cleanupStalePlaceholders();
+  // Warm the repo index. Routing recognises bare repo names ("how does lumen
+  // render") via KNOWN_REPO_NAMES, which fetchRepoIndex populates -- without
+  // this, the very first code question would have to rely on keywords alone.
+  // Non-fatal: if there is no GH_TOKEN, code mode simply stays keyword-only.
+  if (process.env.GH_TOKEN) {
+    try {
+      await fetchRepoIndex();
+      console.log(`GitHub: indexed ${KNOWN_REPO_NAMES.length} repos for ${GITHUB_OWNER}.`);
+    } catch (err) {
+      console.error("GitHub: repo index warm-up failed:", err.message);
+    }
+  } else {
+    console.log("GitHub: GH_TOKEN not set -- code mode will be keyword-routed only.");
+  }
 });
 
 (async () => {

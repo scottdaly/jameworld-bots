@@ -15,6 +15,27 @@ RUN apt-get update \
       tabulate \
  && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI, so Claude's Bash tool can explore Scott's repos the same way it
+# explores the DB: read-only, bounded by the credential rather than the tools.
+# gh picks up GH_TOKEN from the environment automatically.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+ && mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+# Make plain `git clone https://github.com/<owner>/<repo>` work for PRIVATE
+# repos without the agent ever handling the token itself. The helper reads
+# GH_TOKEN at call time, so no credential is baked into the image layer.
+RUN git config --system credential.https://github.com.helper \
+      '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+
 WORKDIR /usr/src/app
 
 # Data Boy has its own package.json to avoid peer-dep conflicts with
@@ -28,9 +49,14 @@ RUN npm install --omit=dev
 COPY patch-gemini-provider.js ./
 RUN node patch-gemini-provider.js
 
-COPY data-boy.js data-boy-prompt.md ./
+COPY data-boy.js data-boy-prompt.md code-prompt.md ./
 
 # Scratch dir Claude works in. Wiped per query by data-boy.js.
 RUN mkdir -p /tmp/data-boy-work
+
+# Persistent clone cache. Cloning lumen on every question would be slow, so
+# repos live here across queries and are `git -C <dir> pull`ed when stale.
+# NOT wiped per query, unlike /tmp/data-boy-work. Backed by a named volume.
+RUN mkdir -p /var/cache/repos
 
 CMD ["node", "data-boy.js"]

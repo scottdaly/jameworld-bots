@@ -73,11 +73,19 @@ services:
       # Headless container — fail fast if OAuth refresh wants a browser instead
       # of hanging 5 min waiting for a tab that doesn't exist.
       - NO_BROWSER=true
+      # Read-only GitHub access for Data Boy's code mode. Fine-grained PAT with
+      # contents:read + metadata:read only -- the same "bound by the credential,
+      # not by the toolset" model as POSTGRES_READONLY_USER above.
+      - GH_TOKEN=${GH_TOKEN}
+      - GITHUB_OWNER=${GITHUB_OWNER:-scottdaly}
+      - REPO_CACHE=/var/cache/repos
     volumes:
       # OAuth creds for Gemini provider. Mounted RW so the provider can write
       # refreshed access tokens back to oauth_creds.json on the host.
       # Harmless when MODEL_PROVIDER=anthropic.
       - /root/.gemini:/root/.gemini
+      # Cloned repos persist across questions so we don't re-clone every time.
+      - repo_cache:/var/cache/repos
     network_mode: host
     restart: unless-stopped
 
@@ -134,3 +142,5 @@ services:
 volumes:
   postgres_data:
     name: jameworld-bots_postgres_data
+  repo_cache:
+    name: jameworld-bots_repo_cache
