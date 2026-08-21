@@ -185,8 +185,16 @@ function containsWord(haystack, word) {
   return false;
 }
 
+// Discord has TWO mention forms and stripMention() only handles the user one
+// (<@id>). When the client autocompletes to the bot's ROLE instead (<@&id>),
+// the mention survives into the question text -- which silently defeated the
+// "^" anchor on ROUTE_PREFIX and made "chat:" overrides do nothing. Strip any
+// leading mention of either form before looking for the prefix. Character
+// classes rather than \d/\s on purpose; see the note on bashTimeoutFor.
+const LEADING_MENTIONS = /^(?:<@[!&]?[0-9]+>[ ]*)+/;
+
 function parseRoute(rawQuestion) {
-  const raw = (rawQuestion || "").trim();
+  const raw = (rawQuestion || "").replace(LEADING_MENTIONS, "").trim();
   const m = raw.match(ROUTE_PREFIX);
   if (m) {
     const tag = m[1].toLowerCase();
@@ -1182,7 +1190,10 @@ discord.on("messageCreate", async (message) => {
         ? MAX_TURNS_DEEP
         : MAX_TURNS;
   const askerUsername = message.author.username;
-  const askerLine = `**Asker:** Discord user \`${askerUsername}\` (look them up in the People table to use their friendly name when addressing them).\n\n`;
+  const askerLine =
+    route === "code"
+      ? `**Asker:** Discord user \`${askerUsername}\`.\n\n`
+      : `**Asker:** Discord user \`${askerUsername}\` (look them up in the People table to use their friendly name when addressing them).\n\n`;
   const recentContext = await fetchRecentContext(
     message.channel,
     message.id,
