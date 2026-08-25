@@ -19,8 +19,12 @@ const REPLY_CHUNK_LEN = 1900;
 // were empirically burning all 30 turns before writing final prose — surfacing
 // as "(Data Boy returned no answer.)" with status=error_max_turns / length.
 // Shallow lookups don't need the headroom. Watch data_boy_logs.status to tune.
+// The cap is no longer a cliff: runVercelAiSdkAnswer does a tool-free salvage
+// pass when the budget runs out mid-investigation, so hitting it costs a
+// less-researched answer rather than no answer at all. Grep logs for
+// [SALVAGED] to see how often that fires before raising these further.
 const MAX_TURNS = 30; // shallow default (also the fallback when depth unknown)
-const MAX_TURNS_DEEP = 50;
+const MAX_TURNS_DEEP = 70;
 
 // MODEL_PROVIDER controls the LLM backend.
 //   - "anthropic" uses the Claude Agent SDK over OAuth (Max account).
@@ -135,11 +139,34 @@ const DEEP_KEYWORDS = [
   "style of each",
   "as if they were",
   "as if i were",
+  // Catch-up / "what did I miss" questions. These read as casual — often
+  // literally phrased as "a quick rundown" — but answering one means sweeping
+  // an open-ended date range and synthesising it, which is deep work. Asking
+  // for a SHORT answer is not the same as asking an EASY question; depth is
+  // about the investigation, not the reply length.
+  "rundown",
+  "recap",
+  "up to speed",
+  "what did i miss",
+  "what have i missed",
+  "what i missed",
+  "what's new",
+  "whats new",
+];
+
+// Same job as DEEP_KEYWORDS, for phrasings that need a wildcard in the middle
+// ("catch Jake up", "since he last dropped in") and so can't be a substring.
+const DEEP_PATTERNS = [
+  /\bcatch\s+(?:\w+\s+)?up\b/,
+  /\bsince\s+(?:he|she|they|we|you|i|\w+)\s+(?:last|was|were)\b/,
+  /\bwhat(?:'s|s|\s+has|\s+have|\s+had)?\s+(?:been\s+)?(?:happen(?:ed|ing)|going\s+on)\s+(?:since|lately|recently)\b/,
 ];
 
 function classifyDepth(question) {
   const lower = question.toLowerCase();
-  return DEEP_KEYWORDS.some((kw) => lower.includes(kw)) ? "deep" : "shallow";
+  if (DEEP_KEYWORDS.some((kw) => lower.includes(kw))) return "deep";
+  if (DEEP_PATTERNS.some((re) => re.test(lower))) return "deep";
+  return "shallow";
 }
 
 // ── Route: which DOMAIN is this question about? ────────────────────────────
@@ -902,15 +929,67 @@ async function runVercelAiSdkAnswer({ modelHandle, providerOptions, systemPrompt
       }
     },
   });
+  // Vercel AI SDK finishReason: 'stop' | 'length' | 'tool-calls' |
+  // 'content-filter' | 'error' | 'other'. 'length'/'tool-calls' at the end
+  // is the Gemini-path analogue of Anthropic's error_max_turns.
+  const status = result.finishReason ?? null;
+  let text = result.text || lastText || "";
+  let salvaged = false;
+  let salvageInput = 0;
+  let salvageOutput = 0;
+
+  // Budget exhausted mid-investigation: stopWhen cut the loop while the model
+  // was still calling tools, so it never got to write prose and `text` is
+  // empty. Everything it learned is still sitting in the message history —
+  // throwing that away and reporting nothing wastes the whole run. Ask once
+  // more with toolChoice:'none' so it MUST answer from what it already has.
+  if (text.trim().length === 0 && (status === "tool-calls" || status === "length")) {
+    try {
+      const salvage = await generateText({
+        model: modelHandle,
+        system: systemPrompt,
+        messages: [
+          { role: "user", content: question },
+          ...(result.response?.messages ?? []),
+          {
+            role: "user",
+            content:
+              "You are out of tool budget and cannot call any more tools. " +
+              "Answer the original question now, using only what you already " +
+              "found above. If your research was cut off before you had the " +
+              "whole picture, say so in one short line and then give the best " +
+              "answer you can from what you do have.",
+          },
+        ],
+        // Tools stay declared so the message history stays schema-valid;
+        // toolChoice:'none' is what actually forces prose.
+        tools,
+        toolChoice: "none",
+        ...(providerOptions ? { providerOptions } : {}),
+      });
+      if ((salvage.text || "").trim().length > 0) {
+        text = salvage.text;
+        salvaged = true;
+        stepCount++;
+        salvageInput = salvage.usage?.inputTokens ?? salvage.usage?.promptTokens ?? 0;
+        salvageOutput = salvage.usage?.outputTokens ?? salvage.usage?.completionTokens ?? 0;
+      }
+    } catch (err) {
+      // A dangling tool call with no result will make the provider reject the
+      // replayed history. Nothing to do but report the empty answer as before.
+      console.warn(`Salvage pass failed: ${err.message}`);
+    }
+  }
+
   return {
-    text: result.text || lastText || "",
+    text,
     turns: stepCount,
-    inputTokens: result.usage?.inputTokens ?? result.usage?.promptTokens ?? inputTokens,
-    outputTokens: result.usage?.outputTokens ?? result.usage?.completionTokens ?? outputTokens,
-    // Vercel AI SDK finishReason: 'stop' | 'length' | 'tool-calls' |
-    // 'content-filter' | 'error' | 'other'. 'length'/'tool-calls' at the end
-    // is the Gemini-path analogue of Anthropic's error_max_turns.
-    status: result.finishReason ?? null,
+    inputTokens:
+      (result.usage?.inputTokens ?? result.usage?.promptTokens ?? inputTokens) + salvageInput,
+    outputTokens:
+      (result.usage?.outputTokens ?? result.usage?.completionTokens ?? outputTokens) + salvageOutput,
+    status,
+    salvaged,
   };
 }
 
@@ -1253,11 +1332,28 @@ discord.on("messageCreate", async (message) => {
     await placeholder
       .edit(`-# 🧠 Data Boy thought for ${secs} second${secs === 1 ? "" : "s"}`)
       .catch(() => {});
-    await postChunked(message, result.text, attachments);
-    const retryTag = capacityRetries > 0 ? ` [after ${capacityRetries} capacity retr${capacityRetries === 1 ? "y" : "ies"}]` : "";
     const isEmpty = (result.text || "").trim().length === 0 && attachments.length === 0;
+    if (isEmpty) {
+      // Don't fall through to postChunked's generic "(Data Boy returned no
+      // answer.)" — it tells the asker nothing about what went wrong or what
+      // to do next. If we got here the salvage pass failed too.
+      const ranOut =
+        result.status === "tool-calls" ||
+        result.status === "length" ||
+        result.status === "error_max_turns"; // the Anthropic path's spelling
+      await replyOrSend(
+        message,
+        ranOut
+          ? `I ran out of digging time on that one — ${result.turns} steps and I still hadn't pulled it together. Try narrowing it down to a specific person, channel, or date range and I'll get there.`
+          : "(Data Boy returned no answer.)"
+      );
+    } else {
+      await postChunked(message, result.text, attachments);
+    }
+    const retryTag = capacityRetries > 0 ? ` [after ${capacityRetries} capacity retr${capacityRetries === 1 ? "y" : "ies"}]` : "";
+    const salvageTag = result.salvaged ? " [SALVAGED]" : "";
     console.log(
-      `Answered "${question.slice(0, 60)}" in ${duration}ms (${depth}/${model}${retryTag}, ${result.turns} turns, ${result.inputTokens}+${result.outputTokens} tokens, status=${result.status ?? "?"})${isEmpty ? " [EMPTY ANSWER]" : ""}`
+      `Answered "${question.slice(0, 60)}" in ${duration}ms (${depth}/${model}${retryTag}, ${result.turns} turns, ${result.inputTokens}+${result.outputTokens} tokens, status=${result.status ?? "?"})${salvageTag}${isEmpty ? " [EMPTY ANSWER]" : ""}`
     );
     await finalizeQuery(logRowId, {
       answer: result.text,
