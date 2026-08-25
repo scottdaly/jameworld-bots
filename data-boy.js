@@ -662,7 +662,7 @@ async function buildSystemPrompt(depth = "shallow", route = "chat") {
 
   const depthGuidance =
     depth === "deep"
-      ? "**Depth tier: DEEP.** This question requires synthesis across many messages. Pull a substantial sample — scale with the user's total message count (aim for `min(2000, total/8)` messages, well-spread across the date range). Take your time; multiple passes are fine. Verify relationship claims (girlfriend vs sister, roommate vs brother, etc.) before asserting them."
+      ? "**Depth tier: DEEP.** This question requires synthesis across many messages. Pull a substantial sample — scale with the user's total message count (aim for `min(2000, total/8)` messages, well-spread across the date range). Take your time; multiple passes are fine. Verify relationship claims (girlfriend vs sister, roommate vs brother, etc.) before asserting them. **Exception: catch-up questions.** If the question is \"what did X miss\" / \"what's happened since…\", follow the Catch-up section instead — scope to that person's absence window and read it in full. Spreading a sample across the whole archive will miss exactly the recent, low-volume things a catch-up is asking for."
       : "**Depth tier: SHALLOW.** This is a counting/stats/lookup question. One or two SQL queries should be enough. Don't over-sample.";
 
   const context = [
