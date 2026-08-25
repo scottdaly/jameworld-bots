@@ -38,9 +38,20 @@ const MAX_TURNS_DEEP = 70;
 const MODEL_PROVIDER = (process.env.MODEL_PROVIDER || "anthropic").toLowerCase();
 const MODELS_BY_PROVIDER = {
   anthropic: { shallow: "claude-sonnet-4-6", deep: "claude-opus-4-7" },
-  // API-key path: full model catalog is available, including the newer
-  // gemini-3.5-flash that the OAuth backend doesn't yet whitelist.
-  "gemini-api": { shallow: "gemini-3.5-flash", deep: "gemini-3.1-pro-preview" },
+  // API-key path: full model catalog is available.
+  //
+  // Both tiers are the same model on purpose. The pro tier was measurably
+  // WORSE at this job than flash: on 2026-08-25 the same catch-up question
+  // ran deep on gemini-3.1-pro-preview and stopped itself at 20 of 70 turns
+  // having pulled 17k input tokens, where flash had spent 41k on the shallow
+  // attempt. More budget and a "smarter" model produced a thinner answer,
+  // because pro decided it was done early. Data Boy's work is wide sampling
+  // and synthesis, not hard reasoning, and flash is better at wide sampling.
+  //
+  // So depth no longer picks a model — it picks a turn budget (MAX_TURNS vs
+  // MAX_TURNS_DEEP) and a prompt tier that tells the model how much to
+  // sample. Those are the levers that actually make a deep answer deeper.
+  "gemini-api": { shallow: "gemini-3.7-flash", deep: "gemini-3.7-flash" },
   // Gemini 3.x with thinking turned down so multi-step tool calls work
   // without the `thoughtSignature` roundtrip the provider doesn't yet
   // support. Sacrifices the model's reasoning mode for now but keeps Gemini
