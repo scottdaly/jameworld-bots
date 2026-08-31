@@ -443,34 +443,40 @@ async function replyOrSend(question, payload) {
 // Post the answer as one or more brand-new messages — no editing of any
 // placeholder. The first chunk replies to the asker's question (so it threads
 // under it); overflow chunks are plain channel sends. Files ride the final
-// chunk so the reader sees them after the prose.
-async function postChunked(question, text, files = []) {
+// chunk so the reader sees them after the prose. An optional `prefix` (e.g.
+// the "thought for Ns" line) is prepended to the very first chunk instead of
+// being posted as its own message.
+async function postChunked(question, text, files = [], prefix = "") {
   const channel = question.channel;
   const trimmed = text.trim();
+  const lead = prefix ? `${prefix}\n` : "";
   if (trimmed.length === 0 && files.length === 0) {
-    await replyOrSend(question, "(Data Boy returned no answer.)");
+    await replyOrSend(question, `${lead}(Data Boy returned no answer.)`);
     return;
   }
-  if (trimmed.length <= DISCORD_MAX_LEN) {
-    await replyOrSend(question, { content: trimmed || " ", files });
+  if (lead.length + trimmed.length <= DISCORD_MAX_LEN) {
+    await replyOrSend(question, { content: `${lead}${trimmed}` || " ", files });
     return;
   }
   const parts = [];
   let remaining = trimmed;
+  // First chunk has less room to make space for the prepended prefix.
+  let chunkLimit = REPLY_CHUNK_LEN - lead.length;
   while (remaining.length > 0) {
-    if (remaining.length <= REPLY_CHUNK_LEN) {
+    if (remaining.length <= chunkLimit) {
       parts.push(remaining);
       break;
     }
     // Prefer splitting at a newline, fall back to a space, hard-cut only if needed.
-    let splitAt = remaining.lastIndexOf("\n", REPLY_CHUNK_LEN);
-    if (splitAt <= 0) splitAt = remaining.lastIndexOf(" ", REPLY_CHUNK_LEN);
-    if (splitAt <= 0) splitAt = REPLY_CHUNK_LEN;
+    let splitAt = remaining.lastIndexOf("\n", chunkLimit);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf(" ", chunkLimit);
+    if (splitAt <= 0) splitAt = chunkLimit;
     parts.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
+    chunkLimit = REPLY_CHUNK_LEN;
   }
   for (let i = 0; i < parts.length; i++) {
-    const labeled = `${parts[i]}\n*(part ${i + 1}/${parts.length})*`;
+    const labeled = `${i === 0 ? lead : ""}${parts[i]}\n*(part ${i + 1}/${parts.length})*`;
     if (i === 0) {
       await replyOrSend(question, labeled);
     } else if (i === parts.length - 1) {
@@ -1363,12 +1369,12 @@ discord.on("messageCreate", async (message) => {
     if (attachments.length > 0) {
       console.log(`Attaching ${attachments.length} file(s): ${attachments.map((a) => a.name).join(", ")}`);
     }
-    // Convert the placeholder into a quiet "thought for Ns" line, then post the
-    // actual answer as separate new message(s).
+    // Drop the placeholder entirely and fold the "thought for Ns" line into
+    // the top of the actual answer message, instead of leaving it behind as
+    // its own edited-in-place message.
     const secs = Math.round(duration / 1000);
-    await placeholder
-      .edit(`-# 🧠 Data Boy thought for ${secs} second${secs === 1 ? "" : "s"}`)
-      .catch(() => {});
+    const thoughtLine = `-# 🧠 Data Boy thought for ${secs} second${secs === 1 ? "" : "s"}`;
+    await placeholder.delete().catch(() => {});
     const isEmpty = (result.text || "").trim().length === 0 && attachments.length === 0;
     if (isEmpty) {
       // Don't fall through to postChunked's generic "(Data Boy returned no
@@ -1380,12 +1386,13 @@ discord.on("messageCreate", async (message) => {
         result.status === "error_max_turns"; // the Anthropic path's spelling
       await replyOrSend(
         message,
-        ranOut
-          ? `I ran out of digging time on that one — ${result.turns} steps and I still hadn't pulled it together. Try narrowing it down to a specific person, channel, or date range and I'll get there.`
-          : "(Data Boy returned no answer.)"
+        `${thoughtLine}\n` +
+          (ranOut
+            ? `I ran out of digging time on that one — ${result.turns} steps and I still hadn't pulled it together. Try narrowing it down to a specific person, channel, or date range and I'll get there.`
+            : "(Data Boy returned no answer.)")
       );
     } else {
-      await postChunked(message, result.text, attachments);
+      await postChunked(message, result.text, attachments, thoughtLine);
     }
     const retryTag = capacityRetries > 0 ? ` [after ${capacityRetries} capacity retr${capacityRetries === 1 ? "y" : "ies"}]` : "";
     const salvageTag = result.salvaged ? " [SALVAGED]" : "";
