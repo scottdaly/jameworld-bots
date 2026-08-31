@@ -375,6 +375,31 @@ async function fetchRecentContext(channel, beforeMessageId, botUserId) {
   }
 }
 
+// If this question is itself a Discord reply (to something other than Data
+// Boy — that case is handled separately above), fetch the message it's
+// replying to and surface it explicitly. Without this, a pronoun like "his"
+// in "add it to his clueless tally" has no resolved antecedent — the model
+// only sees a flat, unlinked transcript in fetchRecentContext and has to
+// guess, which biases it toward whichever person is already the strongest
+// running bit in the channel rather than the actual reply target.
+async function fetchReplyTarget(message, botUserId) {
+  const refId = message.reference?.messageId;
+  if (!refId) return "";
+  try {
+    const ref = await message.fetchReference();
+    let content = (ref.cleanContent || ref.content || "").trim();
+    if (!content) return "";
+    if (content.length > RECENT_CONTEXT_MAX_CHARS_PER_MSG) {
+      content = content.slice(0, RECENT_CONTEXT_MAX_CHARS_PER_MSG) + " …[truncated]";
+    }
+    const author = ref.author.id === botUserId ? "Data Boy" : ref.author.username;
+    return `**This message is a reply to** ${author}: "${content}"\n\n`;
+  } catch (err) {
+    console.error("Failed to fetch reply target:", err.message);
+    return "";
+  }
+}
+
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
 
@@ -1292,7 +1317,8 @@ discord.on("messageCreate", async (message) => {
   const contextBlock = recentContext
     ? `**Recent channel conversation** (last ~${RECENT_CONTEXT_LIMIT} messages, chronological; use to resolve follow-ups like "expand on #N", "the one about X", "no, the other one", etc.):\n\n${recentContext}\n\n---\n\n`
     : "";
-  const enrichedQuestion = `${askerLine}${contextBlock}**Current question:**\n${question}`;
+  const replyTargetBlock = await fetchReplyTarget(message, discord.user.id);
+  const enrichedQuestion = `${askerLine}${contextBlock}${replyTargetBlock}**Current question:**\n${question}`;
   console.log(`Classified "${question.slice(0, 60)}" as ${route}/${depth}${routeForced ? " (forced)" : ""} → ${model} (maxTurns=${maxTurns}, asker: ${askerUsername}, ctx: ${recentContext.length} chars)`);
 
   try {
