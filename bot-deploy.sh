@@ -21,6 +21,13 @@ psql_q() {
 preflight() {
   echo "== preflight =="
 
+  # Pull first: the repo is edited from a local clone and pushed, so the
+  # server's job is to fetch what was reviewed -- not to be a place files
+  # are copied to by hand, which is how three commits ended up existing
+  # only on this box.
+  git pull --ff-only --quiet origin main || fail "could not fast-forward from origin"
+  echo "  pulled $(git rev-parse --short HEAD)"
+
   node --check data-boy.js || fail "data-boy.js does not parse"
   node -e 'require("./toaster-feature.js")' || fail "toaster-feature.js does not load"
   echo "  syntax ok"
