@@ -50,11 +50,23 @@ preflight() {
 
 verify() {
   echo "== verify =="
-  sleep 8
+  # Poll rather than sleep-then-check-once. Discord login takes a variable few
+  # seconds, and a fixed wait produced a false "never connected" on a bot that
+  # was fine -- a check that cries wolf is one people learn to ignore.
+  local waited=0
+  while [ $waited -lt 45 ]; do
+    if docker compose logs --tail=40 "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND"; then
+      fail "module load failure"
+    fi
+    if docker compose logs --tail=40 "$SVC" 2>&1 | grep -q "Logged in as"; then
+      break
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  [ $waited -lt 45 ] || fail "never connected to Discord after 45s"
   docker compose ps "$SVC" --format '{{.Status}}' | grep -q '^Up' || fail "container is not Up"
-  docker compose logs --tail=40 "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND" && fail "module load failure"
-  docker compose logs --tail=40 "$SVC" 2>&1 | grep -q "Logged in as" || fail "never connected to Discord"
-  echo "  container up and connected"
+  echo "  container up and connected (${waited}s)"
 
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' https://city.rsdaly.com/)

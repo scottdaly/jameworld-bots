@@ -263,6 +263,12 @@ async function runFeature(o) {
     } catch (_) {}
   };
 
+  // Declared before the first thing that can fail. The early catch below
+  // spreads it, and a const referenced above its declaration throws a
+  // ReferenceError rather than returning the failure message -- which broke
+  // the report-back guarantee in exactly the path meant to guarantee it.
+  const usage = { turns: 0, inputTokens: 0, outputTokens: 0 };
+
   let branch;
   try {
     say("cloning the repo…");
@@ -277,9 +283,6 @@ async function runFeature(o) {
 
   let lastAgentText = "";
   let lastBuildError = "";
-  // Accumulated across build attempts so the caller logs real usage,
-  // not zeros -- a retry is still tokens spent.
-  const usage = { turns: 0, inputTokens: 0, outputTokens: 0 };
 
   for (let attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
     const audioNote = audio.saved
