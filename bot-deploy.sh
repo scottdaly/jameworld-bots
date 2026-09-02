@@ -57,23 +57,32 @@ preflight() {
 
 verify() {
   echo "== verify =="
-  # Poll rather than sleep-then-check-once. Discord login takes a variable few
-  # seconds, and a fixed wait produced a false "never connected" on a bot that
-  # was fine -- a check that cries wolf is one people learn to ignore.
-  local waited=0
-  while [ $waited -lt 45 ]; do
-    if docker compose logs --tail=40 "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND"; then
-      fail "module load failure"
-    fi
-    if docker compose logs --tail=40 "$SVC" 2>&1 | grep -q "Logged in as"; then
-      break
-    fi
-    sleep 3
-    waited=$((waited + 3))
-  done
-  [ $waited -lt 45 ] || fail "never connected to Discord after 45s"
+  # Only a container that was actually recreated will print a fresh "Logged in
+  # as" line. Grepping recent logs unconditionally reported a long-running,
+  # perfectly healthy bot as failed -- twice. Compare start times instead, and
+  # only wait for the login line when the container really did restart.
+  local now_started
+  now_started=$(docker inspect -f '{{.State.StartedAt}}'     jameworld-bots-discord-bot-data-boy-1 2>/dev/null)
+
+  if [ "$now_started" != "${WAS_STARTED:-}" ]; then
+    local waited=0
+    while [ $waited -lt 60 ]; do
+      if docker compose logs --since "$now_started" "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND"; then
+        fail "module load failure"
+      fi
+      if docker compose logs --since "$now_started" "$SVC" 2>&1 | grep -q "Logged in as"; then
+        break
+      fi
+      sleep 3
+      waited=$((waited + 3))
+    done
+    [ $waited -lt 60 ] || fail "restarted but never connected to Discord"
+    echo "  restarted and connected (${waited}s)"
+  else
+    echo "  container was already current; nothing to restart"
+  fi
+
   docker compose ps "$SVC" --format '{{.Status}}' | grep -q '^Up' || fail "container is not Up"
-  echo "  container up and connected (${waited}s)"
 
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' https://city.rsdaly.com/)
@@ -86,6 +95,9 @@ case "${1:-deploy}" in
   check) preflight ;;
   deploy)
     preflight
+    # Remember the start time so verify can tell a real restart from a
+    # no-op, instead of demanding a fresh login line either way.
+    WAS_STARTED=$(docker inspect -f '{{.State.StartedAt}}' \n      jameworld-bots-discord-bot-data-boy-1 2>/dev/null)
     echo "== restarting =="
     docker compose up -d --build "$SVC" 2>&1 | tail -1
     verify ;;
