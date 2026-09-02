@@ -52,6 +52,11 @@ services:
     restart: unless-stopped
 
   discord-bot-data-boy:
+    # A feature build takes ~60s. Docker's default 10s stop timeout would
+    # SIGKILL a job mid-run; give the drain handler room to finish first.
+    # A feature job runs 3-7 minutes. Anything shorter and a rebuild just
+    # SIGKILLs it after the drain gives up, which is what we were doing.
+    stop_grace_period: 900s
     build:
       context: .
       dockerfile: Dockerfile.data-boy
@@ -79,11 +84,27 @@ services:
       - GH_TOKEN=${GH_TOKEN}
       - GITHUB_OWNER=${GITHUB_OWNER:-scottdaly}
       - REPO_CACHE=/var/cache/repos
+      # Toaster City feature mode. The agent pushes a branch with the
+      # write-scoped deploy key, then triggers a build on the droplet via a
+      # forced-command key that can only run deploy.sh.
+      - TOASTER_REPO=github-push:scottdaly/toaster-city.git
+      - TOASTER_DEPLOY_HOST=toaster-deploy
+      - TOASTER_SITE_URL=https://city.rsdaly.com
     volumes:
       # OAuth creds for Gemini provider. Mounted RW so the provider can write
       # refreshed access tokens back to oauth_creds.json on the host.
       # Harmless when MODEL_PROVIDER=anthropic.
       - /root/.gemini:/root/.gemini
+      # Only the two toaster-city keys, not all of root's .ssh -- the rest
+      # of that directory holds keys to other machines.
+      - /root/.ssh/toaster_push:/root/.ssh/toaster_push:ro
+      - /root/.ssh/toaster_trigger:/root/.ssh/toaster_trigger:ro
+      - /root/toaster-ssh/config:/root/.ssh/config:ro
+      - /root/toaster-ssh/known_hosts:/root/.ssh/known_hosts:ro
+      # Agent edits live here until the build commits them. On the image's
+      # own filesystem they die with the container; on a volume an
+      # interrupted job's work can be salvaged to a branch on restart.
+      - data_boy_work:/tmp/data-boy-work
       # Cloned repos persist across questions so we don't re-clone every time.
       - repo_cache:/var/cache/repos
     network_mode: host
@@ -143,4 +164,5 @@ volumes:
   postgres_data:
     name: jameworld-bots_postgres_data
   repo_cache:
+  data_boy_work:
     name: jameworld-bots_repo_cache

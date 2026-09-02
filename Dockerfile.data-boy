@@ -9,6 +9,7 @@ RUN apt-get update \
       python3 \
       python3-pip \
       jq \
+      libsdl2-dev \
  && pip3 install --no-cache-dir \
       pandas \
       matplotlib \
@@ -49,7 +50,7 @@ RUN npm install --omit=dev
 COPY patch-gemini-provider.js ./
 RUN node patch-gemini-provider.js
 
-COPY data-boy.js data-boy-prompt.md code-prompt.md ./
+COPY data-boy.js data-boy-prompt.md code-prompt.md toaster-feature.js feature-prompt.md ./
 
 # Scratch dir Claude works in. Wiped per query by data-boy.js.
 RUN mkdir -p /tmp/data-boy-work

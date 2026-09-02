@@ -11,6 +11,7 @@ const {
   tool,
   createSdkMcpServer,
 } = require("@anthropic-ai/claude-agent-sdk");
+const { runFeature, salvageWorkDir } = require("./toaster-feature.js");
 
 const DISCORD_MAX_LEN = 2000;
 const REPLY_CHUNK_LEN = 1900;
@@ -200,7 +201,7 @@ const CODE_KEYWORDS = [
 ];
 
 // Explicit override beats the classifier: "@Data Boy code: <question>".
-const ROUTE_PREFIX = /^(code|chat|db|github|gh)\s*[:\-]\s*/i;
+const ROUTE_PREFIX = /^(code|chat|db|github|gh|feature|build)\s*[:\-]\s*/i;
 
 // Repo names are the strongest signal there is — a bare "how does lumen render"
 // should route to code even with no keyword. Filled in at startup from gh.
@@ -237,7 +238,12 @@ function parseRoute(rawQuestion) {
   if (m) {
     const tag = m[1].toLowerCase();
     return {
-      route: tag === "chat" || tag === "db" ? "chat" : "code",
+      route:
+        tag === "chat" || tag === "db"
+          ? "chat"
+          : tag === "feature" || tag === "build"
+            ? "feature"
+            : "code",
       question: raw.slice(m[0].length).trim(),
       forced: true,
     };
@@ -255,6 +261,15 @@ const PROMPT_PATH = path.join(__dirname, "data-boy-prompt.md");
 const CODE_PROMPT_PATH = path.join(__dirname, "code-prompt.md");
 // Code questions clone and grep real repos, so they need more headroom than a
 // SQL lookup, but the terse-answer rules keep output short regardless.
+// Feature mode edits real C and must get it compiling, which takes many more
+// steps than answering a question. Ambitious requests are the point, so this is
+// deliberately generous -- the prompt governs reply length, not the turn cap.
+const FEATURE_PROMPT_PATH = path.join(__dirname, "feature-prompt.md");
+const MAX_TURNS_FEATURE = Number(process.env.MAX_TURNS_FEATURE || 200);
+// Feature mode always runs on the Anthropic path regardless of
+// MODEL_PROVIDER: editing 1200 lines of C until it compiles is a different
+// job from answering a question, and the global provider serves the latter.
+const FEATURE_MODEL = process.env.FEATURE_MODEL || "claude-opus-5";
 const MAX_TURNS_CODE = 40;
 const MAX_TURNS_CODE_DEEP = 60;
 // Persistent clone cache (see Dockerfile.data-boy). Survives between questions.
@@ -268,6 +283,40 @@ const WORK_ROOT = "/tmp/data-boy-work";
 
 // Per-user in-flight question lock (Discord user id → boolean).
 const inFlight = new Set();
+
+// When this process started. Recovery uses it to tell an orphaned job from a
+// live one: every unfinished row looks identical, so without this a second
+// instance (or a slow boot) would declare a running job lost and mark it
+// failed while its worker was still going.
+const BOOT_TIME = new Date();
+
+// A rebuild sends SIGTERM. Killing a job mid-run leaves the asker with a
+// placeholder that never resolves and work that is silently lost -- so refuse
+// new work and wait for what is running to finish. Docker's default 10s stop
+// timeout is far too short for a ~60s feature build; docker-compose.yml sets
+// stop_grace_period to match DRAIN_MS.
+let shuttingDown = false;
+// Feature jobs routinely run 3-7 minutes; a drain shorter than that just
+// means Docker SIGKILLs the job anyway. Matches stop_grace_period.
+const DRAIN_MS = Number(process.env.DRAIN_MS || 880_000);
+
+async function drainThenExit(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal}: draining ${inFlight.size} in-flight job(s), up to ${DRAIN_MS}ms.`);
+  const deadline = Date.now() + DRAIN_MS;
+  while (inFlight.size > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (inFlight.size > 0) {
+    console.warn(`${signal}: giving up with ${inFlight.size} still running.`);
+  } else {
+    console.log(`${signal}: drained cleanly.`);
+  }
+  process.exit(0);
+}
+process.on("SIGTERM", () => drainThenExit("SIGTERM"));
+process.on("SIGINT", () => drainThenExit("SIGINT"));
 
 // Discord message ids of "thinking…" placeholders belonging to a query that is
 // still running. The janitor (cleanupStalePlaceholders) excludes these so it
@@ -664,6 +713,7 @@ async function buildSystemPrompt(depth = "shallow", route = "chat") {
   // Code questions get a completely separate prompt — no message-history
   // instructions, no DB stats, no channel map. Chat questions fall through to
   // the original path below, byte-identical to before GitHub support existed.
+  if (route === "feature") return fs.readFileSync(FEATURE_PROMPT_PATH, "utf8");
   if (route === "code") return buildCodeSystemPrompt(depth);
 
   const template = fs.readFileSync(PROMPT_PATH, "utf8");
@@ -718,15 +768,19 @@ async function buildSystemPrompt(depth = "shallow", route = "chat") {
 }
 
 // ── The core: run one question through the SDK ─────────────────────────────
-async function answer(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir) {
+async function answer(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir, prepared = false, provider = MODEL_PROVIDER) {
   // Fresh scratch dir per question (unique per invocation — see WORK_ROOT).
-  fs.rmSync(workDir, { recursive: true, force: true });
-  fs.mkdirSync(workDir, { recursive: true });
+  // Feature mode passes prepared=true: it has already cloned the repo in there
+  // and cutting it away would delete the checkout we are about to edit.
+  if (!prepared) {
+    fs.rmSync(workDir, { recursive: true, force: true });
+    fs.mkdirSync(workDir, { recursive: true });
+  }
 
-  if (MODEL_PROVIDER === "gemini") {
+  if (provider === "gemini") {
     return answerWithGemini(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }
-  if (MODEL_PROVIDER === "gemini-api") {
+  if (provider === "gemini-api") {
     return answerWithGeminiApi(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }
   return answerWithAnthropic(question, systemPrompt, model, onProgress, maxTurns, workDir);
@@ -1079,15 +1133,15 @@ async function answerWithGeminiApi(question, systemPrompt, modelName, onProgress
 // id on success, or null if another invocation already claimed it (uniqueness
 // violation). This is the bulletproof dedup layer — DB enforces it regardless
 // of how many process instances or async handler invocations race here.
-async function claimMessage(messageId, discordUser, question) {
+async function claimMessage(messageId, discordUser, question, channelId) {
   try {
     const result = await adminPool.query(
-      `INSERT INTO data_boy_logs (discord_message_id, discord_user, question)
-       VALUES ($1, $2, $3)
+      `INSERT INTO data_boy_logs (discord_message_id, discord_user, question, discord_channel_id)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (discord_message_id) WHERE discord_message_id IS NOT NULL
          DO NOTHING
        RETURNING id`,
-      [messageId, discordUser, question]
+      [messageId, discordUser, question, channelId]
     );
     return result.rowCount > 0 ? result.rows[0].id : null;
   } catch (err) {
@@ -1203,7 +1257,19 @@ discord.on("messageCreate", async (message) => {
     return;
   }
 
-  if (!message.mentions.has(discord.user)) return;
+  // Bare-prefix feature command, in the same style as !datastats above, so a
+  // change request doesn't need an @mention. "@Data Boy feature: ..." still
+  // works; both land on the same route.
+  const bang = message.content.trim().match(/^!(?:feature|build)(?:\s+([\s\S]*))?$/i);
+  if (bang && !(bang[1] || "").trim()) {
+    // Never leave a bare !feature unanswered -- say what it wants instead.
+    await message.reply(
+      "Tell me what to change, e.g. `!feature make the night sky purple`. " +
+        "I'll edit the game, build it, and post the result."
+    );
+    return;
+  }
+  if (!bang && !message.mentions.has(discord.user)) return;
 
   console.log(`messageCreate from ${message.author.username} (msg=${message.id}, len=${message.content.length})`);
 
@@ -1216,14 +1282,18 @@ discord.on("messageCreate", async (message) => {
   // Discord auto-prepends an @mention when you reply to a message. Don't treat
   // a plain reply to Data Boy as a new question — the user must explicitly
   // @mention to ask something new.
+  // ...but an explicit !feature is never an accidental reply, so let it through.
   if (
+    !bang &&
     message.reference?.messageId &&
     message.mentions.repliedUser?.id === discord.user.id
   ) {
     return;
   }
 
-  const rawQuestion = stripMention(message.content, discord.user.id, message);
+  const rawQuestion = bang
+    ? `feature: ${(bang[1] || "").trim()}`
+    : stripMention(message.content, discord.user.id, message);
   // Route BEFORE anything else so an explicit "code:"/"chat:" prefix is
   // stripped before the question reaches logging, context enrichment, or the
   // model. Chat is the default and behaves exactly as it always has.
@@ -1238,11 +1308,23 @@ discord.on("messageCreate", async (message) => {
   const userId = message.author.id;
   const userTag = message.author.tag;
 
+  if (shuttingDown) {
+    await message.reply("I'm restarting right now — give me a few seconds and ask again.");
+    return;
+  }
   if (inFlight.has(userId)) {
     await message.reply("I'm still working on your last question. One at a time!");
     return;
   }
+  // Claim the slot synchronously, before the first await. Checking here and
+  // adding after `await claimMessage` leaves a gap two fast messages from the
+  // same person can both slip through -- and then whichever finishes first
+  // deletes the key, making the user look idle while the other still runs.
+  // Every early return below must release it again.
+  inFlight.add(userId);
+
   if (!rateLimitCheck(userId)) {
+    inFlight.delete(userId);
     await message.reply(
       `You've asked ${RATE_LIMIT_PER_HOUR} questions in the last hour. Take a breather.`
     );
@@ -1253,13 +1335,13 @@ discord.on("messageCreate", async (message) => {
   // invocation already claimed it (uniqueness violation), bail without
   // touching Discord. This is the bulletproof layer beneath the in-memory
   // dedup — it works even across processes.
-  const logRowId = await claimMessage(message.id, userTag, question);
+  const logRowId = await claimMessage(message.id, userTag, question, message.channel.id);
   if (logRowId === null) {
     console.log(`DB-dedup: message ${message.id} already claimed by another invocation — skipping.`);
+    inFlight.delete(userId);
     return;
   }
 
-  inFlight.add(userId);
   const startedAt = Date.now();
   // Per-question scratch dir, unique to this Discord message.
   const workDir = path.join(WORK_ROOT, String(message.id));
@@ -1299,11 +1381,14 @@ discord.on("messageCreate", async (message) => {
   const progressInterval = setInterval(editProgress, 15_000);
 
   const depth = classifyDepth(question);
-  const model = depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
+  const model =
+    route === "feature" ? FEATURE_MODEL : depth === "deep" ? MODEL_DEEP : MODEL_SHALLOW;
   // Code questions clone and grep real repos, so they get a higher turn cap
   // than a SQL lookup. Reply length is governed by the prompt, not by turns.
   const maxTurns =
-    route === "code"
+    route === "feature"
+      ? MAX_TURNS_FEATURE
+      : route === "code"
       ? depth === "deep"
         ? MAX_TURNS_CODE_DEEP
         : MAX_TURNS_CODE
@@ -1342,6 +1427,39 @@ discord.on("messageCreate", async (message) => {
     };
     let result;
     let capacityRetries = 0;
+    if (route === "feature") {
+      const fr = await runFeature({
+        request: question,
+        // Discord CDN links expire, so the module downloads these immediately
+        // rather than handing the agent a URL that may be dead by then.
+        attachments: [...message.attachments.values()].map((a) => ({
+          name: a.name,
+          url: a.url,
+          size: a.size,
+          contentType: a.contentType,
+        })),
+        workDir,
+        answer,
+        systemPrompt,
+        model,
+        maxTurns,
+        onProgress: (s) => {
+          progressSnippet = s;
+          editProgress();
+        },
+      });
+      // runFeature always returns text -- success, failure, or exhaustion. The
+      // built frame is left in workDir, so collectAttachments posts it.
+      result = {
+        text: fr.ok ? `${fr.text}
+
+${fr.url}` : fr.text,
+        turns: fr.turns || 0,
+        inputTokens: fr.inputTokens || 0,
+        outputTokens: fr.outputTokens || 0,
+        status: fr.ok ? "success" : "feature_failed",
+      };
+    } else
     while (true) {
       try {
         result = await answer(enrichedQuestion, systemPrompt, model, onProgress, maxTurns, workDir);
@@ -1500,8 +1618,69 @@ async function cleanupStalePlaceholders() {
   if (cleaned > 0) console.log(`Cleaned up ${cleaned} stale placeholder message(s).`);
 }
 
+
+// A job killed mid-run (a rebuild, a crash) leaves its log row unfinalized and
+// its asker staring at a placeholder that never resolves. Going quiet is the one
+// outcome we refuse, so on boot: find those rows, tell the asker, close them out.
+async function recoverInterruptedJobs() {
+  try {
+    await adminPool.query(
+      "ALTER TABLE data_boy_logs ADD COLUMN IF NOT EXISTS discord_channel_id TEXT"
+    );
+    const { rows } = await adminPool.query(
+      `SELECT id, discord_message_id, discord_channel_id, question
+         FROM data_boy_logs
+        WHERE answer IS NULL AND error IS NULL AND status IS NULL
+          AND asked_at > NOW() - INTERVAL '24 hours'
+          AND asked_at < $1
+        ORDER BY id DESC LIMIT 20`,
+      [BOOT_TIME]
+    );
+    if (rows.length === 0) return;
+    console.log(`Recovery: ${rows.length} interrupted job(s) from before the restart.`);
+
+    for (const r of rows) {
+      // The work dir is on a volume, so an interrupted job's edits are still
+      // on disk. Push them somewhere durable before telling anyone it's lost.
+      const salvaged = await salvageWorkDir(
+        path.join(WORK_ROOT, String(r.discord_message_id)),
+        r.id
+      );
+
+      let told = false;
+      if (r.discord_channel_id && r.discord_message_id) {
+        try {
+          const ch = await discord.channels.fetch(r.discord_channel_id);
+          const msg = await ch.messages.fetch(r.discord_message_id);
+          await msg.reply(
+            salvaged
+              ? "I got restarted while working on this — sorry. I saved what I had " +
+                  `to the branch \`${salvaged.branch}\`, so nothing is lost. Ask ` +
+                  "again and I'll redo it properly."
+              : "I got restarted while working on this and lost it — sorry. Ask again and I'll pick it up."
+          );
+          told = true;
+        } catch (err) {
+          console.warn(`Recovery: could not reply to ${r.discord_message_id}: ${err.message}`);
+        }
+      }
+      await finalizeQuery(r.id, {
+        error:
+          (told ? "interrupted by restart (asker notified)" : "interrupted by restart") +
+          (salvaged ? ` [salvaged to ${salvaged.branch}]` : ""),
+        duration_ms: 0,
+      });
+      console.log(`Recovery: closed row ${r.id} ("${(r.question || "").slice(0, 40)}")`);
+    }
+  } catch (err) {
+    // Never let recovery stop the bot from coming up.
+    console.error("Recovery failed:", err.message);
+  }
+}
+
 discord.once("ready", async () => {
   console.log(`Logged in as ${discord.user.tag}.`);
+  await recoverInterruptedJobs();
   // Run cleanup periodically so stranded placeholders self-clean.
   setInterval(() => { cleanupStalePlaceholders().catch(() => {}); }, 90 * 1000);
   await cleanupStalePlaceholders();

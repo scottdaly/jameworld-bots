@@ -3,3 +3,5 @@ backups/
 node_modules/
 .env
 
+*.bak.*
+*.bak-*
