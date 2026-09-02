@@ -57,32 +57,30 @@ preflight() {
 
 verify() {
   echo "== verify =="
-  # Only a container that was actually recreated will print a fresh "Logged in
-  # as" line. Grepping recent logs unconditionally reported a long-running,
-  # perfectly healthy bot as failed -- twice. Compare start times instead, and
-  # only wait for the login line when the container really did restart.
-  local now_started
-  now_started=$(docker inspect -f '{{.State.StartedAt}}'     jameworld-bots-discord-bot-data-boy-1 2>/dev/null)
+  # Deliberately dumb. The previous version grepped the logs for the Discord
+  # login line and reported a healthy bot as broken three separate times --
+  # once because login was slower than a fixed sleep, once because the line had
+  # scrolled out of the tail on a long-running container, once because of
+  # --since parsing. A check that cries wolf gets ignored, which is worse than
+  # no check. These four signals cannot be wrong about whether it is running.
+  local name=jameworld-bots-discord-bot-data-boy-1
+  sleep 6
 
-  if [ "$now_started" != "${WAS_STARTED:-}" ]; then
-    local waited=0
-    while [ $waited -lt 60 ]; do
-      if docker compose logs --since "$now_started" "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND"; then
-        fail "module load failure"
-      fi
-      if docker compose logs --since "$now_started" "$SVC" 2>&1 | grep -q "Logged in as"; then
-        break
-      fi
-      sleep 3
-      waited=$((waited + 3))
-    done
-    [ $waited -lt 60 ] || fail "restarted but never connected to Discord"
-    echo "  restarted and connected (${waited}s)"
-  else
-    echo "  container was already current; nothing to restart"
-  fi
+  local state restarts
+  state=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
+  [ "$state" = "running" ] || fail "container state is '$state'"
 
-  docker compose ps "$SVC" --format '{{.Status}}' | grep -q '^Up' || fail "container is not Up"
+  # The real symptom of a broken build is a crash loop, not a missing log line.
+  sleep 6
+  restarts=$(docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null)
+  sleep 6
+  local restarts2
+  restarts2=$(docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null)
+  [ "$restarts" = "$restarts2" ] || fail "crash looping (restart count $restarts -> $restarts2)"
+
+  docker compose logs --tail=60 "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND"     && fail "module load failure"
+
+  echo "  running, not crash looping, module loaded"
 
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' https://city.rsdaly.com/)
