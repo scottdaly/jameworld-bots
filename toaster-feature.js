@@ -498,4 +498,170 @@ async function salvageWorkDir(workDir, label) {
   }
 }
 
-module.exports = { runFeature, salvageWorkDir, SITE_URL };
+/* =======================================================================
+ *  Large requests, delivered in pieces
+ *
+ *  A big ask ("add everything from Cities: Skylines") currently succeeds or
+ *  fails whole: one run, one gate, all or nothing. Split into increments, a
+ *  later failure still leaves the earlier ones shipped and playable, each diff
+ *  is small enough to rarely conflict, and the integration lock is released
+ *  between them so nobody else is stuck behind an epic.
+ *
+ *  The planner decides how many pieces. It does NOT decide the limits: every
+ *  bound below is enforced here, because the runaway case -- an unbounded plan
+ *  multiplied by three build attempts at full turn budget -- is the one failure
+ *  that is both expensive and silent.
+ * ===================================================================== */
+
+const MAX_INCREMENTS = Number(process.env.TOASTER_MAX_INCREMENTS || 4);
+const EPIC_TURN_BUDGET = Number(process.env.TOASTER_EPIC_TURNS || 500);
+const EPIC_MS_BUDGET = Number(process.env.TOASTER_EPIC_MS || 45 * 60 * 1000);
+
+const PLAN_PROMPT = [
+  "Break the request below into increments that each leave the game fully",
+  "playable on their own, and that build on each other in order.",
+  "",
+  "Rules:",
+  "- If the request fits in ONE change, return exactly one increment. Most do.",
+  "- Never more than " + MAX_INCREMENTS + ".",
+  "- Each increment must stand alone: no half-wired UI, no save-format change",
+  "  before the code that reads it, nothing that leaves the game worse than",
+  "  before if the next increment never happens.",
+  "- Order them so each one only relies on what came before.",
+  "",
+  "Reply with JSON only, no prose and no code fence:",
+  '{"increments":[{"title":"short label","request":"a full standalone request"}]}',
+  "",
+  "The `request` field is handed verbatim to whoever implements it, so it must",
+  "make sense with no other context.",
+].join("\n");
+
+/** Ask for a plan. Any doubt at all falls back to a single increment. */
+async function planIncrements(o) {
+  const res = await o.answer(
+    PLAN_PROMPT + "\n\nThe request:\n" + o.request,
+    "You are planning work on a small C game. Reply with JSON only.",
+    o.model,
+    null,
+    12,                      // planning is cheap; it must not become the work
+    o.workDir + "-plan",     // its own dir, so stray edits cannot leak into the build
+    false
+  );
+  const usage = {
+    turns: res && res.turns ? res.turns : 0,
+    inputTokens: res && res.inputTokens ? res.inputTokens : 0,
+    outputTokens: res && res.outputTokens ? res.outputTokens : 0,
+  };
+  try {
+    const raw = String((res && res.text) || "");
+    const json = raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1);
+    const parsed = JSON.parse(json);
+    const list = Array.isArray(parsed.increments) ? parsed.increments : [];
+    const clean = list
+      .filter(function (x) { return x && typeof x.request === "string" && x.request.trim(); })
+      .slice(0, MAX_INCREMENTS)
+      .map(function (x, i) {
+        return {
+          title: String(x.title || "step " + (i + 1)).slice(0, 60),
+          request: x.request.trim().slice(0, 2000),
+        };
+      });
+    return { plan: clean.length ? clean : null, usage };
+  } catch (err) {
+    // A malformed plan is not permission to improvise; do the request as asked.
+    console.warn("[toaster] plan unparseable, treating as one change:", err.message);
+    return { plan: null, usage };
+  }
+}
+
+/**
+ * Run a request, in one piece or several.
+ *
+ * @param {function} [o.onIncrement] awaited between increments, so the preview
+ *        is delivered before the next clone wipes the work dir.
+ */
+async function runFeatureEpic(o) {
+  const started = Date.now();
+  const total = { turns: 0, inputTokens: 0, outputTokens: 0 };
+  const add = function (r) {
+    total.turns += (r && r.turns) || 0;
+    total.inputTokens += (r && r.inputTokens) || 0;
+    total.outputTokens += (r && r.outputTokens) || 0;
+  };
+
+  const planned = await planIncrements(o);
+  add(planned.usage);
+  const plan = planned.plan;
+
+  // One increment means one ordinary job -- and it runs the ORIGINAL wording,
+  // not the planner's paraphrase, which can quietly drop detail.
+  if (!plan || plan.length <= 1) {
+    const r = await runFeature(o);
+    add(r);
+    return Object.assign({}, r, total);
+  }
+
+  console.log("[toaster] plan: " + plan.map(function (p) { return p.title; }).join(" -> "));
+  const shipped = [];
+
+  for (let i = 0; i < plan.length; i++) {
+    const step = plan[i];
+    const left = EPIC_TURN_BUDGET - total.turns;
+    const elapsed = Date.now() - started;
+
+    if (left <= 0 || elapsed > EPIC_MS_BUDGET) {
+      return Object.assign({
+        ok: shipped.length > 0,
+        text: summarise(shipped, plan) +
+          "\n\nI stopped there -- this had already used its budget for one request. " +
+          "Ask for the rest and I'll carry on.",
+      }, total);
+    }
+
+    // callers pass onProgress, not say -- this drives the placeholder text
+    if (typeof o.onProgress === "function") {
+      try { o.onProgress("step " + (i + 1) + " of " + plan.length + ": " + step.title); }
+      catch (e) {}
+    }
+    const r = await runFeature(Object.assign({}, o, { request: step.request }));
+    add(r);
+
+    if (!r.ok) {
+      // Stop rather than build the next step on something that did not land.
+      // A merged-but-unpublished step is worse still: main and the site
+      // disagree, and continuing would pile changes on top of that.
+      return Object.assign({
+        ok: shipped.length > 0,
+        branch: r.branch,
+        text: summarise(shipped, plan) +
+          "\n\n**" + step.title + "** did not land: " + r.text +
+          "\n\nI stopped there rather than building the rest on top of it.",
+      }, total);
+    }
+
+    shipped.push(step.title);
+    if (i < plan.length - 1 && typeof o.onIncrement === "function") {
+      try {
+        await o.onIncrement({
+          title: step.title,
+          index: i + 1,
+          of: plan.length,
+          text: r.text,
+          preview: path.join(o.workDir, "preview.png"),
+        });
+      } catch (err) {
+        console.warn("[toaster] interim post failed:", err.message);
+      }
+    }
+  }
+
+  return Object.assign({ ok: true, url: SITE_URL, text: summarise(shipped, plan) }, total);
+}
+
+function summarise(shipped, plan) {
+  if (!shipped.length) return "Nothing landed.";
+  return "Shipped " + shipped.length + " of " + plan.length + ": " +
+    shipped.map(function (s) { return "**" + s + "**"; }).join(", ") + ".";
+}
+
+module.exports = { runFeature, runFeatureEpic, salvageWorkDir, SITE_URL };

@@ -11,7 +11,7 @@ const {
   tool,
   createSdkMcpServer,
 } = require("@anthropic-ai/claude-agent-sdk");
-const { runFeature, salvageWorkDir } = require("./toaster-feature.js");
+const { runFeatureEpic, salvageWorkDir } = require("./toaster-feature.js");
 
 const DISCORD_MAX_LEN = 2000;
 const REPLY_CHUNK_LEN = 1900;
@@ -1428,7 +1428,7 @@ discord.on("messageCreate", async (message) => {
     let result;
     let capacityRetries = 0;
     if (route === "feature") {
-      const fr = await runFeature({
+      const fr = await runFeatureEpic({
         request: question,
         // Discord CDN links expire, so the module downloads these immediately
         // rather than handing the agent a URL that may be dead by then.
@@ -1446,6 +1446,19 @@ discord.on("messageCreate", async (message) => {
         onProgress: (s) => {
           progressSnippet = s;
           editProgress();
+        },
+        // Posted between increments of a large request, and awaited: the
+        // screenshot lives in the work dir, which the next increment's clone
+        // wipes, so it has to be delivered before we move on.
+        onIncrement: async (inc) => {
+          const files = [];
+          try {
+            if (inc.preview && fs.existsSync(inc.preview)) {
+              files.push({ attachment: inc.preview, name: `step-${inc.index}.png` });
+            }
+          } catch {}
+          const header = `-# step ${inc.index} of ${inc.of} — **${inc.title}** is live`;
+          await postChunked(message, inc.text || "", files, header);
         },
       });
       // runFeature always returns text -- success, failure, or exhaustion. The
