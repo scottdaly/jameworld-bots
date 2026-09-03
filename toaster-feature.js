@@ -839,6 +839,14 @@ const EPIC_TURN_BUDGET = Number(process.env.TOASTER_EPIC_TURNS || 500);
 const EPIC_MS_BUDGET = Number(process.env.TOASTER_EPIC_MS || 45 * 60 * 1000);
 
 const PLAN_PROMPT = [
+  "You are planning work on Toaster City: an existing, working SDL2 isometric",
+  "city builder in C (main.c, sprites.c, save.c and headers) that is live at",
+  SITE_URL + ". The checkout in your working directory IS that game. Read",
+  "CLAUDE.md and enough of the source to know what already exists before",
+  "you plan anything. Every increment is an addition to this game -- never a",
+  "rewrite, a new project, a new build system, or a different kind of game.",
+  "Do not edit any file here; this directory is thrown away after you answer.",
+  "",
   "Break the request below into increments that each leave the game fully",
   "playable on their own, and that build on each other in order.",
   "",
@@ -866,15 +874,34 @@ async function planIncrements(o) {
 
 /** The provider call on its own, so a provider outage degrades to one job. */
 async function planAsk(o) {
+  // The planner used to run in an empty directory: its own scratch dir, which
+  // answer() wiped and recreated, holding nothing. A request specific enough
+  // to split on its own never noticed. "make our game more cool and fun like
+  // city skyline" (job 244) did: the planner looked around, found an empty
+  // floor, and wrote a four-step plan that opened with "the repository is
+  // currently empty, so start from scratch" -- a Makefile and a terminal
+  // rewrite for a repo holding a live SDL2 city builder. The coder, which does
+  // get the checkout, refused step one and nothing landed. So the planner now
+  // reads the same repo the coder will: its own clone, thrown away afterwards
+  // so a stray edit cannot leak into the build.
+  const planDir = o.workDir + "-plan";
   try {
+    fs.rmSync(planDir, { recursive: true, force: true });
+    const clone = await run("git", ["clone", "--quiet", REPO, planDir]);
+    if (!clone.ok) {
+      console.warn("[toaster] planner could not clone the repo, treating as one change: " +
+        clone.stderr.trim());
+      return null;
+    }
     return await o.answer(
       PLAN_PROMPT + "\n\nThe request:\n" + o.request,
-      "You are planning work on a small C game. Reply with JSON only.",
+      "You are planning additions to an existing C game; its checkout is your " +
+        "working directory. Read before you plan, edit nothing, reply with JSON only.",
       o.model,
       null,
       12,                      // planning is cheap; it must not become the work
-      o.workDir + "-plan",     // its own dir, so stray edits cannot leak into the build
-      false,
+      planDir,
+      true,                    // already cloned; answer() must not wipe it
       // Same provider as the work itself. Without this the planner inherits the
       // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
       // name, and the request goes to Google asking for a Claude model.
@@ -883,6 +910,8 @@ async function planAsk(o) {
   } catch (e) {
     console.warn("[toaster] planner unavailable, treating as one change:", e.message);
     return null;
+  } finally {
+    try { fs.rmSync(planDir, { recursive: true, force: true }); } catch (e) {}
   }
 }
 
@@ -1101,4 +1130,5 @@ async function stashAttachments(workDir, attachments) {
 
 module.exports = {
   runFeature, runFeatureEpic, salvageWorkDir, stashAttachments, SITE_URL,
+  planIncrements,   // exported for tests/planner-test.js
 };
