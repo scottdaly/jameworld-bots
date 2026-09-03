@@ -12,6 +12,31 @@ const {
   createSdkMcpServer,
 } = require("@anthropic-ai/claude-agent-sdk");
 const { runFeatureEpic, salvageWorkDir } = require("./toaster-feature.js");
+const jobs = require("./job-queue.js");
+
+/* Which half of the bot this process is.
+ *
+ *   gateway (default) -- holds the Discord connection, answers everything
+ *                        short, and hands feature work to the queue.
+ *   worker            -- no Discord connection at all; claims feature jobs
+ *                        and runs them.
+ *
+ * Both are this same file, started with a different DATA_BOY_ROLE. Splitting
+ * it into two modules would have meant extracting answer(), the SDK plumbing
+ * and buildSystemPrompt() out from under the Discord client they currently
+ * sit beside -- a large refactor to gain nothing the env var does not.
+ *
+ * TOASTER_SPLIT is separate on purpose. The role decides what a process does;
+ * the flag decides whether feature requests actually go to the queue. Shipped
+ * off, the gateway runs jobs inline exactly as it does today, so this can be
+ * deployed and watched before anything depends on it.
+ */
+const JOB_ROLE = process.argv.includes("--worker")
+  ? "worker"
+  : (process.env.DATA_BOY_ROLE || "gateway").toLowerCase();
+const SPLIT_ENABLED = process.env.TOASTER_SPLIT === "1";
+const WORKER_POLL_MS = Number(process.env.TOASTER_WORKER_POLL_MS || 4000);
+const GATEWAY_POLL_MS = Number(process.env.TOASTER_GATEWAY_POLL_MS || 5000);
 
 const DISCORD_MAX_LEN = 2000;
 const REPLY_CHUNK_LEN = 1900;
@@ -1471,6 +1496,7 @@ discord.on("messageCreate", async (message) => {
     message.channel.sendTyping().catch(() => {});
   }, 8_000);
 
+  let handedOff = false;        // queued for a worker; this process is done
   let progressSnippet = null;
   let activitySnippet = null;   // what the agent is touching right now
   let liveTurn = 0;
@@ -1566,6 +1592,32 @@ discord.on("messageCreate", async (message) => {
     };
     let result;
     let capacityRetries = 0;
+
+    if (route === "feature" && SPLIT_ENABLED) {
+      // Hand it to a worker and stop holding this handler open. The whole
+      // point: restarting this process to ship a change no longer kills a job
+      // somebody asked for forty minutes ago.
+      clearInterval(progressInterval);
+      clearInterval(typingInterval);
+      await jobs.enqueue(adminPool, logRowId, {
+        request: question,
+        attachments: [...message.attachments.values()].map((a) => ({
+          name: a.name, url: a.url, size: a.size, contentType: a.contentType,
+        })),
+        model,
+        maxTurns,
+        placeholder_id: placeholder.id,
+        queued_at: Date.now(),
+      });
+      handedOff = true;
+      jobNote(logRowId, {
+        user: askerUsername, question, started: startedAt, note: "queued for a worker",
+      });
+      try { await placeholder.edit("Queued — a worker is picking this up. 🛠️"); } catch {}
+      console.log(`Queued feature job (row ${logRowId}) for a worker.`);
+      return;
+    }
+
     if (route === "feature") {
       const fr = await runFeatureEpic({
         request: question,
@@ -1700,9 +1752,15 @@ ${fr.url}` : fr.text,
     });
   } finally {
     inFlight.delete(userId);
-    livePlaceholderIds.delete(placeholder.id);
-    // Remove this question's scratch dir so /tmp doesn't accumulate.
-    fs.rmSync(workDir, { recursive: true, force: true });
+    // A handed-off job has not started yet: the worker still needs the scratch
+    // dir, and the placeholder has to survive until the worker's answer
+    // replaces it. Tearing either down here is how a queued job would arrive
+    // with no work dir and no message to edit.
+    if (!handedOff) {
+      livePlaceholderIds.delete(placeholder.id);
+      // Remove this question's scratch dir so /tmp doesn't accumulate.
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -1738,6 +1796,26 @@ async function cleanupStalePlaceholders() {
     /^Data Boy is (still )?researching/i,
     /^_\(still working/i,
   ];
+  // A queued or running job's placeholder is *supposed* to be old -- a feature
+  // job runs for the better part of an hour. livePlaceholderIds only knows
+  // about jobs this process is running, which after the split is none of them,
+  // and it does not survive a restart either. The queue does.
+  const guarded = new Set();
+  try {
+    const { rows } = await adminPool.query(
+      `SELECT job_payload->>'placeholder_id' AS pid
+         FROM data_boy_logs
+        WHERE job_status IN ('queued', 'running')
+          AND job_payload->>'placeholder_id' IS NOT NULL`
+    );
+    for (const r of rows) if (r.pid) guarded.add(r.pid);
+  } catch (err) {
+    // If we cannot tell which are live, delete nothing. A stale placeholder is
+    // untidy; deleting the one a running job is writing to is a lost answer.
+    console.warn(`Placeholder guard query failed, skipping cleanup: ${err.message}`);
+    return;
+  }
+
   let cleaned = 0;
   try {
     for (const guild of discord.guilds.cache.values()) {
@@ -1749,8 +1827,10 @@ async function cleanupStalePlaceholders() {
           const recent = await channel.messages.fetch({ limit: 50 });
           for (const m of recent.values()) {
             if (m.author.id !== discord.user.id) continue;
-            // Never touch a placeholder for a query still running here.
+            // Never touch a placeholder for a query still running here...
             if (livePlaceholderIds.has(m.id)) continue;
+            // ...nor one a worker in another container is writing to.
+            if (guarded.has(m.id)) continue;
             const ageMs = Date.now() - m.createdTimestamp;
             if (ageMs < STALE_MS) continue;
             if (!PATTERNS.some((re) => re.test(m.content || ""))) continue;
@@ -1881,6 +1961,11 @@ async function recoverInterruptedJobs() {
         WHERE answer IS NULL AND error IS NULL AND status IS NULL
           AND asked_at > NOW() - INTERVAL '24 hours'
           AND asked_at < $1
+          -- A job the queue owns is not this process's to recover. Without
+          -- this, restarting the gateway would resume a job in-process that a
+          -- worker is still running -- two agents editing the same branch,
+          -- which is the exact failure the queue exists to prevent.
+          AND (job_status IS NULL OR job_status = 'done')
         ORDER BY id DESC LIMIT 20`,
       [BOOT_TIME]
     );
@@ -1948,9 +2033,226 @@ async function recoverInterruptedJobs() {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ── worker ───────────────────────────────────────────────────────────────
+ * Claim a job, run it, say what happened, repeat. The loop never exits: a
+ * worker that stops polling is indistinguishable from one that is gone, and
+ * a container that exits gets restarted anyway.
+ */
+async function runQueuedJob(row) {
+  const startedAt = Date.now();
+  const payload = row.job_payload && typeof row.job_payload === "object" ? row.job_payload : {};
+  const state = row.job_state && typeof row.job_state === "object" ? row.job_state : null;
+  const workDir = path.join(WORK_ROOT, String(row.discord_message_id));
+  const systemPrompt = await buildSystemPrompt("shallow", "feature");
+
+  // Live progress goes into the row, overwritten in place. The gateway reads
+  // it on a timer -- a tool fires far more often than anyone needs told.
+  let snippet = null, activity = null, turn = 0;
+  const beat = setInterval(() => {
+    jobs.heartbeat(adminPool, row.id, { snippet, activity, turn })
+      .catch((e) => console.warn(`heartbeat failed for ${row.id}: ${e.message}`));
+  }, jobs.HEARTBEAT_MS);
+
+  try {
+    console.log(`[worker] job ${row.id} attempt ${row.job_attempts}: ` +
+      `${String(row.question || "").slice(0, 60)}`);
+    const fr = await runFeatureEpic({
+      request: payload.request || row.question,
+      attachments: payload.attachments || [],
+      workDir,
+      answer,
+      systemPrompt,
+      model: payload.model || FEATURE_MODEL,
+      maxTurns: payload.maxTurns || MAX_TURNS_FEATURE,
+      // A re-claimed job already has a plan and a shipped list, so picking it
+      // back up is the same machinery as recovering one -- nothing extra.
+      resume: state && Array.isArray(state.plan) ? state : null,
+      persist: (s) => jobs.heartbeat(adminPool, row.id, s),
+      onProgress: (s) => { snippet = s; },
+      onActivity: (what, t) => { activity = what; if (t) turn = t; },
+      onIncrement: async (inc) => {
+        // The preview lives in the work dir, which the next increment's clone
+        // wipes -- so copy it somewhere the gateway can still find it when it
+        // gets round to posting.
+        let keep = null;
+        try {
+          if (inc.preview && fs.existsSync(inc.preview)) {
+            keep = path.join(WORK_ROOT, `post-${row.id}-${inc.index}.png`);
+            fs.copyFileSync(inc.preview, keep);
+          }
+        } catch (e) { console.warn(`could not keep preview: ${e.message}`); }
+        await jobs.pushOutbox(adminPool, {
+          logId: row.id, channelId: row.discord_channel_id,
+          replyTo: row.discord_message_id, kind: "increment",
+          text: `-# step ${inc.index} of ${inc.of} — **${inc.title}** is live\n\n${inc.text || ""}`,
+          filePath: keep,
+        });
+      },
+    });
+
+    let keep = null;
+    try {
+      const shot = path.join(workDir, "preview.png");
+      if (fs.existsSync(shot)) {
+        keep = path.join(WORK_ROOT, `post-${row.id}-final.png`);
+        fs.copyFileSync(shot, keep);
+      }
+    } catch (e) { console.warn(`could not keep final preview: ${e.message}`); }
+
+    await jobs.pushOutbox(adminPool, {
+      logId: row.id, channelId: row.discord_channel_id,
+      replyTo: row.discord_message_id, kind: "final",
+      text: fr.ok ? `${fr.text}\n\n${fr.url}` : fr.text,
+      filePath: keep,
+    });
+    await finalizeQuery(row.id, {
+      answer: fr.text, status: fr.ok ? "success" : "feature_failed",
+      turns: fr.turns || 0, input_tokens: fr.inputTokens || 0,
+      output_tokens: fr.outputTokens || 0, duration_ms: Date.now() - startedAt,
+    });
+    console.log(`[worker] job ${row.id} done in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+  } finally {
+    clearInterval(beat);
+  }
+}
+
+async function runWorkerLoop() {
+  for (;;) {
+    let row = null;
+    try {
+      row = await jobs.claimNext(adminPool);
+    } catch (err) {
+      console.error(`[worker] claim failed: ${err.message}`);
+      await sleep(WORKER_POLL_MS);
+      continue;
+    }
+    if (!row) { await sleep(WORKER_POLL_MS); continue; }
+
+    try {
+      await runQueuedJob(row);
+    } catch (err) {
+      // runFeatureEpic already promises never to reject, so this is the
+      // outbox or the database. Either way the asker is owed a sentence.
+      console.error(`[worker] job ${row.id} threw: ${(err && err.stack) || err}`);
+      try {
+        await jobs.pushOutbox(adminPool, {
+          logId: row.id, channelId: row.discord_channel_id,
+          replyTo: row.discord_message_id, kind: "final",
+          text: `That job hit an unexpected error and stopped: ${err.message}`,
+        });
+      } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
+      await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
+    } finally {
+      try { await jobs.complete(adminPool, row.id); }
+      catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+    }
+  }
+}
+
+/* ── gateway ──────────────────────────────────────────────────────────────
+ * Everything the worker wanted said, said. Two jobs: post what is in the
+ * outbox, and keep each running job's placeholder showing live progress.
+ */
+async function postOutboxRow(r) {
+  const ch = await discord.channels.fetch(r.channel_id);
+  const files = [];
+  if (r.file_path && fs.existsSync(r.file_path)) {
+    files.push({ attachment: r.file_path, name: path.basename(r.file_path) });
+  }
+  const target = r.reply_to
+    ? await ch.messages.fetch(r.reply_to).catch(() => null)
+    : null;
+  if (target) await postChunked(target, r.text || "", files);
+  else await ch.send({ content: String(r.text || "").slice(0, DISCORD_MAX_LEN), files });
+
+  if (r.kind === "final" && r.log_id) {
+    // The placeholder has done its job; the answer is above it now.
+    try {
+      const { rows } = await adminPool.query(
+        "SELECT job_payload FROM data_boy_logs WHERE id = $1", [r.log_id]
+      );
+      const pid = rows[0] && rows[0].job_payload && rows[0].job_payload.placeholder_id;
+      if (pid) {
+        const ph = await ch.messages.fetch(pid).catch(() => null);
+        if (ph) await ph.delete().catch(() => {});
+      }
+    } catch (e) { console.warn(`placeholder cleanup for ${r.log_id}: ${e.message}`); }
+  }
+  // The kept copy exists only to survive the hop between processes.
+  if (r.file_path && r.file_path.startsWith(path.join(WORK_ROOT, "post-"))) {
+    try { fs.rmSync(r.file_path, { force: true }); } catch {}
+  }
+}
+
+async function refreshQueuedPlaceholders() {
+  const rows = await jobs.liveRows(adminPool);
+  for (const r of rows) {
+    const payload = r.job_payload || {};
+    const st = r.job_state || {};
+    if (!payload.placeholder_id || !r.discord_channel_id) continue;
+    const secs = Math.round((Date.now() - (payload.queued_at || Date.now())) / 1000);
+    const clock = secs < 90 ? `${secs}s` : `${Math.floor(secs / 60)}m${secs % 60}s`;
+    const lines = [];
+    if (st.snippet) {
+      lines.push(`_(still thinking… ${clock})_`);
+      lines.push("> " + String(st.snippet).replace(/\n+/g, " ").slice(0, 300));
+    } else {
+      lines.push(`Data Boy is still thinking… (${clock}) 🧠`);
+    }
+    if (Array.isArray(st.plan) && st.plan.length > 1) {
+      lines.push(`-# step ${Math.min((st.step || 0) + 1, st.plan.length)} of ${st.plan.length}`);
+    }
+    if (st.activity) lines.push(`-# ${st.activity}${st.turn ? ` · turn ${st.turn}` : ""}`);
+    // Keep !status honest for jobs this process is not running.
+    jobNote(r.id, {
+      user: r.discord_user || "?", question: r.question,
+      started: payload.queued_at || Date.now(),
+      note: st.activity || st.snippet || "working",
+      turn: st.turn,
+    });
+    try {
+      const ch = await discord.channels.fetch(r.discord_channel_id);
+      const ph = await ch.messages.fetch(payload.placeholder_id).catch(() => null);
+      if (ph) await ph.edit(lines.join("\n"));
+    } catch (e) { /* a deleted placeholder is not an error worth logging every 5s */ }
+  }
+  // Jobs nobody can finish. Say so rather than leaving them queued forever.
+  for (const dead of await jobs.reapExhausted(adminPool)) {
+    liveJobs.delete(dead.id);
+    try {
+      await jobs.pushOutbox(adminPool, {
+        logId: dead.id, channelId: dead.discord_channel_id,
+        replyTo: dead.discord_message_id, kind: "final",
+        text: "I tried that one a few times and it failed every time, so I've " +
+          "stopped retrying it. Worth a look at the logs before asking again.",
+      });
+      await finalizeQuery(dead.id, { error: "job exhausted its attempts", duration_ms: 0 });
+    } catch (e) { console.error(`reaping ${dead.id}: ${e.message}`); }
+  }
+}
+
+function startGatewayPolling() {
+  let busy = false;
+  setInterval(async () => {
+    if (busy) return;           // a slow post must not stack up behind itself
+    busy = true;
+    try {
+      await jobs.drainOutbox(adminPool, postOutboxRow);
+      await refreshQueuedPlaceholders();
+    } catch (err) {
+      console.error(`gateway poll failed: ${err.message}`);
+    } finally {
+      busy = false;
+    }
+  }, GATEWAY_POLL_MS);
+}
+
 discord.once("ready", async () => {
   console.log(`Logged in as ${discord.user.tag}.`);
   await recoverInterruptedJobs();
+  if (SPLIT_ENABLED) startGatewayPolling();
   // Run cleanup periodically so stranded placeholders self-clean.
   setInterval(() => { cleanupStalePlaceholders().catch(() => {}); }, 90 * 1000);
   await cleanupStalePlaceholders();
@@ -1992,6 +2294,17 @@ discord.once("ready", async () => {
   await waitForDb(adminPool, "admin");
   await waitForDb(readonlyPool, "readonly");
   fs.mkdirSync(WORK_ROOT, { recursive: true });
+  await jobs.ensureSchema(adminPool);
+
+  if (JOB_ROLE === "worker") {
+    // No Discord connection: this process exists to survive the one that has
+    // it being restarted. Anything it wants said goes through the outbox.
+    console.log(`Worker ${jobs.WORKER_ID} up, polling every ${WORKER_POLL_MS}ms.`);
+    await runWorkerLoop();     // never returns
+    return;
+  }
+
+  if (SPLIT_ENABLED) console.log("Feature jobs go to the queue (TOASTER_SPLIT=1).");
   await discord.login(process.env.DISCORD_TOKEN_DATA_BOY);
 })().catch((err) => {
   console.error("Startup failed:", err);

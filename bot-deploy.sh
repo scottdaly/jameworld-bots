@@ -6,11 +6,29 @@
 # bot fully offline, and three in-flight jobs were destroyed because nothing
 # checked whether anyone was mid-request. Each check below is one of those.
 #
-#   ./bot-deploy.sh          preflight, restart, verify
+#   ./bot-deploy.sh          preflight, restart, verify  (the gateway)
 #   ./bot-deploy.sh check    preflight only
+#   ./bot-deploy.sh worker   the same, for the job worker
+#
+# Two services now. The gateway holds the Discord connection and answers
+# everything short; the worker runs feature jobs. Deploying the gateway is the
+# common case and, once the split is live, cannot disturb a running job --
+# which is the entire reason the worker exists.
 set -uo pipefail
 cd "$(dirname "$0")"
 SVC=discord-bot-data-boy
+WSVC=discord-bot-data-boy-worker
+TARGET="$SVC"
+CONTAINER=jameworld-bots-discord-bot-data-boy-1
+
+# Is feature work actually running somewhere this deploy will not touch? Both
+# halves have to be true: a worker container up, and the gateway told to use
+# it. Either one alone means jobs are still in this container.
+split_live() {
+  docker ps -q -f "name=jameworld-bots-${WSVC}-1" -f status=running | grep -q . || return 1
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
+    jameworld-bots-discord-bot-data-boy-1 2>/dev/null | grep -qx 'TOASTER_SPLIT=1'
+}
 fail() { echo "FAILED: $*" >&2; exit 1; }
 
 psql_q() {
@@ -37,16 +55,24 @@ preflight() {
 
   # The container only gets files the Dockerfile explicitly copies. Forgetting
   # one is invisible on the host and fatal inside the image.
-  for f in data-boy.js toaster-feature.js feature-prompt.md data-boy-prompt.md code-prompt.md; do
+  for f in data-boy.js toaster-feature.js job-queue.js feature-prompt.md data-boy-prompt.md code-prompt.md; do
     grep -q "$f" Dockerfile.data-boy || fail "$f is not COPYed in Dockerfile.data-boy"
   done
   echo "  all required files are in the image"
 
-  # Never restart on top of someone's request.
+  # Never restart on top of someone's request -- unless the request is not in
+  # the container being restarted. Once the split is live a feature job runs in
+  # the worker, so blocking a routing change behind somebody's hour-long job is
+  # pure cost with nothing bought.
   local n
   n=$(psql_q "SELECT count(*) FROM data_boy_logs WHERE answer IS NULL AND error IS NULL AND asked_at > NOW() - INTERVAL '2 hours';")
-  [ "${n:-0}" = "0" ] || fail "$n job(s) in flight -- wait for them"
-  echo "  no jobs in flight"
+  if [ "${n:-0}" = "0" ]; then
+    echo "  no jobs in flight"
+  elif [ "$TARGET" = "$SVC" ] && split_live; then
+    echo "  $n job(s) in flight, but they run in the worker -- the gateway is safe to restart"
+  else
+    fail "$n job(s) in flight -- wait for them"
+  fi
 
   if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
     echo "  WARNING: uncommitted changes -- no rollback point if this goes wrong"
@@ -63,7 +89,7 @@ verify() {
   # scrolled out of the tail on a long-running container, once because of
   # --since parsing. A check that cries wolf gets ignored, which is worse than
   # no check. These four signals cannot be wrong about whether it is running.
-  local name=jameworld-bots-discord-bot-data-boy-1
+  local name="$CONTAINER"
   sleep 6
 
   local state restarts
@@ -78,7 +104,7 @@ verify() {
   restarts2=$(docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null)
   [ "$restarts" = "$restarts2" ] || fail "crash looping (restart count $restarts -> $restarts2)"
 
-  docker compose logs --tail=60 "$SVC" 2>&1 | grep -q "MODULE_NOT_FOUND"     && fail "module load failure"
+  docker compose logs --tail=60 "$TARGET" 2>&1 | grep -q "MODULE_NOT_FOUND"  && fail "module load failure"
 
   echo "  running, not crash looping, module loaded"
 
@@ -93,11 +119,17 @@ case "${1:-deploy}" in
   check) preflight ;;
   deploy)
     preflight
-    # Remember the start time so verify can tell a real restart from a
-    # no-op, instead of demanding a fresh login line either way.
-    WAS_STARTED=$(docker inspect -f '{{.State.StartedAt}}' \n      jameworld-bots-discord-bot-data-boy-1 2>/dev/null)
-    echo "== restarting =="
+    echo "== restarting the gateway =="
     docker compose up -d --build "$SVC" 2>&1 | tail -1
     verify ;;
-  *) echo "usage: $0 [check|deploy]" >&2; exit 2 ;;
+  worker)
+    # The worker is the container jobs actually live in, so this one does wait
+    # for them -- there is no third process to hand them to.
+    TARGET="$WSVC"
+    CONTAINER="jameworld-bots-${WSVC}-1"
+    preflight
+    echo "== restarting the worker =="
+    docker compose up -d --build "$WSVC" 2>&1 | tail -1
+    verify ;;
+  *) echo "usage: $0 [check|deploy|worker]" >&2; exit 2 ;;
 esac

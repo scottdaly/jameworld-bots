@@ -60,7 +60,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.data-boy
-    environment:
+    environment: &data_boy_env
       - NODE_OPTIONS=--dns-result-order=ipv4first
       - DISCORD_TOKEN_DATA_BOY=${DISCORD_TOKEN_DATA_BOY}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
@@ -90,7 +90,7 @@ services:
       - TOASTER_REPO=github-push:scottdaly/toaster-city.git
       - TOASTER_DEPLOY_HOST=toaster-deploy
       - TOASTER_SITE_URL=https://city.rsdaly.com
-    volumes:
+    volumes: &data_boy_volumes
       # OAuth creds for Gemini provider. Mounted RW so the provider can write
       # refreshed access tokens back to oauth_creds.json on the host.
       # Harmless when MODEL_PROVIDER=anthropic.
@@ -107,6 +107,41 @@ services:
       - data_boy_work:/tmp/data-boy-work
       # Cloned repos persist across questions so we don't re-clone every time.
       - repo_cache:/var/cache/repos
+    network_mode: host
+    restart: unless-stopped
+
+  # Where feature jobs actually run.
+  #
+  # Same image and same file as the gateway above, started with a different
+  # DATA_BOY_ROLE. It holds no Discord connection: it claims jobs from
+  # Postgres, runs them, and writes what it wants said back to the database
+  # for the gateway to post.
+  #
+  # The point of it existing is that `docker compose up -d
+  # discord-bot-data-boy` no longer touches it. Almost every deploy changes
+  # the gateway's half -- routing, prompts, the chat path -- and those used to
+  # SIGKILL whatever job was running. Now they don't.
+  #
+  # It shares the work volume because a job's scratch dir is written by the
+  # gateway (which clones nothing, but does hold the dir) and read by whoever
+  # posts the preview afterwards.
+  #
+  # With TOASTER_SPLIT unset this container comes up, finds an empty queue and
+  # polls quietly -- which is the intended first deploy: prove it is healthy
+  # before anything depends on it.
+  discord-bot-data-boy-worker:
+    # A job runs the better part of an hour. Nothing about that got shorter --
+    # this container just isn't the one a routine deploy restarts.
+    stop_grace_period: 900s
+    build:
+      context: .
+      dockerfile: Dockerfile.data-boy
+    # The gateway's environment block is a YAML *list*, and merge keys only
+    # work on mappings -- so the role travels as an argument instead of an
+    # extra env entry, and this reuses the list verbatim.
+    command: ["node", "data-boy.js", "--worker"]
+    environment: *data_boy_env
+    volumes: *data_boy_volumes
     network_mode: host
     restart: unless-stopped
 
