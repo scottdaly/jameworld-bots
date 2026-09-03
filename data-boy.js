@@ -537,12 +537,10 @@ async function postChunked(question, text, files = [], prefix = "") {
   const trimmed = text.trim();
   const lead = prefix ? `${prefix}\n` : "";
   if (trimmed.length === 0 && files.length === 0) {
-    await replyOrSend(question, `${lead}(Data Boy returned no answer.)`);
-    return;
+    return await replyOrSend(question, `${lead}(Data Boy returned no answer.)`);
   }
   if (lead.length + trimmed.length <= DISCORD_MAX_LEN) {
-    await replyOrSend(question, { content: `${lead}${trimmed}` || " ", files });
-    return;
+    return await replyOrSend(question, { content: `${lead}${trimmed}` || " ", files });
   }
   const parts = [];
   let remaining = trimmed;
@@ -561,16 +559,20 @@ async function postChunked(question, text, files = [], prefix = "") {
     remaining = remaining.slice(splitAt).trimStart();
     chunkLimit = REPLY_CHUNK_LEN;
   }
+  // The first chunk is the one that replies to the asker, so it is the one
+  // worth handing back for the log line.
+  let first = null;
   for (let i = 0; i < parts.length; i++) {
     const labeled = `${i === 0 ? lead : ""}${parts[i]}\n*(part ${i + 1}/${parts.length})*`;
     if (i === 0) {
-      await replyOrSend(question, labeled);
+      first = await replyOrSend(question, labeled);
     } else if (i === parts.length - 1) {
       await channel.send({ content: labeled, files });
     } else {
       await channel.send(labeled);
     }
   }
+  return first;
 }
 
 function rateLimitCheck(userId) {
@@ -2437,8 +2439,20 @@ async function postOutboxRow(r) {
   const target = r.reply_to
     ? await ch.messages.fetch(r.reply_to).catch(() => null)
     : null;
-  if (target) await postChunked(target, r.text || "", files);
-  else await ch.send({ content: String(r.text || "").slice(0, DISCORD_MAX_LEN), files });
+  // Say what went out and as which Discord message. Failures were already
+  // logged by drainOutbox; successes were not logged at all, so "did Data Boy
+  // actually answer job N" could only be settled by asking Discord's API --
+  // the whole 48h log for a job read "queued" and nothing else.
+  const posted = target
+    ? await postChunked(target, r.text || "", files)
+    : await ch.send({ content: String(r.text || "").slice(0, DISCORD_MAX_LEN), files });
+  console.log(
+    `[gateway] posted outbox ${r.id} (${r.kind}, job ${r.log_id == null ? "-" : r.log_id}) ` +
+    `to channel ${r.channel_id} as message ${posted && posted.id ? posted.id : "?"}` +
+    (target ? ` replying to ${r.reply_to}`
+      : r.reply_to ? ` (reply target ${r.reply_to} not found; sent plain)` : "") +
+    (files.length ? ` with ${files[0].name}` : "")
+  );
 
   if (r.kind === "final" && r.log_id) {
     // Nothing is watching this job any more.
@@ -2452,7 +2466,10 @@ async function postOutboxRow(r) {
       if (pid) {
         livePlaceholderIds.delete(pid);
         const ph = await ch.messages.fetch(pid).catch(() => null);
-        if (ph) await ph.delete().catch(() => {});
+        if (ph) {
+          const gone = await ph.delete().then(() => true).catch(() => false);
+          console.log(`[gateway] job ${r.log_id}: placeholder ${pid} ${gone ? "deleted" : "not deleted"}`);
+        }
       }
     } catch (e) { console.warn(`placeholder cleanup for ${r.log_id}: ${e.message}`); }
   }

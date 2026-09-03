@@ -123,24 +123,26 @@ async function prepareWorkspace(workDir, request) {
 }
 
 /**
- * Save an attached audio file into the checkout as the background music track.
+ * Download an audio attachment somewhere the agent can pick it up from.
  *
- * Discord CDN links expire, so this has to happen now rather than being handed
- * to the agent as a URL. Exactly one track is kept: the previous one is cleared
- * first, otherwise an old music.mp3 would keep winning over a new music.ogg.
+ * It lands OUTSIDE the checkout, at a path sibling to workDir, and nothing
+ * is written into the repo here. This used to wipe web/audio/ and drop the
+ * file in as music.<ext> -- right back when the page had exactly one
+ * background track, and destructive the moment it grew a track list: an
+ * "add this as the third song" request (job 243) arrived with the first
+ * track overwritten and the second deleted before the agent had read a
+ * line, and only came out right because the agent noticed and undid it.
+ * Where a new track belongs, and whether it replaces anything, is the
+ * request's call, so the agent makes it with the file in hand.
+ *
+ * The sibling path also survives a re-clone (build-fix retry, redo, worker
+ * re-claim), and the Discord URL it came from may have expired by then --
+ * `stash` is that path from a previous pass, reused instead of re-fetched.
  */
 async function saveAudioAttachment(workDir, attachments, stash) {
-  // A redo re-clones into a fresh workDir, so the track saved on the first
-  // attempt is gone -- and the Discord URL it came from has a good chance of
-  // having expired by then. Reuse the copy kept outside workDir instead of
-  // letting a merge collision turn a valid music request into a failed one.
   if (stash && fs.existsSync(stash.path)) {
-    const dir = path.join(workDir, "web", "audio");
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.mkdirSync(dir, { recursive: true });
-    fs.copyFileSync(stash.path, path.join(dir, "music" + stash.ext));
     console.log("[toaster] reused stashed audio " + stash.name);
-    return { saved: stash.name, rel: "web/audio/music" + stash.ext, stash: stash };
+    return { saved: stash.name, stash: stash };
   }
 
   for (const a of attachments || []) {
@@ -155,41 +157,30 @@ async function saveAudioAttachment(workDir, attachments, stash) {
       };
     }
     const ext = (name.match(AUDIO_EXT) || [".mp3"])[0].toLowerCase();
-    const dir = path.join(workDir, "web", "audio");
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.mkdirSync(dir, { recursive: true });
-    const dest = path.join(dir, "music" + ext);
+    // Outside workDir, so prepareWorkspace cannot wipe it; runFeature deletes
+    // it once the job (including any redo) is finished with it.
+    const dest = workDir + ".audio";
 
     // --fail matters here: without it curl writes the CDN's 403/404 HTML body
     // to the file and still exits 0, and "nonempty" then calls that a track.
     const r = await run("curl", ["-sSL", "--fail", "--max-time", "180", "-o", dest, a.url]);
     const got = r.ok && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
     if (!got) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dest, { force: true });
       return { skipped: `I could not download ${name}` };
     }
     // a.size above is the caller's claim about the file; this is the file that
     // actually arrived, which is the one that would go into the repo forever.
     if (got > MAX_AUDIO_BYTES) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dest, { force: true });
       return {
         skipped: `${name} came down as ${(got / 1048576).toFixed(1)}MB and the limit is ` +
           `${(MAX_AUDIO_BYTES / 1048576).toFixed(0)}MB`,
       };
     }
-
-    // Outside workDir, so prepareWorkspace cannot wipe it; runFeature deletes
-    // it once the job (including any redo) is finished with it.
-    const stashPath = workDir + ".audio";
-    let kept = null;
-    try {
-      fs.copyFileSync(dest, stashPath);
-      kept = { path: stashPath, ext: ext, name: name };
-    } catch (e) {
-      console.warn("[toaster] could not stash audio: " + e.message);
-    }
-    console.log(`[toaster] saved audio ${name} -> web/audio/music${ext} (${got} bytes)`);
-    return { saved: name, rel: "web/audio/music" + ext, stash: kept };
+    const kept = { path: dest, ext: ext, name: name, bytes: got };
+    console.log(`[toaster] saved audio ${name} -> ${dest} (${got} bytes); nothing written into the checkout`);
+    return { saved: name, stash: kept };
   }
   return {};
 }
@@ -498,13 +489,17 @@ async function runFeatureOnce(o) {
   const audioNote = audio.saved
     ? `
 
-The user attached "${audio.saved}". It is already saved in the ` +
-      `checkout at ${audio.rel} and the page already plays whatever track is ` +
-      `there (see web/index.html and web/boot.js) -- playback, the mute ` +
-      `control and the autoplay unlock are all done. You do not need to ` +
-      `change main.c or write any audio code. Confirm the file is in ` +
-      `place and say so; only touch the page if the request asks for more ` +
-      `than background music.`
+The user attached an audio file, "${audio.saved}"` +
+      (audio.stash && audio.stash.bytes
+        ? ` (${(audio.stash.bytes / 1048576).toFixed(1)}MB)` : "") +
+      `. It is saved OUTSIDE the checkout at ${audio.stash.path} -- that ` +
+      `path has no extension, but the file is a ${audio.stash.ext} and ` +
+      `should keep that extension wherever you put it. Nothing has been ` +
+      `placed in the repo yet. Copy it into web/audio/ under a filename that ` +
+      `does not collide with the tracks already there, and wire it in the ` +
+      `way the request asks (the track list is in web/boot.js at the time ` +
+      `of writing; check). Do not delete or overwrite an existing track ` +
+      `unless the request explicitly says to replace it.`
     : audio.skipped
       ? `
 

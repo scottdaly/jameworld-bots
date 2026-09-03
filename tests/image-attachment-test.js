@@ -6,6 +6,7 @@
 // in for Discord's CDN, using the real curl the shipped code shells out to.
 process.env.TOASTER_MAX_IMAGE_BYTES = "500";   // small, so "big" is trivial to trigger
 process.env.TOASTER_MAX_IMAGES = "4";          // room for both bad ones plus two good, below
+process.env.TOASTER_MAX_AUDIO_BYTES = "1000";  // same idea for the audio case
 
 const http = require("http");
 const fs = require("fs");
@@ -21,6 +22,8 @@ function check(name, cond, extra) {
 
 const GOOD = Buffer.from("not really a png but nothing parses it, only measures it");
 const BIG = Buffer.alloc(600, 1);  // exceeds the 500-byte cap above
+const AUDIO = Buffer.alloc(300, 7);   // "an mp3", under the 1000-byte audio cap
+const HUGE = Buffer.alloc(1200, 7);   // over it
 
 // Every request is logged so the test can prove rejection actually ran,
 // not merely that a name is absent from the result -- absence alone does
@@ -34,6 +37,8 @@ const server = http.createServer((req, res) => {
   if (req.url === "/good3.png") return res.end(GOOD);   // to prove the cap trims it
   if (req.url === "/big.png") return res.end(BIG);
   if (req.url === "/gone.png") { res.statusCode = 404; return res.end("not found"); }
+  if (req.url === "/beast.mp3") return res.end(AUDIO);
+  if (req.url === "/huge.mp3") return res.end(HUGE);
   res.statusCode = 500; res.end("?");
 });
 
@@ -91,6 +96,45 @@ const server = http.createServer((req, res) => {
   const onDisk = fs.readdirSync(dir);
   check("exactly as many files on disk as were kept",
     onDisk.length === stash.images.length, JSON.stringify(onDisk));
+
+  // -- audio lands OUTSIDE the checkout and the checkout's existing tracks
+  //    survive. This used to wipe web/audio/ and write music.<ext> into it:
+  //    job 243 ("add this as the third song") lost the first two tracks that
+  //    way before the agent had read a line, and only came out right because
+  //    the agent noticed and put them back.
+  const workDir2 = path.join(os.tmpdir(), "toaster-audtest-" + Date.now());
+  const audioDir = path.join(workDir2, "web", "audio");
+  fs.mkdirSync(audioDir, { recursive: true });
+  const T1 = Buffer.from("track one"), T2 = Buffer.from("track two");
+  fs.writeFileSync(path.join(audioDir, "music.mp3"), T1);
+  fs.writeFileSync(path.join(audioDir, "music2.mp3"), T2);
+  const a1 = await stashAttachments(workDir2, [
+    { name: "beast.mp3", url: `${base}/beast.mp3`, size: AUDIO.length, contentType: "audio/mpeg3" },
+  ]);
+  check("audio attachment is stashed", !!(a1 && a1.audio && a1.audio.name === "beast.mp3"),
+    JSON.stringify(a1));
+  check("audio stash lives at the sibling path, outside the checkout",
+    a1.audio.path === workDir2 + ".audio" && fs.existsSync(a1.audio.path), a1.audio.path);
+  check("audio stash has the right bytes", fs.readFileSync(a1.audio.path).equals(AUDIO));
+  check("audio stash records the real extension and size",
+    a1.audio.ext === ".mp3" && a1.audio.bytes === AUDIO.length, JSON.stringify(a1.audio));
+  check("existing tracks in the checkout are untouched, byte for byte",
+    fs.readdirSync(audioDir).sort().join(",") === "music.mp3,music2.mp3" &&
+    fs.readFileSync(path.join(audioDir, "music.mp3")).equals(T1) &&
+    fs.readFileSync(path.join(audioDir, "music2.mp3")).equals(T2),
+    fs.readdirSync(audioDir).join(","));
+  check("nothing new was written anywhere in the checkout",
+    fs.readdirSync(workDir2).join(",") === "web", fs.readdirSync(workDir2).join(","));
+
+  // Oversize audio: fetched, measured on real bytes, rejected, and nothing
+  // left behind at the stash path for a later pass to mistake for a track.
+  const a2 = await stashAttachments(workDir2, [
+    { name: "huge.mp3", url: `${base}/huge.mp3`, contentType: "audio/mpeg" },
+  ]);
+  check("oversize audio was actually requested, then rejected", requested.includes("/huge.mp3"));
+  check("oversize audio yields no stash", !a2 || a2.audio === null, JSON.stringify(a2));
+  check("oversize audio leaves no file at the stash path", !fs.existsSync(workDir2 + ".audio"));
+  fs.rmSync(workDir2, { recursive: true, force: true });
 
   // -- the server going away must fail closed, not crash or return a wrong
   //    file. stashAttachments always fetches fresh (it has no stash param --
