@@ -284,6 +284,22 @@ const WORK_ROOT = "/tmp/data-boy-work";
 // Per-user in-flight question lock (Discord user id → boolean).
 const inFlight = new Set();
 
+// What each running job is doing right now. Without this the only evidence a
+// long job is alive was file timestamps in its work dir -- the Discord
+// placeholder is transient and overwritten, and the logs go quiet between
+// "Classified" and the build twenty minutes later.
+const liveJobs = new Map();   // logRowId -> {user, question, started, note, at}
+
+function jobNote(id, fields) {
+  const j = liveJobs.get(id) || {};
+  liveJobs.set(id, Object.assign(j, fields, { at: Date.now() }));
+}
+
+function ago(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? s + "s" : Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s";
+}
+
 // When this process started. Recovery uses it to tell an orphaned job from a
 // live one: every unfinished row looks identical, so without this a second
 // instance (or a slow boot) would declare a running job lost and mark it
@@ -1271,6 +1287,20 @@ discord.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!message.guild) return;
 
+  if (message.content.trim().toLowerCase() === "!status") {
+    if (liveJobs.size === 0) {
+      await message.reply("Nothing running.");
+      return;
+    }
+    const now = Date.now();
+    const rows = [...liveJobs.entries()].map(([id, j]) =>
+      `**${j.user || "?"}** — ${String(j.question || "").slice(0, 46)}\n` +
+      `-# ${ago(now - (j.started || now))} in · last: ${j.note || "?"} (${ago(now - (j.at || now))} ago)`
+    );
+    await message.reply(rows.join("\n\n"));
+    return;
+  }
+
   if (message.content.trim().toLowerCase() === "!datastats") {
     await handleStats(message);
     return;
@@ -1344,6 +1374,7 @@ discord.on("messageCreate", async (message) => {
 
   if (!rateLimitCheck(userId)) {
     inFlight.delete(userId);
+    liveJobs.delete(logRowId);
     await message.reply(
       `You've asked ${RATE_LIMIT_PER_HOUR} questions in the last hour. Take a breather.`
     );
@@ -1362,6 +1393,7 @@ discord.on("messageCreate", async (message) => {
   }
 
   const startedAt = Date.now();
+  jobNote(logRowId, { user: userTag, question, started: startedAt, note: "starting" });
   // Per-question scratch dir, unique to this Discord message.
   const workDir = path.join(WORK_ROOT, String(message.id));
 
@@ -1441,6 +1473,13 @@ discord.on("messageCreate", async (message) => {
     });
     const onProgress = (text) => {
       progressSnippet = text;
+      // Also record it: a placeholder edit is overwritten by the next one, so
+      // without this there is no trace afterwards of what a job was doing.
+      const line = String(text || "").replace(/\s+/g, " ").trim().slice(0, 110);
+      if (line) {
+        jobNote(logRowId, { note: line });
+        console.log(`[job ${logRowId}] ${line}`);
+      }
       // Update immediately when the model says something, throttled to 5s.
       if (Date.now() - lastProgressEdit > 5_000) editProgress();
     };
