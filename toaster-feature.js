@@ -18,6 +18,14 @@
 const { execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const {
+  CAPACITY_RETRY_DELAYS_MS,
+  capacityRetryMessage,
+  capacityFinalMessage,
+  isCapacityError,
+  isAuthError,
+  authFailureMessage,
+} = require("./error-classify.js");
 
 const REPO = process.env.TOASTER_REPO || "github-push:scottdaly/toaster-city.git";
 const DEPLOY_HOST = process.env.TOASTER_DEPLOY_HOST || "toaster-deploy";
@@ -512,18 +520,44 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
 
     say(attempt === 1 ? "editing the code…" : `build failed — fixing (attempt ${attempt})…`);
 
+    // A capacity blip and an ordinary bug both throw from answer() now (an
+    // upstream outage used to come back as a normal, empty result -- "I
+    // didn't end up changing anything" is not what happened when Opus was
+    // down). Capacity backs off and retries the same prompt; a credential
+    // failure will not fix itself by waiting, so it fails fast instead;
+    // anything else reports honestly rather than silently.
     let res;
-    try {
-      // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
-      // path, which has the file-editing tools this job needs.
-      res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, "anthropic",
-                         { onActivity: o.onActivity });
-    } catch (e) {
-      return {
-        ok: false,
-        ...usage,
-        text: `The agent errored out while editing: ${e.message}. Nothing was deployed.`,
-      };
+    let capacityRetries = 0;
+    for (;;) {
+      try {
+        // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
+        // path, which has the file-editing tools this job needs.
+        res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, "anthropic",
+                           { onActivity: o.onActivity });
+        break;
+      } catch (e) {
+        if (isAuthError(e)) {
+          return { ok: false, ...usage, text: authFailureMessage("anthropic") };
+        }
+        if (isCapacityError(e) && capacityRetries < CAPACITY_RETRY_DELAYS_MS.length) {
+          const waitMs = CAPACITY_RETRY_DELAYS_MS[capacityRetries];
+          capacityRetries++;
+          console.warn(
+            `[toaster] capacity error (attempt ${capacityRetries}/${CAPACITY_RETRY_DELAYS_MS.length}): ` +
+            `${e.message}. Retrying in ${waitMs}ms.`
+          );
+          say(capacityRetryMessage("anthropic"));
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        return {
+          ok: false,
+          ...usage,
+          text: isCapacityError(e)
+            ? capacityFinalMessage("anthropic")
+            : `The agent errored out while editing: ${e.message}. Nothing was deployed.`,
+        };
+      }
     }
 
     usage.turns += res?.turns || 0;

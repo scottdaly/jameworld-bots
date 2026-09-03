@@ -93,38 +93,24 @@ if (!MODELS_BY_PROVIDER[MODEL_PROVIDER]) {
 const MODEL_SHALLOW = MODELS_BY_PROVIDER[MODEL_PROVIDER].shallow;
 const MODEL_DEEP = MODELS_BY_PROVIDER[MODEL_PROVIDER].deep;
 
-// When the upstream model is capacity-throttled, the Vercel AI SDK has
-// already burned its 3 internal retries by the time we see the error. Wait
-// these intervals between outer retries — backoff matches what Google
-// capacity blips empirically take to clear (seconds to a minute). After the
-// last entry is consumed, we give up and surface the friendly final error.
-const CAPACITY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
-const CAPACITY_RETRY_MESSAGE = "Google is cucking data boy right now (ꐦ¬_¬)... give him a minute";
-
-// Recognize the family of "the upstream is overloaded, your retries won't
-// help, fail fast" errors. Matches messages emitted by both the Vercel AI
-// SDK wrapper and the underlying Gemini / Anthropic transports.
-function isCapacityError(err) {
-  const msg = String(err?.message || err || "").toLowerCase();
-  return (
-    msg.includes("no capacity available") ||
-    msg.includes("overloaded") ||
-    msg.includes("resource exhausted") ||
-    msg.includes("unavailable") ||
-    msg.includes("503") ||
-    msg.includes("429") ||
-    msg.includes("rate limit") ||
-    msg.includes("quota")
-  );
-}
+// Capacity backoff, provider-flavored messages, and the auth-vs-capacity-
+// vs-everything-else classification -- shared with toaster-feature.js,
+// which needs the exact same judgment calls for the feature/worker path.
+const {
+  CAPACITY_RETRY_DELAYS_MS,
+  capacityRetryMessage,
+  capacityFinalMessage,
+  isCapacityError,
+  isAuthError,
+  authFailureMessage,
+} = require("./error-classify.js");
 
 // Turn an internal error into something a non-engineer in Discord can read
 // without panicking. We keep the raw message in logs (see callers) so we
 // don't lose debugging fidelity.
-function formatUserFacingError(err) {
-  if (isCapacityError(err)) {
-    return "Google is still cucking data boy (｡•̀ ⤙ •́ ｡ꐦ)... try again in a few minutes.";
-  }
+function formatUserFacingError(err, provider = MODEL_PROVIDER) {
+  if (isAuthError(err)) return authFailureMessage(provider);
+  if (isCapacityError(err)) return capacityFinalMessage(provider);
   const raw = String(err?.message || err || "unknown error").trim();
   // Trim Vercel AI SDK's noisy "Failed after N attempts. Last error: …" wrapper.
   const cleaned = raw.replace(/^Failed after \d+ attempts?\.\s*Last error:\s*/i, "");
@@ -942,6 +928,11 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
 
   const onActivity = opts.onActivity || null;
   let liveTurns = 0;
+  // Auxiliary evidence for the failure check below, never what decides
+  // whether one happened -- it's undocumented whether this callback carries
+  // tool stderr as well as the CLI's own, so a stray substring match here
+  // can only explain an already-established failure, not manufacture one.
+  let stderrBuf = "";
   for await (const msg of sdkQuery({
     prompt: question,
     options: {
@@ -962,7 +953,10 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
         "mcp__data-boy-db__query_db",
       ],
       permissionMode: "bypassPermissions",
-      stderr: (data) => process.stderr.write(`[claude] ${data}`),
+      stderr: (data) => {
+        process.stderr.write(`[claude] ${data}`);
+        stderrBuf = (stderrBuf + data).slice(-4000);
+      },
       env: {
         ...process.env,
         PGCONN: `postgresql://${encodeURIComponent(process.env.POSTGRES_READONLY_USER)}:${encodeURIComponent(process.env.POSTGRES_READONLY_PASSWORD)}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT}/${process.env.POSTGRES_DB}`,
@@ -1014,6 +1008,16 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
       // field for debugging "(Data Boy returned no answer.)".
       status = msg.subtype ?? status;
     }
+  }
+
+  if (status === "error_during_execution") {
+    // A graceful stream, not a thrown exception -- so without this, an
+    // upstream outage or a rejected credential came back as a normally
+    // completed call with an empty answer, and every caller reads "empty
+    // answer" as "the model looked at this and had nothing to add". Those
+    // are not the same thing, and only one of them is worth retrying.
+    const detail = (resultText || lastAssistantText || stderrBuf || "").trim();
+    throw new Error(detail || "execution error with no diagnostic output");
   }
 
   return {
@@ -1758,7 +1762,10 @@ ${fr.url}` : fr.text,
                               false, MODEL_PROVIDER, { onActivity });
         break;
       } catch (err) {
-        if (!isCapacityError(err) || capacityRetries >= CAPACITY_RETRY_DELAYS_MS.length) {
+        // Auth errors are never worth retrying -- a revoked token is still
+        // revoked in five seconds -- so they skip straight past the capacity
+        // loop to the outer catch and its distinct message.
+        if (isAuthError(err) || !isCapacityError(err) || capacityRetries >= CAPACITY_RETRY_DELAYS_MS.length) {
           throw err;
         }
         const waitMs = CAPACITY_RETRY_DELAYS_MS[capacityRetries];
@@ -1768,7 +1775,7 @@ ${fr.url}` : fr.text,
         );
         // Surface the capacity blip in the placeholder itself.
         try {
-          await placeholder.edit(CAPACITY_RETRY_MESSAGE);
+          await placeholder.edit(capacityRetryMessage(MODEL_PROVIDER));
         } catch {}
         await new Promise((r) => setTimeout(r, waitMs));
       }

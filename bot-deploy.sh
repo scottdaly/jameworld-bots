@@ -55,7 +55,7 @@ preflight() {
 
   # The container only gets files the Dockerfile explicitly copies. Forgetting
   # one is invisible on the host and fatal inside the image.
-  for f in data-boy.js toaster-feature.js job-queue.js feature-prompt.md data-boy-prompt.md code-prompt.md; do
+  for f in data-boy.js toaster-feature.js job-queue.js error-classify.js feature-prompt.md data-boy-prompt.md code-prompt.md; do
     grep -q "$f" Dockerfile.data-boy || fail "$f is not COPYed in Dockerfile.data-boy"
   done
   echo "  all required files are in the image"
