@@ -1806,8 +1806,11 @@ ${fr.url}` : fr.text,
     // with no work dir and no message to edit.
     if (!handedOff) {
       livePlaceholderIds.delete(placeholder.id);
-      // Remove this question's scratch dir so /tmp doesn't accumulate.
+      // Remove this question's scratch dirs so /tmp doesn't accumulate. The
+      // planner gets its own directory alongside the work dir, and nothing
+      // was ever deleting it -- they had been piling up since epics shipped.
       fs.rmSync(workDir, { recursive: true, force: true });
+      fs.rmSync(workDir + "-plan", { recursive: true, force: true });
     }
   }
 });
@@ -2258,6 +2261,7 @@ async function runWorkerLoop() {
       try {
         const wd = path.join(WORK_ROOT, String(row.discord_message_id));
         fs.rmSync(wd, { recursive: true, force: true });
+        fs.rmSync(wd + "-plan", { recursive: true, force: true });
         // runFeature only retires a stash it created itself, and this one came
         // from the gateway -- so nobody else is going to remove it.
         fs.rmSync(wd + ".audio", { force: true });
