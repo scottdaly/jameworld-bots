@@ -262,6 +262,41 @@ async function newJob(pool, opts = {}) {
     check("once the last worker has gone stale, the same job IS dead-lettered",
       reapedG.some((r) => String(r.id) === String(waiting)), JSON.stringify(reapedG.map(r => r.id)));
 
+    // -- 9. !cancel: break the fence, and only the fence ------------------------
+    {
+      await pool.query("UPDATE data_boy_logs SET job_status = NULL");
+      const a = await newJob(pool, { user: "scott" });
+      const b = await newJob(pool, { user: "matthan" });
+      const ra = await jobs.claimNext(pool);            // worker takes a
+      check("cancel setup: job a claimed", ra && String(ra.id) === String(a));
+      const fenceA = { worker: jobs.WORKER_ID, attempt: ra.job_attempts };
+      check("cancel setup: a's fence is good", await jobs.heartbeat(pool, a, {}, fenceA));
+
+      const c = await jobs.cancelJob(pool, a, "scott");
+      check("cancelling a running job returns it, with attempts > 0", c && Number(c.attempts) === 1,
+        JSON.stringify(c));
+      check("the worker's next heartbeat fails: the fence is broken",
+        (await jobs.heartbeat(pool, a, {}, fenceA)) === false);
+      check("the worker can tell it was a cancel, not a re-claim", await jobs.isCancelled(pool, a));
+      check("complete() with the old fence does nothing", (await jobs.complete(pool, a, fenceA)) === false);
+      check("a cancelled job is never handed out again",
+        String((await jobs.claimNext(pool)).id) === String(b));
+      check("cancelling it a second time finds nothing", (await jobs.cancelJob(pool, a, "scott")) === null);
+
+      // b is now running; a job that was never claimed cancels with attempts = 0
+      const q = await newJob(pool, { user: "matthan" });
+      check("latestJobFor finds the asker's newest live job",
+        String((await jobs.latestJobFor(pool, "matthan")).id) === String(q));
+      const cq = await jobs.cancelJob(pool, q, "matthan");
+      check("cancelling a queued job reports it never started", cq && Number(cq.attempts) === 0);
+      check("jobRow reads the cancelled state", (await jobs.jobRow(pool, q)).job_status === "cancelled");
+      check("nothing queued or running is left for matthan except b",
+        String((await jobs.latestJobFor(pool, "matthan")).id) === String(b));
+      check("the reaper leaves cancelled rows alone",
+        !(await jobs.reapExhausted(pool)).some((r) => String(r.id) === String(a) || String(r.id) === String(q)));
+    }
+
+    await pool.query("UPDATE data_boy_logs SET job_status = NULL");
     const fresh = await newJob(pool);                      // queued just now
     const reaped2 = await jobs.reapExhausted(pool);
     check("a freshly queued job is left alone",

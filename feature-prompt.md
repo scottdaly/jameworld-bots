@@ -69,6 +69,19 @@ build and never reaches the site.
    and actually look at it. Then
    remove the temporary branch -- it must not reach the commit.
 
+   **Leave that picture for the reply.** Copy the PNG that best shows your
+   change to `$PWD-scratch/preview.png`:
+
+   ```sh
+   cp "$PWD-scratch/check.png" "$PWD-scratch/preview.png"
+   ```
+
+   That file is what gets posted to Discord with your write-up. Without it
+   the reply gets the build's fixed downtown frame, which often does not even
+   contain what you changed -- a water change once shipped with a picture of
+   no water in it. Any frame that shows the change is fine; the forced-state
+   one from above usually is. Do this for visual changes only.
+
    Do this for an interaction: a hover, a click, an overlay, two things that
    can be visible at once, a layout that has to fit. Skip it for a change with
    no visual claim -- a tax formula, a spawn rate, a save-file field.

@@ -408,6 +408,33 @@ async function integrate(workDir, branch, rounds = 5) {
  * has produced traced back to a rejection nobody was catching, so the failure
  * mode is closed here once rather than at each of the twenty return sites.
  */
+/**
+ * The agent's own screenshot, if it left one at <workDir>-scratch/preview.png.
+ *
+ * The frame posted with a reply used to be the build's preview: the fixed
+ * smoke-test shot, same seed, same camera, every time. It proves the build
+ * renders; it does not show what changed, and for a water change it showed a
+ * downtown with no water in it. The prompt now asks the agent to leave the
+ * frame it already took while verifying its change. This is the check that
+ * it is a real PNG of sane size before it goes anywhere -- a stray or
+ * truncated file must not be posted as if it were the picture.
+ */
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const MAX_PREVIEW_BYTES = Number(process.env.TOASTER_MAX_PREVIEW_BYTES || 8 * 1024 * 1024);
+function nominatedPreview(workDir) {
+  const p = path.join(workDir + "-scratch", "preview.png");
+  try {
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size < 64 || st.size > MAX_PREVIEW_BYTES) return null;
+    const fd = fs.openSync(p, "r");
+    const head = Buffer.alloc(8);
+    try { fs.readSync(fd, head, 0, 8, 0); } finally { fs.closeSync(fd); }
+    return head.equals(PNG_MAGIC) ? p : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function runFeature(o) {
   const none = { turns: 0, inputTokens: 0, outputTokens: 0 };
   try {
@@ -448,6 +475,15 @@ async function runFeatureOnce(o) {
   // ReferenceError rather than returning the failure message -- which broke
   // the report-back guarantee in exactly the path meant to guarantee it.
   const usage = { turns: 0, inputTokens: 0, outputTokens: 0 };
+  // Set by the worker when its fence is lost -- a !cancel, or another worker
+  // re-claiming the job. Either way nothing from here may land. Checked
+  // before each expensive or irreversible step rather than only at the end,
+  // which is the gap that used to let a fenced-out worker gate, merge and
+  // publish anyway.
+  const cancelled = () => typeof o.isCancelled === "function" && !!o.isCancelled();
+  const stopped = (when) => ({ ok: false, cancelled: true, ...usage,
+    text: `Cancelled ${when}. Nothing from this step landed.` });
+  if (cancelled()) return stopped("before this step started");
 
   let branch;
   try {
@@ -456,6 +492,11 @@ async function runFeatureOnce(o) {
   } catch (e) {
     return { ok: false, ...usage, text: `Couldn't get set up to make that change: ${e.message}` };
   }
+  // The scratch dir survives re-clones on purpose (that is where the agent's
+  // binary and screenshots go), so a preview nominated by the PREVIOUS
+  // increment is still sitting there. Clear it: this step posts its own or
+  // none, never last step's picture.
+  try { fs.rmSync(path.join(workDir + "-scratch", "preview.png"), { force: true }); } catch (e) {}
 
   // Attachments land in the checkout before the agent starts, so it can see
   // the file rather than being told about a URL it cannot fetch.
@@ -576,10 +617,13 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
         // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
         // path, which has the file-editing tools this job needs.
         res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, "anthropic",
-                           { onActivity: o.onActivity });
+                           { onActivity: o.onActivity, abortController: o.abortController });
         break;
       } catch (e) {
         addPartialUsage(e);
+        // An abort surfaces here as an error from the SDK. It is not a
+        // capacity blip to retry or a bug to report; it is the answer.
+        if (cancelled()) return stopped("while editing");
         if (isAuthError(e)) {
           return { ok: false, ...usage, text: authFailureMessage("anthropic") };
         }
@@ -625,6 +669,8 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       };
     }
 
+    if (cancelled()) return stopped("after editing, before anything was pushed");
+
     let sha;
     try {
       say("pushing…");
@@ -637,12 +683,17 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
     // build checkout, origin/main, and the live symlink. One job at a time.
     say("building...");
     const outcome = await withIntegrationLock(async () => {
+      // Last look before shared state. Past this point a cancel is honoured
+      // only between gate and merge -- never between merge and publish,
+      // where stopping would leave main and the site disagreeing.
+      if (cancelled()) return { stage: "cancelled" };
       // Prove it builds, but publish nothing. Publishing a branch and merging
       // afterwards is how production ends up showing a tree that never
       // reached main.
       const g = await gate(`origin/${branch}`);
       if (!g.ok) return { stage: "gate", output: g.output, timedOut: g.timedOut };
 
+      if (cancelled()) return { stage: "cancelled" };
       say("merging...");
       const m = await integrate(workDir, branch);
       if (!m.merged) return { stage: "merge", reason: m.reason, conflict: !!m.conflict };
@@ -669,6 +720,19 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       // But a truncated or HTML-bodied file must not be handed to
       // collectAttachments, which would post it as if it were the frame.
       if (!gotShot) fs.rmSync(png, { force: true });
+      // The agent's own frame, aimed at what it changed, beats the build's
+      // fixed one. It lands at the same path so everything downstream --
+      // the increment post, the final post, collectAttachments -- is
+      // unchanged and simply sees a better picture.
+      const own = nominatedPreview(workDir);
+      if (own) {
+        try {
+          fs.copyFileSync(own, png);
+          return { stage: "done", shot: true, ownShot: true };
+        } catch (e) {
+          console.warn("[toaster] could not use the agent's preview: " + e.message);
+        }
+      }
       return { stage: "done", shot: gotShot };
     });
 
@@ -693,6 +757,11 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
         inputTokens: (again.inputTokens || 0) + usage.inputTokens,
         outputTokens: (again.outputTokens || 0) + usage.outputTokens,
       });
+    }
+
+    if (outcome.stage === "cancelled") {
+      return { ok: false, cancelled: true, ...usage, branch, merged: false,
+        text: `Cancelled before it merged. The site is unchanged; the work is on branch \`${branch}\`.` };
     }
 
     if (outcome.stage === "merge") {
@@ -751,7 +820,11 @@ It is merged into main, but the publish step failed or timed out. A failure ` +
           (exhausted ? `
 
 (I hit my turn limit, but what I had built and shipped.)` : "") +
-          (outcome.shot ? "" : `
+          (outcome.ownShot ? "" : outcome.shot
+            ? `
+
+-# The picture is the build's fixed frame, not necessarily where the change is.`
+            : `
 
 -# The change is live; I just could not grab a screenshot of it.`),
       };
@@ -905,7 +978,8 @@ async function planAsk(o) {
       // Same provider as the work itself. Without this the planner inherits the
       // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
       // name, and the request goes to Google asking for a Claude model.
-      "anthropic"
+      "anthropic",
+      { abortController: o.abortController }
     );
   } catch (e) {
     console.warn("[toaster] planner unavailable, treating as one change:", e.message);
@@ -1018,10 +1092,18 @@ async function runFeatureEpicInner(o) {
   console.log("[toaster] plan: " + plan.map(function (p) { return p.title; }).join(" -> "));
   await persist({ plan: plan, shipped: shipped, step: startAt });
 
+  const epicCancelled = () => typeof o.isCancelled === "function" && !!o.isCancelled();
   for (let i = startAt; i < plan.length; i++) {
     const step = plan[i];
     const left = EPIC_TURN_BUDGET - total.turns;
     const elapsed = Date.now() - started;
+
+    if (epicCancelled()) {
+      return Object.assign({ ok: shipped.length > 0, cancelled: true,
+        text: (shipped.length ? summarise(shipped, plan) + "\n\nThen cancelled before **" +
+          step.title + "** started." : "Cancelled before **" + step.title + "** started."),
+      }, total);
+    }
 
     if (left <= 0 || elapsed > EPIC_MS_BUDGET) {
       // This branch used to interpolate `r`, which is declared below it and is
@@ -1065,6 +1147,13 @@ async function runFeatureEpicInner(o) {
       maxTurns: Math.max(1, Math.min(o.maxTurns || left, left)),
     }));
     add(r);
+
+    if (r.cancelled) {
+      return Object.assign({ ok: shipped.length > 0, cancelled: true,
+        text: (shipped.length ? summarise(shipped, plan) + "\n\n" : "") +
+          "**" + step.title + "**: " + r.text,
+      }, total);
+    }
 
     if (!r.ok) {
       // Stop rather than build the next step on something that did not land.
@@ -1131,4 +1220,5 @@ async function stashAttachments(workDir, attachments) {
 module.exports = {
   runFeature, runFeatureEpic, salvageWorkDir, stashAttachments, SITE_URL,
   planIncrements,   // exported for tests/planner-test.js
+  nominatedPreview, // exported for tests/preview-test.js
 };

@@ -193,6 +193,59 @@ async function heartbeat(pool, logId, patch, fence) {
   return r.rowCount > 0;      // false: somebody else owns this job now
 }
 
+/**
+ * Gateway side: stop a job. Sets job_status = 'cancelled' and clears the
+ * owner, which is exactly what breaks the running worker's fence -- its next
+ * heartbeat fails, and the worker aborts the model call and refuses to gate,
+ * merge or publish. No signal to the worker process is needed, and a second
+ * job running in that same process never notices.
+ *
+ * Returns the row as it was (attempts = 0 means it never started), or null if
+ * there was nothing left to cancel.
+ */
+async function cancelJob(pool, logId, who) {
+  const { rows } = await pool.query(
+    `UPDATE data_boy_logs
+        SET job_status = 'cancelled', job_worker = NULL, job_lease = NULL,
+            error = 'cancelled by ' || $2
+      WHERE id = $1 AND job_status IN ('queued', 'running')
+      RETURNING id, discord_user, discord_channel_id, discord_message_id, question,
+                COALESCE(job_attempts, 0) AS attempts, job_state, job_payload`,
+    [logId, String(who || "?")]
+  );
+  return rows[0] || null;
+}
+
+/** One job by id, enough to decide who may cancel it. */
+async function jobRow(pool, logId) {
+  const { rows } = await pool.query(
+    `SELECT id, discord_user, job_status, COALESCE(job_attempts, 0) AS attempts, job_state
+       FROM data_boy_logs WHERE id = $1`,
+    [logId]
+  );
+  return rows[0] || null;
+}
+
+/** The asker's own most recent job that is still queued or running. */
+async function latestJobFor(pool, user) {
+  const { rows } = await pool.query(
+    `SELECT id, discord_user, job_status, COALESCE(job_attempts, 0) AS attempts, job_state
+       FROM data_boy_logs
+      WHERE discord_user = $1 AND job_status IN ('queued', 'running')
+      ORDER BY id DESC LIMIT 1`,
+    [user]
+  );
+  return rows[0] || null;
+}
+
+/** Worker side: was the fence lost to a cancel (safe to clean up) or to a re-claim (not)? */
+async function isCancelled(pool, logId) {
+  const { rows } = await pool.query(
+    "SELECT job_status = 'cancelled' AS c FROM data_boy_logs WHERE id = $1", [logId]
+  );
+  return !!(rows[0] && rows[0].c);
+}
+
 /** Worker side: done, one way or the other. Releases the lease. */
 async function complete(pool, logId, fence) {
   const r = await pool.query(
@@ -482,6 +535,7 @@ async function liveRows(pool) {
 module.exports = {
   WORKER_ID, LEASE_MS, HEARTBEAT_MS, MAX_ATTEMPTS, UNCLAIMED_MS,
   WORKER_STALE_MS, WORKER_ANNOUNCE_MS, announce, workersAlive,
+  cancelJob, jobRow, latestJobFor, isCancelled,
   ensureSchema, enqueue, claimNext, heartbeat, complete, finishJob,
   reapExhausted, pruneOutbox, pushOutbox, drainOutbox, liveRows,
   workerPump, availableMemoryMb,

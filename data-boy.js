@@ -954,6 +954,9 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
       model,
       maxTurns,
       cwd: workDir,
+      // A per-job controller from the worker. Aborting it ends this call and
+      // the CLI subprocess under it, and nothing else in the process.
+      abortController: opts.abortController || undefined,
       systemPrompt,
       mcpServers: {
         "data-boy-db": mcpServer,
@@ -1481,7 +1484,7 @@ discord.on("messageCreate", async (message) => {
     }
     const now = Date.now();
     const rows = [...liveJobs.entries()].map(([id, j]) =>
-      `**${j.user || "?"}** — ${String(j.question || "").slice(0, 46)}\n` +
+      `**#${id} ${j.user || "?"}** — ${String(j.question || "").slice(0, 46)}\n` +
       `-# ${ago(now - (j.started || now))} in · last: ${j.note || "?"} (${ago(now - (j.at || now))} ago)`
     );
     await message.reply(rows.join("\n\n"));
@@ -1490,6 +1493,12 @@ discord.on("messageCreate", async (message) => {
 
   if (message.content.trim().toLowerCase() === "!datastats") {
     await handleStats(message);
+    return;
+  }
+
+  const cancelCmd = message.content.trim().match(/^!cancel(?:\s+#?(\d+))?\s*$/i);
+  if (cancelCmd) {
+    await handleCancel(message, cancelCmd[1] ? Number(cancelCmd[1]) : null);
     return;
   }
 
@@ -1755,7 +1764,11 @@ discord.on("messageCreate", async (message) => {
       jobNote(logRowId, {
         user: askerUsername, question, started: startedAt, note: "queued for a worker",
       });
-      try { await placeholder.edit("Queued — a worker is picking this up. 🛠️"); } catch {}
+      try {
+        await placeholder.edit(
+          `Queued as job #${logRowId} — a worker is picking this up. 🛠️\n-# \`!cancel ${logRowId}\` stops it`
+        );
+      } catch {}
       console.log(`Queued feature job (row ${logRowId}) for a worker.`);
       return;
     }
@@ -2239,13 +2252,21 @@ async function runQueuedJob(row) {
   // our predicate stops matching and we find out instead of trampling them.
   const fence = { worker: jobs.WORKER_ID, attempt: row.job_attempts };
   let fenced = false;
+  // Losing the fence used to be logged and then ignored: the job ran on to
+  // gate, merge and publish under a claim it no longer held. Now it stops
+  // the model call outright (the SDK kills its subprocess) and runFeature
+  // checks isCancelled before every step that spends money or touches
+  // shared state. This is also what !cancel is: the gateway breaks the
+  // fence on purpose, and the same path stops the job.
+  const abort = new AbortController();
   const loseFence = (where) => {
     if (fenced) return;
     fenced = true;
     console.error(
-      `[worker] LOST THE FENCE on job ${row.id} at ${where}: another worker has ` +
-      "claimed it. Abandoning quietly -- it now owns the reply."
+      `[worker] LOST THE FENCE on job ${row.id} at ${where}: it was cancelled or ` +
+      "another worker claimed it. Stopping; nothing more from here will land."
     );
+    try { abort.abort(); } catch (e) {}
   };
 
   let snippet = null, activity = null, turn = 0;
@@ -2277,6 +2298,8 @@ async function runQueuedJob(row) {
       },
       onProgress: (s) => { snippet = s; },
       onActivity: (what, t) => { activity = what; if (t) turn = t; },
+      abortController: abort,
+      isCancelled: () => fenced,
       onIncrement: async (inc) => {
         // The preview lives in the work dir, which the next increment's clone
         // wipes -- so copy it somewhere the gateway can still find it when it
@@ -2307,8 +2330,23 @@ async function runQueuedJob(row) {
     } catch (e) { console.warn(`could not keep final preview: ${e.message}`); }
 
     if (fenced) {
-      // Whoever holds the job now will post its own answer. Two finals in the
-      // channel is worse than one late one.
+      // A cancel: the gateway already told the channel what was happening;
+      // confirm from this side that it actually stopped, and where. A
+      // re-claim: whoever holds the job now will post its own answer, and
+      // two finals in the channel is worse than one late one.
+      let cancelled = false;
+      try { cancelled = await jobs.isCancelled(adminPool, row.id); } catch (e) {}
+      if (cancelled) {
+        console.log(`[worker] job ${row.id} stopped after cancel: ${String(fr.text || "").slice(0, 80)}`);
+        try {
+          await jobs.pushOutbox(adminPool, {
+            logId: row.id, channelId: row.discord_channel_id,
+            replyTo: row.discord_message_id, kind: "note",
+            text: `-# job ${row.id} stopped. ${fr.text || ""}`.slice(0, 1800),
+          });
+        } catch (e) { console.warn(`[worker] could not confirm the cancel: ${e.message}`); }
+        return { released: false, cancelled: true };
+      }
       console.warn(`[worker] job ${row.id} finished but we no longer own it; not posting.`);
       return { released: false };
     }
@@ -2412,6 +2450,13 @@ async function runClaimedJob(row) {
     if (!released) {
       try { stillOwned = await jobs.complete(adminPool, row.id, fenceOf(row)); }
       catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+    }
+    // A cancelled row has no owner at all, so its files are nobody else's
+    // live clone -- the one case where losing the fence still leaves cleanup
+    // safe. (A re-claim is the other case, and there it is not.)
+    if (!stillOwned) {
+      try { stillOwned = await jobs.isCancelled(adminPool, row.id); }
+      catch (e) {}
     }
 
     if (stillOwned) {
@@ -2562,6 +2607,99 @@ async function refreshQueuedPlaceholders() {
         duration_ms: 0,
       });
     } catch (e) { console.error(`reaping ${dead.id}: ${e.message}`); }
+  }
+}
+
+/* ── !cancel ──────────────────────────────────────────────────────────────
+ * Stop a queued or running job from Discord. The asker can stop their own;
+ * anyone who manages the server (or is listed in DATA_BOY_ADMINS) can stop
+ * anyone's. All it does is break the job's fence in the database; the worker
+ * notices at its next heartbeat and stops itself, and a second job running
+ * in the same worker process is untouched. Increments that already merged
+ * stay live -- cancel is not a revert.
+ */
+const ADMINS = new Set(String(process.env.DATA_BOY_ADMINS || "")
+  .split(",").map((s) => s.trim()).filter(Boolean));
+
+function describeCancel(c) {
+  const st = c.job_state && typeof c.job_state === "object" ? c.job_state : {};
+  const plan = Array.isArray(st.plan) ? st.plan : null;
+  const shipped = Array.isArray(st.shipped) ? st.shipped : [];
+  if (Number(c.attempts) === 0) {
+    return `Cancelled job #${c.id} before it started. Nothing was changed.`;
+  }
+  const lines = [
+    `Cancelling job #${c.id}. The worker stops at its next checkpoint, within about ` +
+    `${Math.round(jobs.HEARTBEAT_MS / 1000)}s, and will not merge anything more.`,
+  ];
+  if (plan && plan.length > 1) {
+    const i = Math.min(Number(st.step) || 0, plan.length - 1);
+    lines.push(`It was on step ${i + 1} of ${plan.length}, **${plan[i] && plan[i].title}**.`);
+    if (shipped.length) {
+      lines.push(
+        `Already shipped and staying live: ${shipped.map((t) => `**${t}**`).join(", ")}. ` +
+        "Ask for a revert if you want that undone."
+      );
+    } else {
+      lines.push("Nothing from it has landed.");
+    }
+  } else if (/merg|publish|build/i.test(String(st.activity || st.snippet || ""))) {
+    lines.push("It was already building or merging, so that change may still land; the next reply will say.");
+  } else {
+    lines.push("Nothing from it has landed.");
+  }
+  return lines.join("\n");
+}
+
+async function handleCancel(message, id) {
+  const who = message.author.username;
+  if (!SPLIT_ENABLED) {
+    await message.reply("Cancel works on queued jobs, and this bot is running jobs inline right now.");
+    return;
+  }
+  try {
+    let row = id != null ? await jobs.jobRow(adminPool, id) : await jobs.latestJobFor(adminPool, who);
+    if (!row) {
+      await message.reply(id != null
+        ? `There is no job #${id}.`
+        : "You have nothing queued or running. `!cancel <job number>` stops a specific one.");
+      return;
+    }
+    const mine = row.discord_user === who;
+    let admin = ADMINS.has(who);
+    try { admin = admin || !!(message.member && message.member.permissions.has("ManageGuild")); }
+    catch (e) {}
+    if (!mine && !admin) {
+      await message.reply(
+        `Job #${row.id} is ${row.discord_user}'s. Only they, or someone who manages this server, can cancel it.`
+      );
+      return;
+    }
+    if (row.job_status !== "queued" && row.job_status !== "running") {
+      await message.reply(`Job #${row.id} already finished (${row.job_status || "done"}); nothing to cancel.`);
+      return;
+    }
+    const c = await jobs.cancelJob(adminPool, row.id, who);
+    if (!c) {
+      await message.reply(`Job #${row.id} finished just now; nothing to cancel.`);
+      return;
+    }
+    console.log(`[gateway] job ${c.id} cancelled by ${who} (attempts=${c.attempts})`);
+    liveJobs.delete(Number(c.id));
+    const pid = c.job_payload && c.job_payload.placeholder_id;
+    if (pid) {
+      livePlaceholderIds.delete(pid);
+      try {
+        const ch = await discord.channels.fetch(c.discord_channel_id);
+        const ph = await ch.messages.fetch(pid).catch(() => null);
+        if (ph) await ph.delete().catch(() => {});
+      } catch (e) {}
+    }
+    await finalizeQuery(c.id, { error: `cancelled by ${who}`, duration_ms: 0 });
+    await message.reply(describeCancel(c) + (mine ? "" : `\n-# cancelled by ${who}`));
+  } catch (err) {
+    console.error(`[gateway] !cancel failed: ${err.message}`);
+    await message.reply(`I could not cancel that: ${err.message}`).catch(() => {});
   }
 }
 
