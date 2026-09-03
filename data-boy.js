@@ -777,6 +777,25 @@ async function answer(question, systemPrompt, model, onProgress = null, maxTurns
     fs.mkdirSync(workDir, { recursive: true });
   }
 
+  // Model and provider arrive as separate arguments, so they can drift apart --
+  // and they did: the feature planner passed a Claude model while inheriting the
+  // global gemini-api provider, and Google answered "models/claude-opus-5 is not
+  // found for API version v1beta", which reads like a missing model rather than
+  // a routing mistake. Fail here with something that says what actually happened.
+  const claudeModel = /^claude-/.test(String(model || ""));
+  const geminiProvider = provider === "gemini" || provider === "gemini-api";
+  if (claudeModel && geminiProvider) {
+    throw new Error(
+      `routing mistake: model '${model}' is Anthropic's but provider is '${provider}'. ` +
+        `Pass "anthropic" as the provider argument alongside a claude-* model.`
+    );
+  }
+  if (!claudeModel && provider === "anthropic") {
+    throw new Error(
+      `routing mistake: model '${model}' is not an Anthropic model but provider is 'anthropic'.`
+    );
+  }
+
   if (provider === "gemini") {
     return answerWithGemini(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }

@@ -545,7 +545,11 @@ async function planIncrements(o) {
     null,
     12,                      // planning is cheap; it must not become the work
     o.workDir + "-plan",     // its own dir, so stray edits cannot leak into the build
-    false
+    false,
+    // Same provider as the work itself. Without this the planner inherits the
+    // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
+    // name, and the request goes to Google asking for a Claude model.
+    "anthropic"
   );
   const usage = {
     turns: res && res.turns ? res.turns : 0,
