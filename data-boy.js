@@ -2362,7 +2362,14 @@ async function refreshQueuedPlaceholders() {
       lines.push(`Data Boy is still thinking… (${clock}) 🧠`);
     }
     if (Array.isArray(st.plan) && st.plan.length > 1) {
-      lines.push(`-# step ${Math.min((st.step || 0) + 1, st.plan.length)} of ${st.plan.length}`);
+      // `step` is the index of the increment currently running -- it only
+      // advances once one has shipped -- so plan[step] is the right title to
+      // show. Clamped because the last checkpoint sets it past the end.
+      const i = Math.min(st.step || 0, st.plan.length - 1);
+      const title = st.plan[i] && st.plan[i].title;
+      lines.push(
+        `-# step ${i + 1} of ${st.plan.length}` + (title ? ` — ${title}` : "")
+      );
     }
     if (st.activity) lines.push(`-# ${st.activity}${st.turn ? ` · turn ${st.turn}` : ""}`);
     // Keep !status honest for jobs this process is not running.
