@@ -27,6 +27,13 @@ const SITE_URL = process.env.TOASTER_SITE_URL || "https://city.rsdaly.com";
 // compiler error back and let it try again.
 const MAX_BUILD_ATTEMPTS = Number(process.env.TOASTER_MAX_ATTEMPTS || 3);
 
+// How many times a job may start over because someone else's change landed
+// first. Git can isolate two jobs but it cannot merge two different rewrites of
+// the same function -- so when the rebase conflicts, the fix is not a cleverer
+// merge, it is doing the work again against what actually landed. One redo:
+// enough to absorb a collision, not enough to loop in a busy channel.
+const MAX_REDOS = Number(process.env.TOASTER_MAX_REDOS || 1);
+
 // Audio attachments. Binaries live in the repo forever, so cap the size and
 // keep exactly one track -- the page declares a <source> per format and plays
 // whichever is present.
@@ -223,6 +230,7 @@ async function integrate(workDir, branch, rounds = 5) {
       await git(workDir, "rebase", "--abort");
       return {
         merged: false,
+        conflict: true,     // recoverable: redo the work on top of what landed
         reason: "it conflicts with a change that landed while I was working",
       };
     }
@@ -301,9 +309,16 @@ The user attached "${audio.saved}". It is already saved in the ` +
 Note: an attached audio file was not used -- ${audio.skipped}.`
         : "";
 
+    const redoNote = o.priorConflict
+      ? "\n\nNote: you already wrote this once, but another change landed first " +
+        "and the two could not be merged. The checkout below is current -- their " +
+        "change is already in it. Implement the request again on top of what is " +
+        "there now rather than assuming your earlier version."
+      : "";
+
     const prompt =
       attempt === 1
-        ? request + audioNote
+        ? request + audioNote + redoNote
         : `Your last change did not build. Fix it.\n\nThe request was:\n${request}\n\n` +
           `The build failed with:\n\`\`\`\n${lastBuildError}\n\`\`\`\n\n` +
           `The working tree still has your edits. Correct them.`;
@@ -364,7 +379,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
 
       say("merging...");
       const m = await integrate(workDir, branch);
-      if (!m.merged) return { stage: "merge", reason: m.reason };
+      if (!m.merged) return { stage: "merge", reason: m.reason, conflict: !!m.conflict };
 
       // Publish main itself, so the live site equals main by construction
       // rather than by assuming a branch ref resolved to what we think it did.
@@ -383,6 +398,24 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       );
       return { stage: "done" };
     });
+
+    // Someone else landed while this was being written. Do the work again on
+    // top of theirs rather than handing back a branch and asking a person to
+    // retype the request -- that re-ask is exactly what would happen next, and
+    // prepareWorkspace clones main fresh, so the redo starts from their change.
+    if (outcome.stage === "merge" && outcome.conflict && (o.redo || 0) < MAX_REDOS) {
+      say("someone landed first - rebuilding on top of their change...");
+      console.log(`[toaster] ${branch}: rebasing conflicted, redoing against new main`);
+      const again = await runFeature(
+        Object.assign({}, o, { redo: (o.redo || 0) + 1, priorConflict: outcome.reason })
+      );
+      // The first attempt's tokens were still spent; do not report them as free.
+      return Object.assign({}, again, {
+        turns: (again.turns || 0) + usage.turns,
+        inputTokens: (again.inputTokens || 0) + usage.inputTokens,
+        outputTokens: (again.outputTokens || 0) + usage.outputTokens,
+      });
+    }
 
     if (outcome.stage === "merge") {
       // Nothing was published, so the site is untouched and still matches main.
