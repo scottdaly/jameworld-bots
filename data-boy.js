@@ -1674,10 +1674,10 @@ discord.on("messageCreate", async (message) => {
         name: a.name, url: a.url, size: a.size, contentType: a.contentType,
       }));
       // Fetch it now, while the link is certainly still good.
-      let audioStash = null;
+      let stash = null;
       if (atts.length) {
         try {
-          audioStash = await stashAttachments(workDir, atts);
+          stash = await stashAttachments(workDir, atts);
         } catch (e) {
           console.warn(`could not stash attachment for ${logRowId}: ${e.message}`);
         }
@@ -1686,7 +1686,8 @@ discord.on("messageCreate", async (message) => {
       await jobs.enqueue(adminPool, logRowId, {
         request: question,
         attachments: atts,
-        audioStash,
+        audioStash: stash && stash.audio,
+        imageStash: stash && stash.images,
         model,
         maxTurns,
         placeholder_id: placeholder.id,
@@ -2181,6 +2182,7 @@ async function runQueuedJob(row) {
       attachments: payload.attachments || [],
       // Downloaded when the request came in; the URL above may be dead by now.
       audioStash: payload.audioStash || null,
+      imageStash: payload.imageStash || null,
       workDir,
       answer,
       systemPrompt,
@@ -2300,6 +2302,7 @@ async function runWorkerLoop() {
         // runFeature only retires a stash it created itself, and this one came
         // from the gateway -- so nobody else is going to remove it.
         fs.rmSync(wd + ".audio", { force: true });
+        fs.rmSync(wd + ".images", { recursive: true, force: true });
       } catch (e) {
         console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);
       }

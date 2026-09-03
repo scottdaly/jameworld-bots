@@ -47,6 +47,13 @@ const MAX_REDOS = (function () {
 const MAX_AUDIO_BYTES = Number(process.env.TOASTER_MAX_AUDIO_BYTES || 8 * 1024 * 1024);
 const AUDIO_EXT = /\.(mp3|ogg|wav|m4a)$/i;
 
+// Image attachments -- screenshots of a bug, or a reference for what someone
+// wants. Unlike audio these are never committed, so the cap exists only to
+// stop a huge upload from stalling the job, and several are allowed at once.
+const MAX_IMAGE_BYTES = Number(process.env.TOASTER_MAX_IMAGE_BYTES || 6 * 1024 * 1024);
+const MAX_IMAGES = Number(process.env.TOASTER_MAX_IMAGES || 4);
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
+
 // Generous, but not infinite. An SSH that hangs forever would wedge the job and
 // produce no reply at all, which is the one thing we refuse to do.
 const DEPLOY_TIMEOUT_MS = Number(process.env.TOASTER_DEPLOY_TIMEOUT_MS || 15 * 60 * 1000);
@@ -177,6 +184,75 @@ async function saveAudioAttachment(workDir, attachments, stash) {
     return { saved: name, rel: "web/audio/music" + ext, stash: kept };
   }
   return {};
+}
+
+/**
+ * Download any image attachments so the agent can look at them.
+ *
+ * These are read, never committed -- a bug-report screenshot has no business
+ * in the game's git history -- so unlike the audio track they live entirely
+ * outside the checkout, at a path sibling to workDir. That also means a
+ * re-clone (a build-fix retry, a redo, a worker re-claim) does not lose them:
+ * the same sibling directory survives every one of those, exactly like the
+ * audio stash.
+ */
+async function saveImageAttachments(workDir, attachments, stash) {
+  const dir = workDir + ".images";
+
+  // Already fetched by an earlier attempt at this same job. Reuse rather than
+  // re-fetching from Discord, whose CDN links expire.
+  if (Array.isArray(stash) && stash.length && stash.every((s) => fs.existsSync(s.path))) {
+    return { saved: stash.map((s) => s.name), stash };
+  }
+
+  const candidates = (attachments || [])
+    .filter((a) => {
+      const name = a.name || "";
+      return IMAGE_EXT.test(name) || /^image\//.test(a.contentType || "");
+    })
+    .slice(0, MAX_IMAGES);
+  if (!candidates.length) return {};
+
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+
+  const kept = [];
+  const skipped = [];
+  let i = 0;
+  for (const a of candidates) {
+    i++;
+    const name = a.name || `image${i}`;
+    if (a.size && a.size > MAX_IMAGE_BYTES) {
+      skipped.push(`${name} is ${(a.size / 1048576).toFixed(1)}MB and the limit is ` +
+        `${(MAX_IMAGE_BYTES / 1048576).toFixed(0)}MB`);
+      continue;
+    }
+    const ext = (name.match(IMAGE_EXT) || [".png"])[0].toLowerCase();
+    const dest = path.join(dir, `img${i}${ext}`);
+    // --fail matters here too: without it a CDN 403/404 page gets saved as
+    // "an image" and handed to the agent as if it were the screenshot.
+    const r = await run("curl", ["-sSL", "--fail", "--max-time", "60", "-o", dest, a.url]);
+    const got = r.ok && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+    if (!got) { skipped.push(`I could not download ${name}`); continue; }
+    if (got > MAX_IMAGE_BYTES) {
+      fs.rmSync(dest, { force: true });
+      skipped.push(`${name} came down as ${(got / 1048576).toFixed(1)}MB and the limit is ` +
+        `${(MAX_IMAGE_BYTES / 1048576).toFixed(0)}MB`);
+      continue;
+    }
+    kept.push({ path: dest, name });
+  }
+
+  if (!kept.length) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return skipped.length ? { skipped: skipped.join("; ") } : {};
+  }
+  console.log(`[toaster] saved ${kept.length} image attachment(s) to ${dir}`);
+  return {
+    saved: kept.map((k) => k.name),
+    stash: kept,
+    skipped: skipped.length ? skipped.join("; ") : undefined,
+  };
 }
 
 async function hasChanges(workDir) {
@@ -341,6 +417,9 @@ async function runFeature(o) {
     if (!o.audioStash) {
       try { fs.rmSync(o.workDir + ".audio", { force: true }); } catch (e) {}
     }
+    if (!o.imageStash) {
+      try { fs.rmSync(o.workDir + ".images", { recursive: true, force: true }); } catch (e) {}
+    }
   }
 }
 
@@ -378,6 +457,14 @@ async function runFeatureOnce(o) {
     audio = { skipped: `I could not save the attachment (${e.message})` };
   }
 
+  let images;
+  try {
+    images = await saveImageAttachments(workDir, o.attachments, o.imageStash);
+  } catch (e) {
+    console.warn("[toaster] image attachment save failed: " + e.message);
+    images = { skipped: `I could not save the attachment (${e.message})` };
+  }
+
   let lastAgentText = "";
   let lastBuildError = "";
 
@@ -398,6 +485,17 @@ The user attached "${audio.saved}". It is already saved in the ` +
 Note: an attached audio file was not used -- ${audio.skipped}.`
         : "";
 
+    const imageNote = images.saved && images.saved.length
+      ? "\n\nThe user attached " + images.saved.length +
+        (images.saved.length === 1 ? " image" : " images") +
+        ". Read it with the Read tool before making changes -- it shows what " +
+        "they mean, whether that is a bug, a reference for how something should " +
+        "look, or a part of the game they are pointing at:\n" +
+        images.stash.map((s) => `- ${s.path}`).join("\n")
+      : images.skipped
+        ? `\n\nNote: an attached image was not used -- ${images.skipped}.`
+        : "";
+
     const redoNote = o.priorConflict
       ? "\n\nNote: you already wrote this once, but another change landed first " +
         "and the two could not be merged. The checkout below is current -- their " +
@@ -407,7 +505,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
 
     const prompt =
       attempt === 1
-        ? request + audioNote + redoNote
+        ? request + audioNote + imageNote + redoNote
         : `Your last change did not build. Fix it.\n\nThe request was:\n${request}\n\n` +
           `The build failed with:\n\`\`\`\n${lastBuildError}\n\`\`\`\n\n` +
           `The working tree still has your edits. Correct them.`;
@@ -508,6 +606,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
           redo: (o.redo || 0) + 1,
           priorConflict: outcome.reason,
           audioStash: audio.stash,   // the URL it came from may be dead by now
+          imageStash: images.stash,
         })
       );
       // The first attempt's tokens were still spent; do not report them as free.
@@ -902,20 +1001,24 @@ function summarise(shipped, plan) {
 }
 
 /**
- * Pull an attachment down now and leave it where a later attempt can find it.
+ * Pull audio and image attachments down now and leave them where a later
+ * attempt can find them.
  *
  * Discord CDN links expire. Inline, that was fine -- the job started within
  * seconds. Queued, it may sit behind an hour of other work, and by the time a
- * worker claims it the URL can be dead. The stash lives beside the work dir
- * rather than inside it, so the worker's fresh clone does not wipe it; pass
- * what this returns back as `audioStash`.
+ * worker claims it the URL can be dead. Both stashes live beside the work dir
+ * rather than inside it, so the worker's fresh clone does not wipe them; pass
+ * `.audio`/`.images` back as `audioStash`/`imageStash`.
  */
 async function stashAttachments(workDir, attachments) {
   if (!attachments || !attachments.length) return null;
   fs.mkdirSync(workDir, { recursive: true });
-  const r = await saveAudioAttachment(workDir, attachments);
-  if (r.skipped) console.warn("[toaster] attachment not stashed: " + r.skipped);
-  return r.stash || null;
+  const a = await saveAudioAttachment(workDir, attachments);
+  if (a.skipped) console.warn("[toaster] audio attachment not stashed: " + a.skipped);
+  const i = await saveImageAttachments(workDir, attachments);
+  if (i.skipped) console.warn("[toaster] image attachment not stashed: " + i.skipped);
+  if (!a.stash && !i.stash) return null;
+  return { audio: a.stash || null, images: i.stash || null };
 }
 
 module.exports = {
