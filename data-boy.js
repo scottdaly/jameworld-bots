@@ -867,6 +867,37 @@ async function answer(question, systemPrompt, model, onProgress = null, maxTurns
 function baseName(p) {
   return String(p || "").split(/[\\/]/).pop() || "";
 }
+// Files worth naming. Deliberately a closed list: a pattern loose enough to
+// catch anything with a dot also catches version numbers and sed replacement
+// text, and "editing 0.07" is worse than saying nothing.
+const SOURCEISH = /[\w./-]+\.(?:c|h|js|mjs|json|md|sh|html|css|py|txt|ya?ml|sav)\b/g;
+
+/* The file a shell command is editing, or null.
+ *
+ * The agent edits by shelling out to sed far more often than it reaches for
+ * the Edit tool, so before this the single most common thing Data Boy ever
+ * said about itself was "running sed". */
+function bashTarget(c) {
+  // In-place edits: sed -i, perl -pi, awk -i inplace. The filename is the last
+  // source-looking token; anything earlier belongs to the expression.
+  if (/^(?:sed|perl|awk|python3?|ruby)\b/.test(c) && /(?:\s-i\b|-i\.|--in-place|-pi\b)/.test(c)) {
+    const m = c.match(SOURCEISH);
+    if (m) return { verb: "editing", file: baseName(m[m.length - 1]) };
+  }
+  // A redirect into a file rewrites it, heredoc or not.
+  const redir = c.match(/>>?\s*([\w./-]+)/);
+  if (redir && SOURCEISH.test(redir[1])) {
+    SOURCEISH.lastIndex = 0;                     // the regex is /g; reset it
+    return { verb: "writing", file: baseName(redir[1]) };
+  }
+  SOURCEISH.lastIndex = 0;
+  if (/^(?:mv|cp)\s/.test(c)) {
+    const m = c.match(SOURCEISH);
+    if (m) return { verb: "moving", file: baseName(m[m.length - 1]) };
+  }
+  return null;
+}
+
 function describeBash(cmd, desc) {
   const c = String(cmd || "").trim();
   if (/build\.sh/.test(c))            return "running the build gates";
@@ -877,6 +908,10 @@ function describeBash(cmd, desc) {
   if (/^git push/.test(c))            return "pushing the branch";
   if (/^git (diff|log|status|show)/.test(c)) return "reading the git history";
   if (/^git /.test(c))                return "sorting out git";
+  // Naming the file beats both the command name and the agent's own summary,
+  // and matches what Edit and Write already report.
+  const t = bashTarget(c);
+  if (t)                              return `${t.verb} ${t.file}`;
   // The agent writes its own one-line description; it is usually better than
   // anything we would infer from the command text.
   if (desc)                           return String(desc).toLowerCase().slice(0, 60);
