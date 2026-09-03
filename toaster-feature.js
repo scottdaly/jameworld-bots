@@ -391,13 +391,19 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
         ...usage,
         branch,
         merged: false,
+        // Outcome first. Leading with the agent's write-up made a failure read
+        // as a success: it described the finished feature in the present tense,
+        // then admitted at the end that none of it shipped.
         text:
-          (lastAgentText || "I made the change.") +
+          `**Not shipped.** I could not merge it -- ${outcome.reason}. The site is unchanged.` +
           `
 
-I could not merge it -- ${outcome.reason}. The site is unchanged. ` +
-          `Your work is on branch \`${branch}\` if you want to look, and asking ` +
-          `again now that main has moved will usually just work.`,
+Your work is saved on branch \`${branch}\`. Asking again now that main ` +
+          `has moved usually just works, and beats merging it by hand -- it gets ` +
+          `rebuilt against what actually landed.` +
+          (lastAgentText ? `
+
+-# What it had written, for reference: ${lastAgentText.split(". ")[0]}.` : ""),
       };
     }
 
@@ -616,9 +622,15 @@ async function runFeatureEpic(o) {
     if (left <= 0 || elapsed > EPIC_MS_BUDGET) {
       return Object.assign({
         ok: shipped.length > 0,
-        text: summarise(shipped, plan) +
-          "\n\nI stopped there -- this had already used its budget for one request. " +
-          "Ask for the rest and I'll carry on.",
+        // The step's own message already leads with the outcome, so do not
+        // prefix it with "Nothing landed" -- that read as a contradiction next
+        // to an agent write-up describing the feature as finished.
+        text:
+          (shipped.length
+            ? summarise(shipped, plan) + "\n\nThen **" + step.title + "** did not land.\n\n"
+            : "**" + step.title + "** did not land.\n\n") +
+          r.text +
+          "\n\nI stopped there rather than building the rest on top of it.",
       }, total);
     }
 
