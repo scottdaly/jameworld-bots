@@ -2346,6 +2346,13 @@ async function runQueuedJob(row) {
 }
 
 async function runWorkerLoop() {
+  // Presence, independent of the claim loop: a worker mid-epic claims
+  // nothing for 45 minutes and must still count as present, or the gateway's
+  // reaper dead-letters everything queued behind it as "no worker running".
+  const beat = () => jobs.announce(adminPool)
+    .catch((e) => console.warn(`[worker] could not announce presence: ${e.message}`));
+  await beat();
+  setInterval(beat, jobs.WORKER_ANNOUNCE_MS);
   await jobs.workerPump({
     limit: WORKER_CONCURRENCY,
     pollMs: WORKER_POLL_MS,

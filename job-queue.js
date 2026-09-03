@@ -52,6 +52,11 @@ const MAX_ATTEMPTS = Number(process.env.TOASTER_MAX_ATTEMPTS || 3);
 // How long a job may sit queued with nobody claiming it before we admit there
 // is no worker and say so.
 const UNCLAIMED_MS = Number(process.env.TOASTER_UNCLAIMED_MS || 15 * 60 * 1000);
+// A worker not seen for this long is presumed gone. Workers announce every
+// WORKER_ANNOUNCE_MS, so this allows several missed beats before the
+// "never picked up" dead-letter is allowed to conclude nobody is home.
+const WORKER_STALE_MS = Number(process.env.TOASTER_WORKER_STALE_MS || 2 * 60 * 1000);
+const WORKER_ANNOUNCE_MS = Number(process.env.TOASTER_WORKER_ANNOUNCE_MS || 30 * 1000);
 
 // Any constant; it only has to be the same in both containers.
 const SCHEMA_LOCK = 8577301;
@@ -88,6 +93,18 @@ async function ensureSchemaLocked(pool) {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS data_boy_logs_job_status_idx
        ON data_boy_logs (job_status, id) WHERE job_status IS NOT NULL`
+  );
+  // Worker presence. The "never picked up" dead-letter in reapExhausted needs
+  // to know whether a worker EXISTS, which is a different question from
+  // whether one is free -- a worker 30 minutes into an epic is very much
+  // there. Before this table the reaper inferred "no worker" from "queued
+  // for 15 minutes", and told an asker to go check the containers while the
+  // one worker was busy on the job ahead of theirs (job 246).
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS data_boy_workers (
+       worker_id  TEXT PRIMARY KEY,
+       last_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`
   );
   await pool.query(
     `CREATE TABLE IF NOT EXISTS data_boy_outbox (
@@ -191,6 +208,25 @@ async function complete(pool, logId, fence) {
  * A job that burned through its attempts is stuck in a loop that will not fix
  * itself. Take it out of circulation and hand back enough to tell the asker.
  */
+/** Worker side: "I exist", whether or not I am free. Call it on a timer. */
+async function announce(pool, workerId = WORKER_ID) {
+  await pool.query(
+    `INSERT INTO data_boy_workers (worker_id, last_seen) VALUES ($1, NOW())
+     ON CONFLICT (worker_id) DO UPDATE SET last_seen = NOW()`,
+    [workerId]
+  );
+}
+
+/** How many workers have announced themselves recently. */
+async function workersAlive(pool) {
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS n FROM data_boy_workers
+      WHERE last_seen > NOW() - ($1 || ' milliseconds')::interval`,
+    [String(WORKER_STALE_MS)]
+  );
+  return rows[0].n;
+}
+
 async function reapExhausted(pool) {
   const { rows } = await pool.query(
     `UPDATE data_boy_logs
@@ -199,14 +235,22 @@ async function reapExhausted(pool) {
         AND (job_lease IS NULL OR job_lease < NOW())
         AND (
           COALESCE(job_attempts, 0) >= $1
-          -- ...or nobody ever picked it up. Without this a job enqueued while
-          -- no worker is running sits queued forever and the asker watches a
-          -- placeholder that never changes.
-          OR (COALESCE(job_attempts, 0) = 0 AND asked_at < NOW() - ($2 || ' milliseconds')::interval)
+          -- ...or nobody ever picked it up AND there is nobody to pick it up.
+          -- Without this a job enqueued while no worker is running sits queued
+          -- forever and the asker watches a placeholder that never changes.
+          -- The second half matters as much as the first: "unclaimed for a
+          -- while" alone also describes a job waiting its turn behind a long
+          -- one, and dead-lettering that told the asker to go check the
+          -- containers while the worker was simply busy.
+          OR (COALESCE(job_attempts, 0) = 0
+              AND asked_at < NOW() - ($2 || ' milliseconds')::interval
+              AND NOT EXISTS (
+                SELECT 1 FROM data_boy_workers
+                 WHERE last_seen > NOW() - ($3 || ' milliseconds')::interval))
         )
       RETURNING id, discord_channel_id, discord_message_id, question,
                 COALESCE(job_attempts, 0) AS attempts`,
-    [MAX_ATTEMPTS, String(UNCLAIMED_MS)]
+    [MAX_ATTEMPTS, String(UNCLAIMED_MS), String(WORKER_STALE_MS)]
   );
   return rows;
 }
@@ -437,6 +481,7 @@ async function liveRows(pool) {
 
 module.exports = {
   WORKER_ID, LEASE_MS, HEARTBEAT_MS, MAX_ATTEMPTS, UNCLAIMED_MS,
+  WORKER_STALE_MS, WORKER_ANNOUNCE_MS, announce, workersAlive,
   ensureSchema, enqueue, claimNext, heartbeat, complete, finishJob,
   reapExhausted, pruneOutbox, pushOutbox, drainOutbox, liveRows,
   workerPump, availableMemoryMb,

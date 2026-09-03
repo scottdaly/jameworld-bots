@@ -245,6 +245,23 @@ async function newJob(pool, opts = {}) {
     check("and is reported as never having run",
       reaped.find((r) => String(r.id) === String(never)).attempts === 0);
 
+    // ...but only because no worker exists. A worker that is merely BUSY is
+    // still a worker: a job waiting its turn behind a long one must not be
+    // dead-lettered with "most likely no worker is running" (job 246 was,
+    // fifteen minutes into the epic ahead of it).
+    await jobs.announce(pool, "busy-worker");
+    check("an announced worker counts as alive", (await jobs.workersAlive(pool)) === 1);
+    const waiting = await newJob(pool, { ageMs: 60_000 });  // old, unclaimed, worker present
+    const reapedW = await jobs.reapExhausted(pool);
+    check("an old unclaimed job is NOT dead-lettered while a worker is alive",
+      !reapedW.some((r) => String(r.id) === String(waiting)), JSON.stringify(reapedW.map(r => r.id)));
+    await pool.query(
+      "UPDATE data_boy_workers SET last_seen = NOW() - INTERVAL '1 hour' WHERE worker_id = 'busy-worker'");
+    check("a stale announcement no longer counts", (await jobs.workersAlive(pool)) === 0);
+    const reapedG = await jobs.reapExhausted(pool);
+    check("once the last worker has gone stale, the same job IS dead-lettered",
+      reapedG.some((r) => String(r.id) === String(waiting)), JSON.stringify(reapedG.map(r => r.id)));
+
     const fresh = await newJob(pool);                      // queued just now
     const reaped2 = await jobs.reapExhausted(pool);
     check("a freshly queued job is left alone",
