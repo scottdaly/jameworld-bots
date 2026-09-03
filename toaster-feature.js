@@ -418,7 +418,8 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
     try {
       // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
       // path, which has the file-editing tools this job needs.
-      res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, "anthropic");
+      res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, "anthropic",
+                         { onActivity: o.onActivity });
     } catch (e) {
       return {
         ok: false,

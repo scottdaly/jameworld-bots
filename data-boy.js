@@ -784,7 +784,7 @@ async function buildSystemPrompt(depth = "shallow", route = "chat") {
 }
 
 // ── The core: run one question through the SDK ─────────────────────────────
-async function answer(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir, prepared = false, provider = MODEL_PROVIDER) {
+async function answer(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir, prepared = false, provider = MODEL_PROVIDER, opts = {}) {
   // Fresh scratch dir per question (unique per invocation — see WORK_ROOT).
   // Feature mode passes prepared=true: it has already cloned the repo in there
   // and cutting it away would delete the checkout we are about to edit.
@@ -818,10 +818,51 @@ async function answer(question, systemPrompt, model, onProgress = null, maxTurns
   if (provider === "gemini-api") {
     return answerWithGeminiApi(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }
-  return answerWithAnthropic(question, systemPrompt, model, onProgress, maxTurns, workDir);
+  return answerWithAnthropic(question, systemPrompt, model, onProgress, maxTurns, workDir, opts);
 }
 
-async function answerWithAnthropic(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir) {
+/* ── what the agent is actually doing ──────────────────────────────────────
+ * The stream carries a tool_use block every time the agent touches anything,
+ * and we used to filter those out and keep only its prose. That is why a
+ * twelve-minute stretch of editing main.c looked exactly like a hang: the
+ * model has nothing to say while it works, so the placeholder just sat there
+ * counting seconds. These turn the blocks into the words somebody watching
+ * over its shoulder would use.
+ */
+function baseName(p) {
+  return String(p || "").split(/[\\/]/).pop() || "";
+}
+function describeBash(cmd, desc) {
+  const c = String(cmd || "").trim();
+  if (/build\.sh/.test(c))            return "running the build gates";
+  if (/--savetest/.test(c))           return "checking save compatibility";
+  if (/--shot/.test(c))               return "rendering a test frame";
+  if (/\bemcc\b/.test(c))             return "building the wasm";
+  if (/^git commit/.test(c))          return "committing the change";
+  if (/^git push/.test(c))            return "pushing the branch";
+  if (/^git (diff|log|status|show)/.test(c)) return "reading the git history";
+  if (/^git /.test(c))                return "sorting out git";
+  // The agent writes its own one-line description; it is usually better than
+  // anything we would infer from the command text.
+  if (desc)                           return String(desc).toLowerCase().slice(0, 60);
+  return "running " + (c.split(/\s+/)[0] || "a command");
+}
+function describeToolUse(name, input) {
+  const i = input || {};
+  switch (name) {
+    case "Edit":
+    case "NotebookEdit": return "editing " + baseName(i.file_path);
+    case "Write":        return "writing " + baseName(i.file_path);
+    case "Read":         return "reading " + baseName(i.file_path);
+    case "Grep":         return "searching for " + String(i.pattern || "").slice(0, 40);
+    case "Glob":         return "looking for " + String(i.pattern || "").slice(0, 40);
+    case "Bash":         return describeBash(i.command, i.description);
+    default:
+      return String(name || "").startsWith("mcp__") ? "querying the database" : "";
+  }
+}
+
+async function answerWithAnthropic(question, systemPrompt, model, onProgress = null, maxTurns = MAX_TURNS, workDir, opts = {}) {
   let lastAssistantText = "";
   let resultText = null;
   let turns = 0;
@@ -829,6 +870,8 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
   let outputTokens = 0;
   let status = null;
 
+  const onActivity = opts.onActivity || null;
+  let liveTurns = 0;
   for await (const msg of sdkQuery({
     prompt: question,
     options: {
@@ -866,6 +909,9 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
     },
   })) {
     if (msg.type === "assistant" && msg.message?.content) {
+      // num_turns only arrives in the final result message, so a live counter
+      // has to be our own.
+      liveTurns++;
       const textBlocks = msg.message.content
         .filter((b) => b.type === "text")
         .map((b) => b.text)
@@ -873,6 +919,19 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
       if (textBlocks) {
         lastAssistantText = textBlocks;
         onProgress?.(textBlocks);
+      }
+      for (const b of msg.message.content) {
+        if (b.type !== "tool_use") continue;
+        const what = describeToolUse(b.name, b.input);
+        if (what) onActivity?.(what, liveTurns);
+      }
+    } else if (msg.type === "user" && Array.isArray(msg.message?.content)) {
+      // A failed tool is the other thing worth saying out loud: a build gate
+      // going red is the difference between "still working" and "stuck".
+      for (const b of msg.message.content) {
+        if (b.type === "tool_result" && b.is_error) {
+          onActivity?.("that didn't work - trying another way", liveTurns);
+        }
       }
     } else if (msg.type === "result") {
       resultText = msg.result || null;
@@ -1413,18 +1472,25 @@ discord.on("messageCreate", async (message) => {
   }, 8_000);
 
   let progressSnippet = null;
+  let activitySnippet = null;   // what the agent is touching right now
+  let liveTurn = 0;
   let lastProgressEdit = 0;
   async function editProgress() {
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
-    let status;
+    const clock = elapsed < 90 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m${elapsed % 60}s`;
+    const lines = [];
     if (progressSnippet) {
-      const snippet = progressSnippet.replace(/\n+/g, " ").slice(0, 300);
-      status = `_(still thinking… ${elapsed}s)_\n> ${snippet}`;
+      lines.push(`_(still thinking… ${clock})_`);
+      lines.push("> " + progressSnippet.replace(/\n+/g, " ").slice(0, 300));
     } else {
-      status = `Data Boy is still thinking… (${elapsed}s) 🧠`;
+      lines.push(`Data Boy is still thinking… (${clock}) 🧠`);
+    }
+    // The freshest signal goes last, where the eye lands.
+    if (activitySnippet) {
+      lines.push(`-# ${activitySnippet}${liveTurn ? ` · turn ${liveTurn}` : ""}`);
     }
     try {
-      await placeholder.edit(status);
+      await placeholder.edit(lines.join("\n"));
       lastProgressEdit = Date.now();
     } catch {}
   }
@@ -1483,6 +1549,21 @@ discord.on("messageCreate", async (message) => {
       // Update immediately when the model says something, throttled to 5s.
       if (Date.now() - lastProgressEdit > 5_000) editProgress();
     };
+    // Fires on every tool the agent picks up, which is far more often than it
+    // speaks. Discord allows about five edits per five seconds per channel, so
+    // this only ever marks the text dirty -- the 5s floor below and the 15s
+    // heartbeat above are what actually talk to Discord.
+    let lastActivityLogged = "";
+    const onActivity = (what, turn) => {
+      activitySnippet = what;
+      if (turn) liveTurn = turn;
+      if (what !== lastActivityLogged) {
+        lastActivityLogged = what;
+        jobNote(logRowId, { note: what, turn });
+        console.log(`[job ${logRowId}] turn ${turn}: ${what}`);
+      }
+      if (Date.now() - lastProgressEdit > 5_000) editProgress();
+    };
     let result;
     let capacityRetries = 0;
     if (route === "feature") {
@@ -1505,6 +1586,7 @@ discord.on("messageCreate", async (message) => {
           progressSnippet = s;
           editProgress();
         },
+        onActivity,
         // Posted between increments of a large request, and awaited: the
         // screenshot lives in the work dir, which the next increment's clone
         // wipes, so it has to be delivered before we move on.
@@ -1533,7 +1615,8 @@ ${fr.url}` : fr.text,
     } else
     while (true) {
       try {
-        result = await answer(enrichedQuestion, systemPrompt, model, onProgress, maxTurns, workDir);
+        result = await answer(enrichedQuestion, systemPrompt, model, onProgress, maxTurns, workDir,
+                              false, MODEL_PROVIDER, { onActivity });
         break;
       } catch (err) {
         if (!isCapacityError(err) || capacityRetries >= CAPACITY_RETRY_DELAYS_MS.length) {
