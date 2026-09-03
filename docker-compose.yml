@@ -202,5 +202,9 @@ volumes:
   postgres_data:
     name: jameworld-bots_postgres_data
   repo_cache:
+  # This used to declare `name: jameworld-bots_repo_cache`, which is the name
+  # Compose already gives repo_cache above -- so both mounts resolved to one
+  # volume and /tmp/data-boy-work and /var/cache/repos were the same directory
+  # seen twice. It showed up as cloned repos appearing among the job folders.
+  # Harmless so far only because nothing wipes the work root wholesale.
   data_boy_work:
-    name: jameworld-bots_repo_cache

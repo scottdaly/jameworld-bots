@@ -11,7 +11,7 @@ const {
   tool,
   createSdkMcpServer,
 } = require("@anthropic-ai/claude-agent-sdk");
-const { runFeatureEpic, salvageWorkDir } = require("./toaster-feature.js");
+const { runFeatureEpic, salvageWorkDir, stashAttachments } = require("./toaster-feature.js");
 const jobs = require("./job-queue.js");
 
 /* Which half of the bot this process is.
@@ -37,6 +37,7 @@ const JOB_ROLE = process.argv.includes("--worker")
 const SPLIT_ENABLED = process.env.TOASTER_SPLIT === "1";
 const WORKER_POLL_MS = Number(process.env.TOASTER_WORKER_POLL_MS || 4000);
 const GATEWAY_POLL_MS = Number(process.env.TOASTER_GATEWAY_POLL_MS || 5000);
+const MAX_QUEUED_PER_USER = Number(process.env.TOASTER_MAX_QUEUED_PER_USER || 2);
 
 const DISCORD_MAX_LEN = 2000;
 const REPLY_CHUNK_LEN = 1900;
@@ -341,16 +342,25 @@ let shuttingDown = false;
 // means Docker SIGKILLs the job anyway. Matches stop_grace_period.
 const DRAIN_MS = Number(process.env.DRAIN_MS || 880_000);
 
+/* Jobs this process is running that did not arrive through Discord.
+ *
+ * The drain below only ever watched `inFlight`, which the message handler
+ * populates -- and in worker mode that handler never runs. SIGTERM therefore
+ * saw zero work and exited immediately, killing the job in the very container
+ * built to protect it. The 900s grace period was never reached. */
+const workerJobs = new Set();
+
 async function drainThenExit(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`${signal}: draining ${inFlight.size} in-flight job(s), up to ${DRAIN_MS}ms.`);
+  const busy = () => inFlight.size + workerJobs.size;
+  console.log(`${signal}: draining ${busy()} in-flight job(s), up to ${DRAIN_MS}ms.`);
   const deadline = Date.now() + DRAIN_MS;
-  while (inFlight.size > 0 && Date.now() < deadline) {
+  while (busy() > 0 && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1000));
   }
-  if (inFlight.size > 0) {
-    console.warn(`${signal}: giving up with ${inFlight.size} still running.`);
+  if (busy() > 0) {
+    console.warn(`${signal}: giving up with ${busy()} still running.`);
   } else {
     console.log(`${signal}: drained cleanly.`);
   }
@@ -1458,7 +1468,10 @@ discord.on("messageCreate", async (message) => {
 
   if (!rateLimitCheck(userId)) {
     inFlight.delete(userId);
-    liveJobs.delete(logRowId);
+    // No liveJobs.delete() here: logRowId is declared below and claimMessage
+    // has not run, so there is no job to forget -- and referencing it threw a
+    // ReferenceError from the temporal dead zone, which meant the twelfth
+    // question got a crash instead of the sentence explaining the limit.
     await message.reply(
       `You've asked ${RATE_LIMIT_PER_HOUR} questions in the last hour. Take a breather.`
     );
@@ -1599,11 +1612,46 @@ discord.on("messageCreate", async (message) => {
       // somebody asked for forty minutes ago.
       clearInterval(progressInterval);
       clearInterval(typingInterval);
+      // inFlight is released the moment this handler returns, so it no longer
+      // limits anything for queued work. Cap the queue itself instead.
+      try {
+        const { rows: q } = await adminPool.query(
+          `SELECT count(*)::int AS n FROM data_boy_logs
+            WHERE discord_user = $1 AND job_status IN ('queued', 'running')`,
+          [userTag]
+        );
+        if (q[0] && q[0].n >= MAX_QUEUED_PER_USER) {
+          clearInterval(progressInterval);
+          clearInterval(typingInterval);
+          await placeholder.edit(
+            `You already have ${q[0].n} feature jobs queued or running. ` +
+              "I'll take another once one of those lands."
+          );
+          await finalizeQuery(logRowId, { error: "per-user queue limit", duration_ms: 0 });
+          handedOff = true;   // the work dir is not ours to delete either way
+          return;
+        }
+      } catch (e) {
+        console.warn(`queue-depth check failed, allowing: ${e.message}`);
+      }
+
+      const atts = [...message.attachments.values()].map((a) => ({
+        name: a.name, url: a.url, size: a.size, contentType: a.contentType,
+      }));
+      // Fetch it now, while the link is certainly still good.
+      let audioStash = null;
+      if (atts.length) {
+        try {
+          audioStash = await stashAttachments(workDir, atts);
+        } catch (e) {
+          console.warn(`could not stash attachment for ${logRowId}: ${e.message}`);
+        }
+      }
+
       await jobs.enqueue(adminPool, logRowId, {
         request: question,
-        attachments: [...message.attachments.values()].map((a) => ({
-          name: a.name, url: a.url, size: a.size, contentType: a.contentType,
-        })),
+        attachments: atts,
+        audioStash,
         model,
         maxTurns,
         placeholder_id: placeholder.id,
@@ -1853,6 +1901,18 @@ async function cleanupStalePlaceholders() {
     console.error("cleanupStalePlaceholders error:", err.message);
   }
   if (cleaned > 0) console.log(`Cleaned up ${cleaned} stale placeholder message(s).`);
+
+  // Previews copied out of a work dir so they could survive the hop to the
+  // gateway. The gateway deletes each one as it posts it; these are the ones
+  // it never got to.
+  try {
+    const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+    for (const f of fs.readdirSync(WORK_ROOT)) {
+      if (!f.startsWith("post-") || !f.endsWith(".png")) continue;
+      const p = path.join(WORK_ROOT, f);
+      if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true });
+    }
+  } catch { /* the sweep is housekeeping; never let it break cleanup */ }
 }
 
 
@@ -1961,11 +2021,15 @@ async function recoverInterruptedJobs() {
         WHERE answer IS NULL AND error IS NULL AND status IS NULL
           AND asked_at > NOW() - INTERVAL '24 hours'
           AND asked_at < $1
-          -- A job the queue owns is not this process's to recover. Without
-          -- this, restarting the gateway would resume a job in-process that a
-          -- worker is still running -- two agents editing the same branch,
-          -- which is the exact failure the queue exists to prevent.
-          AND (job_status IS NULL OR job_status = 'done')
+          -- A job the queue has ever owned is not this process's to recover.
+          -- Without this, restarting the gateway would resume a job in-process
+          -- that a worker is still running -- two agents editing the same
+          -- branch, the exact failure the queue exists to prevent. 'done' is
+          -- excluded too: a worker whose bookkeeping write failed leaves the
+          -- row done-but-blank, and recovering that would re-run a job whose
+          -- answer is already sitting in the outbox. The queue's own reaper
+          -- handles anything it has stranded.
+          AND job_status IS NULL
         ORDER BY id DESC LIMIT 20`,
       [BOOT_TIME]
     );
@@ -2034,6 +2098,7 @@ async function recoverInterruptedJobs() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const fenceOf = (row) => ({ worker: jobs.WORKER_ID, attempt: row.job_attempts });
 
 /* ── worker ───────────────────────────────────────────────────────────────
  * Claim a job, run it, say what happened, repeat. The loop never exits: a
@@ -2049,9 +2114,24 @@ async function runQueuedJob(row) {
 
   // Live progress goes into the row, overwritten in place. The gateway reads
   // it on a timer -- a tool fires far more often than anyone needs told.
+  // Proof of ownership, checked by every write from here on. A re-claim bumps
+  // job_attempts, so if this worker's lease lapsed and another took the job,
+  // our predicate stops matching and we find out instead of trampling them.
+  const fence = { worker: jobs.WORKER_ID, attempt: row.job_attempts };
+  let fenced = false;
+  const loseFence = (where) => {
+    if (fenced) return;
+    fenced = true;
+    console.error(
+      `[worker] LOST THE FENCE on job ${row.id} at ${where}: another worker has ` +
+      "claimed it. Abandoning quietly -- it now owns the reply."
+    );
+  };
+
   let snippet = null, activity = null, turn = 0;
   const beat = setInterval(() => {
-    jobs.heartbeat(adminPool, row.id, { snippet, activity, turn })
+    jobs.heartbeat(adminPool, row.id, { snippet, activity, turn }, fence)
+      .then((ok) => { if (!ok) loseFence("heartbeat"); })
       .catch((e) => console.warn(`heartbeat failed for ${row.id}: ${e.message}`));
   }, jobs.HEARTBEAT_MS);
 
@@ -2061,6 +2141,8 @@ async function runQueuedJob(row) {
     const fr = await runFeatureEpic({
       request: payload.request || row.question,
       attachments: payload.attachments || [],
+      // Downloaded when the request came in; the URL above may be dead by now.
+      audioStash: payload.audioStash || null,
       workDir,
       answer,
       systemPrompt,
@@ -2069,7 +2151,9 @@ async function runQueuedJob(row) {
       // A re-claimed job already has a plan and a shipped list, so picking it
       // back up is the same machinery as recovering one -- nothing extra.
       resume: state && Array.isArray(state.plan) ? state : null,
-      persist: (s) => jobs.heartbeat(adminPool, row.id, s),
+      persist: async (s) => {
+        if (!(await jobs.heartbeat(adminPool, row.id, s, fence))) loseFence("checkpoint");
+      },
       onProgress: (s) => { snippet = s; },
       onActivity: (what, t) => { activity = what; if (t) turn = t; },
       onIncrement: async (inc) => {
@@ -2101,17 +2185,30 @@ async function runQueuedJob(row) {
       }
     } catch (e) { console.warn(`could not keep final preview: ${e.message}`); }
 
-    await jobs.pushOutbox(adminPool, {
-      logId: row.id, channelId: row.discord_channel_id,
-      replyTo: row.discord_message_id, kind: "final",
-      text: fr.ok ? `${fr.text}\n\n${fr.url}` : fr.text,
-      filePath: keep,
-    });
-    await finalizeQuery(row.id, {
-      answer: fr.text, status: fr.ok ? "success" : "feature_failed",
-      turns: fr.turns || 0, input_tokens: fr.inputTokens || 0,
-      output_tokens: fr.outputTokens || 0, duration_ms: Date.now() - startedAt,
-    });
+    if (fenced) {
+      // Whoever holds the job now will post its own answer. Two finals in the
+      // channel is worse than one late one.
+      console.warn(`[worker] job ${row.id} finished but we no longer own it; not posting.`);
+      return;
+    }
+    // Answer recorded, claim released and reply queued together, so there is
+    // no window where the job looks unfinished but the answer is already out
+    // -- or the reverse.
+    const kept = await jobs.finishJob(
+      adminPool, row.id, fence,
+      {
+        answer: fr.text, status: fr.ok ? "success" : "feature_failed",
+        turns: fr.turns || 0, input_tokens: fr.inputTokens || 0,
+        output_tokens: fr.outputTokens || 0, duration_ms: Date.now() - startedAt,
+      },
+      {
+        channelId: row.discord_channel_id, replyTo: row.discord_message_id,
+        kind: "final",
+        text: fr.ok ? `${fr.text}\n\n${fr.url}` : fr.text,
+        filePath: keep,
+      }
+    );
+    if (!kept) { loseFence("finish"); return; }
     console.log(`[worker] job ${row.id} done in ${Math.round((Date.now() - startedAt) / 1000)}s`);
   } finally {
     clearInterval(beat);
@@ -2120,6 +2217,9 @@ async function runQueuedJob(row) {
 
 async function runWorkerLoop() {
   for (;;) {
+    // Once we are shutting down, finish what is in hand and take nothing new.
+    // Claiming during a drain would start a job with seconds left to live.
+    if (shuttingDown) { await sleep(1000); continue; }
     let row = null;
     try {
       row = await jobs.claimNext(adminPool);
@@ -2130,6 +2230,7 @@ async function runWorkerLoop() {
     }
     if (!row) { await sleep(WORKER_POLL_MS); continue; }
 
+    workerJobs.add(row.id);
     try {
       await runQueuedJob(row);
     } catch (err) {
@@ -2145,8 +2246,25 @@ async function runWorkerLoop() {
       } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
       await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
     } finally {
-      try { await jobs.complete(adminPool, row.id); }
+      // Fenced or not, complete() is predicated on ownership, so this can only
+      // ever close a job this worker still holds.
+      try { await jobs.complete(adminPool, row.id, fenceOf(row)); }
       catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+      // Nobody else will. The gateway used to delete this in its own finally,
+      // but a handed-off job returns from that handler before the work has
+      // even started -- so without this the clone sits on the volume forever,
+      // one full checkout of the game per request. Safe here: the previews
+      // worth keeping were copied out to post-*.png above.
+      try {
+        const wd = path.join(WORK_ROOT, String(row.discord_message_id));
+        fs.rmSync(wd, { recursive: true, force: true });
+        // runFeature only retires a stash it created itself, and this one came
+        // from the gateway -- so nobody else is going to remove it.
+        fs.rmSync(wd + ".audio", { force: true });
+      } catch (e) {
+        console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);
+      }
+      workerJobs.delete(row.id);
     }
   }
 }
@@ -2168,6 +2286,8 @@ async function postOutboxRow(r) {
   else await ch.send({ content: String(r.text || "").slice(0, DISCORD_MAX_LEN), files });
 
   if (r.kind === "final" && r.log_id) {
+    // Nothing is watching this job any more.
+    liveJobs.delete(Number(r.log_id));
     // The placeholder has done its job; the answer is above it now.
     try {
       const { rows } = await adminPool.query(
@@ -2175,6 +2295,7 @@ async function postOutboxRow(r) {
       );
       const pid = rows[0] && rows[0].job_payload && rows[0].job_payload.placeholder_id;
       if (pid) {
+        livePlaceholderIds.delete(pid);
         const ph = await ch.messages.fetch(pid).catch(() => null);
         if (ph) await ph.delete().catch(() => {});
       }
@@ -2221,14 +2342,24 @@ async function refreshQueuedPlaceholders() {
   // Jobs nobody can finish. Say so rather than leaving them queued forever.
   for (const dead of await jobs.reapExhausted(adminPool)) {
     liveJobs.delete(dead.id);
+    // Never picked up is a different problem from tried and failed, and the
+    // person waiting should be told which.
+    const neverRan = Number(dead.attempts) === 0;
     try {
       await jobs.pushOutbox(adminPool, {
         logId: dead.id, channelId: dead.discord_channel_id,
         replyTo: dead.discord_message_id, kind: "final",
-        text: "I tried that one a few times and it failed every time, so I've " +
-          "stopped retrying it. Worth a look at the logs before asking again.",
+        text: neverRan
+          ? "That one sat in the queue and nothing ever picked it up — most " +
+            "likely no worker is running. Nothing was changed; worth a look at " +
+            "the containers before asking again."
+          : "I tried that one a few times and it failed every time, so I've " +
+            "stopped retrying it. Worth a look at the logs before asking again.",
       });
-      await finalizeQuery(dead.id, { error: "job exhausted its attempts", duration_ms: 0 });
+      await finalizeQuery(dead.id, {
+        error: neverRan ? "job was never claimed by a worker" : "job exhausted its attempts",
+        duration_ms: 0,
+      });
     } catch (e) { console.error(`reaping ${dead.id}: ${e.message}`); }
   }
 }
@@ -2241,6 +2372,8 @@ function startGatewayPolling() {
     try {
       await jobs.drainOutbox(adminPool, postOutboxRow);
       await refreshQueuedPlaceholders();
+      // Cheap, and only actually deletes anything once a week's worth exists.
+      if (Math.random() < 0.01) await jobs.pruneOutbox(adminPool);
     } catch (err) {
       console.error(`gateway poll failed: ${err.message}`);
     } finally {
@@ -2252,7 +2385,11 @@ function startGatewayPolling() {
 discord.once("ready", async () => {
   console.log(`Logged in as ${discord.user.tag}.`);
   await recoverInterruptedJobs();
-  if (SPLIT_ENABLED) startGatewayPolling();
+  // Deliberately not behind SPLIT_ENABLED. Turning the flag off is how a
+  // rollback happens, and jobs already queued still finish and still write
+  // their answers -- if nothing drains the outbox those answers are simply
+  // never delivered. With an empty queue this costs one cheap query per tick.
+  startGatewayPolling();
   // Run cleanup periodically so stranded placeholders self-clean.
   setInterval(() => { cleanupStalePlaceholders().catch(() => {}); }, 90 * 1000);
   await cleanupStalePlaceholders();

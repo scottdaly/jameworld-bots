@@ -843,8 +843,19 @@ async function runFeatureEpicInner(o) {
     }
     // `left` was computed and then dropped on the floor, so every increment
     // got the full per-request allowance and the epic budget bounded nothing.
+    // The step whose success was never checkpointed may in fact have landed:
+    // runFeature merges and publishes before returning, and `step` only
+    // advances after it returns. A crash in that gap is invisible from here,
+    // so the first step after a resume is warned rather than assumed fresh.
+    const firstAfterResume = i === startAt && startAt > 0 && !!o.resume;
     const r = await runFeature(Object.assign({}, o, {
-      request: step.request,
+      request: firstAfterResume
+        ? step.request +
+          "\n\nNOTE: a previous attempt at this step was interrupted, and it " +
+          "may have already landed before it died. Check whether this change is " +
+          "already present before making it. If it is, verify it is complete and " +
+          "correct rather than doing it a second time."
+        : step.request,
       maxTurns: Math.max(1, Math.min(o.maxTurns || left, left)),
     }));
     add(r);
@@ -890,4 +901,23 @@ function summarise(shipped, plan) {
     shipped.map(function (s) { return "**" + s + "**"; }).join(", ") + ".";
 }
 
-module.exports = { runFeature, runFeatureEpic, salvageWorkDir, SITE_URL };
+/**
+ * Pull an attachment down now and leave it where a later attempt can find it.
+ *
+ * Discord CDN links expire. Inline, that was fine -- the job started within
+ * seconds. Queued, it may sit behind an hour of other work, and by the time a
+ * worker claims it the URL can be dead. The stash lives beside the work dir
+ * rather than inside it, so the worker's fresh clone does not wipe it; pass
+ * what this returns back as `audioStash`.
+ */
+async function stashAttachments(workDir, attachments) {
+  if (!attachments || !attachments.length) return null;
+  fs.mkdirSync(workDir, { recursive: true });
+  const r = await saveAudioAttachment(workDir, attachments);
+  if (r.skipped) console.warn("[toaster] attachment not stashed: " + r.skipped);
+  return r.stash || null;
+}
+
+module.exports = {
+  runFeature, runFeatureEpic, salvageWorkDir, stashAttachments, SITE_URL,
+};
