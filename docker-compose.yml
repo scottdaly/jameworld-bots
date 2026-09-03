@@ -90,6 +90,9 @@ services:
       - TOASTER_REPO=github-push:scottdaly/toaster-city.git
       - TOASTER_DEPLOY_HOST=toaster-deploy
       - TOASTER_SITE_URL=https://city.rsdaly.com
+      # Set to 1 in .env to send feature requests to the worker instead of
+      # running them in the gateway. Off means today's behaviour exactly.
+      - TOASTER_SPLIT=${TOASTER_SPLIT:-}
     volumes: &data_boy_volumes
       # OAuth creds for Gemini provider. Mounted RW so the provider can write
       # refreshed access tokens back to oauth_creds.json on the host.
