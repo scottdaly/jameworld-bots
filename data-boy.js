@@ -1587,6 +1587,9 @@ discord.on("messageCreate", async (message) => {
           editProgress();
         },
         onActivity,
+        // Written after the plan and after every landed increment, so a
+        // restart can pick the plan back up instead of losing it.
+        persist: (s) => saveJobState(logRowId, s),
         // Posted between increments of a large request, and awaited: the
         // screenshot lives in the work dir, which the next increment's clone
         // wipes, so it has to be delivered before we move on.
@@ -1776,13 +1779,104 @@ async function cleanupStalePlaceholders() {
 // A job killed mid-run (a rebuild, a crash) leaves its log row unfinalized and
 // its asker staring at a placeholder that never resolves. Going quiet is the one
 // outcome we refuse, so on boot: find those rows, tell the asker, close them out.
+/* The plan a feature job is working through, and how far it got. A shipped
+ * increment is already merged and published -- the only thing a restart
+ * destroys is the knowledge that it happened, which is exactly the kind of
+ * thing a database is for. */
+async function saveJobState(rowId, state) {
+  await adminPool.query("UPDATE data_boy_logs SET job_state = $1 WHERE id = $2", [
+    JSON.stringify(state),
+    rowId,
+  ]);
+}
+
+/* Carry on with a plan a restart interrupted, instead of telling somebody who
+ * waited forty minutes to type it again. The increments in state.shipped are
+ * live on main; only what was mid-flight is redone. */
+async function resumeFeatureJob(row, state) {
+  const startedAt = Date.now();
+  const left = state.plan.length - state.step;
+  const ch = await discord.channels.fetch(row.discord_channel_id);
+  const msg = await ch.messages.fetch(row.discord_message_id);
+  const placeholder = await msg.reply(
+    `I got restarted mid-job. **${state.shipped.length} of ${state.plan.length}** ` +
+      `already shipped and live; ${left === 1 ? "one step is" : `${left} steps are`} ` +
+      "still to go — picking up where I left off rather than starting over."
+  );
+  jobNote(row.id, {
+    user: row.discord_user || "?", question: row.question,
+    started: startedAt, note: "resuming after a restart",
+  });
+
+  const workDir = path.join(WORK_ROOT, String(row.discord_message_id));
+  const systemPrompt = await buildSystemPrompt("shallow", "feature");
+  let snippet = null, activity = null, turn = 0, lastEdit = 0;
+  async function redraw() {
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    const clock = secs < 90 ? `${secs}s` : `${Math.floor(secs / 60)}m${secs % 60}s`;
+    const lines = [`_(picking up where I left off… ${clock})_`];
+    if (snippet) lines.push("> " + String(snippet).replace(/\n+/g, " ").slice(0, 300));
+    if (activity) lines.push(`-# ${activity}${turn ? ` · turn ${turn}` : ""}`);
+    try { await placeholder.edit(lines.join("\n")); lastEdit = Date.now(); } catch {}
+  }
+  const beat = setInterval(redraw, 15_000);
+
+  try {
+    const fr = await runFeatureEpic({
+      request: row.question,
+      attachments: [],           // the originals expired long ago
+      workDir, answer, systemPrompt,
+      model: FEATURE_MODEL,
+      maxTurns: MAX_TURNS_FEATURE,
+      resume: state,
+      persist: (s) => saveJobState(row.id, Object.assign({}, s, { resumes: (state.resumes || 0) + 1 })),
+      onProgress: (s) => { snippet = s; if (Date.now() - lastEdit > 5_000) redraw(); },
+      onActivity: (what, t) => {
+        activity = what; if (t) turn = t;
+        jobNote(row.id, { note: what, turn: t });
+        if (Date.now() - lastEdit > 5_000) redraw();
+      },
+      onIncrement: async (inc) => {
+        const files = [];
+        try {
+          if (inc.preview && fs.existsSync(inc.preview)) {
+            files.push({ attachment: inc.preview, name: `step-${inc.index}.png` });
+          }
+        } catch {}
+        await postChunked(msg, inc.text || "", files,
+          `-# step ${inc.index} of ${inc.of} — **${inc.title}** is live`);
+      },
+    });
+    clearInterval(beat);
+    try { await placeholder.delete(); } catch {}
+    await postChunked(msg, fr.ok ? `${fr.text}\n\n${fr.url}` : fr.text, collectAttachments(workDir));
+    await finalizeQuery(row.id, {
+      answer: fr.text, status: fr.ok ? "success" : "feature_failed",
+      turns: fr.turns || 0,
+      input_tokens: fr.inputTokens || 0,
+      output_tokens: fr.outputTokens || 0,
+      duration_ms: Date.now() - startedAt,
+    });
+  } catch (err) {
+    clearInterval(beat);
+    console.error(`Recovery: resume of row ${row.id} failed: ${err.message}`);
+    try { await msg.reply(`I tried to pick that back up and hit an error: ${err.message}`); } catch {}
+    await finalizeQuery(row.id, { error: `resume failed: ${err.message}`, duration_ms: Date.now() - startedAt });
+  } finally {
+    liveJobs.delete(row.id);
+  }
+}
+
 async function recoverInterruptedJobs() {
   try {
     await adminPool.query(
       "ALTER TABLE data_boy_logs ADD COLUMN IF NOT EXISTS discord_channel_id TEXT"
     );
+    await adminPool.query(
+      "ALTER TABLE data_boy_logs ADD COLUMN IF NOT EXISTS job_state JSONB"
+    );
     const { rows } = await adminPool.query(
-      `SELECT id, discord_message_id, discord_channel_id, question
+      `SELECT id, discord_message_id, discord_channel_id, discord_user, question, job_state
          FROM data_boy_logs
         WHERE answer IS NULL AND error IS NULL AND status IS NULL
           AND asked_at > NOW() - INTERVAL '24 hours'
@@ -1793,6 +1887,7 @@ async function recoverInterruptedJobs() {
     if (rows.length === 0) return;
     console.log(`Recovery: ${rows.length} interrupted job(s) from before the restart.`);
 
+    let resumed = 0;
     for (const r of rows) {
       // The work dir is on a volume, so an interrupted job's edits are still
       // on disk. Push them somewhere durable before telling anyone it's lost.
@@ -1800,6 +1895,27 @@ async function recoverInterruptedJobs() {
         path.join(WORK_ROOT, String(r.discord_message_id)),
         r.id
       );
+
+      // A plan with steps left is worth finishing rather than apologising for.
+      // One at a time, so a crash loop cannot start four jobs at boot, and
+      // capped at two attempts so a job that dies on every restart eventually
+      // gets a straight answer instead of an infinite retry.
+      const st = r.job_state && typeof r.job_state === "object" ? r.job_state : null;
+      if (
+        resumed < 1 && st && Array.isArray(st.plan) && st.plan.length > 1 &&
+        Number(st.step) >= 0 && Number(st.step) < st.plan.length &&
+        (Number(st.resumes) || 0) < 2 && r.discord_channel_id && r.discord_message_id
+      ) {
+        resumed++;
+        console.log(`Recovery: resuming row ${r.id} at step ${Number(st.step) + 1}/${st.plan.length}`);
+        // Deliberately not awaited: the bot has to finish coming up. The row
+        // stays open until the resumed job closes it, so another restart in
+        // the meantime picks it up again.
+        resumeFeatureJob(r, st).catch((e) =>
+          console.error(`Recovery: resume of row ${r.id} threw: ${e.message}`)
+        );
+        continue;
+      }
 
       let told = false;
       if (r.discord_channel_id && r.discord_message_id) {

@@ -767,9 +767,33 @@ async function runFeatureEpicInner(o) {
     total.outputTokens += (r && r.outputTokens) || 0;
   };
 
-  const planned = await planIncrements(o);
-  add(planned.usage);
-  const plan = planned.plan;
+  // Writing the plan down is what makes a killed job resumable: a shipped
+  // increment is already merged and published, so the only thing lost in a
+  // restart is the knowledge that it happened. Never let a bookkeeping
+  // failure take the job with it.
+  const persist = async function (state) {
+    if (typeof o.persist !== "function") return;
+    try { await o.persist(state); }
+    catch (e) { console.warn("[toaster] could not persist job state: " + e.message); }
+  };
+
+  let plan, shipped = [], startAt = 0;
+  if (o.resume && Array.isArray(o.resume.plan) && o.resume.plan.length > 1) {
+    // Picking up after a restart. The increments in `shipped` are on main and
+    // live; redoing them would be a second, conflicting rewrite of work that
+    // already landed.
+    plan = o.resume.plan;
+    shipped = Array.isArray(o.resume.shipped) ? o.resume.shipped.slice() : [];
+    startAt = Number(o.resume.step) || 0;
+    if (!(startAt >= 0)) startAt = 0;
+    if (startAt > plan.length) startAt = plan.length;
+    console.log(`[toaster] resuming at step ${startAt + 1} of ${plan.length}, ` +
+      `${shipped.length} already shipped`);
+  } else {
+    const planned = await planIncrements(o);
+    add(planned.usage);
+    plan = planned.plan;
+  }
 
   // One increment means one ordinary job -- and it runs the ORIGINAL wording,
   // not the planner's paraphrase, which can quietly drop detail.
@@ -779,10 +803,16 @@ async function runFeatureEpicInner(o) {
     return Object.assign({}, r, total);
   }
 
-  console.log("[toaster] plan: " + plan.map(function (p) { return p.title; }).join(" -> "));
-  const shipped = [];
+  // Everything already landed before the restart; nothing left to run.
+  if (startAt >= plan.length) {
+    return Object.assign({ ok: shipped.length > 0, url: SITE_URL,
+      text: summarise(shipped, plan) }, total);
+  }
 
-  for (let i = 0; i < plan.length; i++) {
+  console.log("[toaster] plan: " + plan.map(function (p) { return p.title; }).join(" -> "));
+  await persist({ plan: plan, shipped: shipped, step: startAt });
+
+  for (let i = startAt; i < plan.length; i++) {
     const step = plan[i];
     const left = EPIC_TURN_BUDGET - total.turns;
     const elapsed = Date.now() - started;
@@ -833,6 +863,9 @@ async function runFeatureEpicInner(o) {
     }
 
     shipped.push(step.title);
+    // Record it before the interim post: the post can fail, the increment is
+    // still shipped, and a restart must not redo it.
+    await persist({ plan: plan, shipped: shipped, step: i + 1 });
     if (i < plan.length - 1 && typeof o.onIncrement === "function") {
       try {
         await o.onIncrement({
