@@ -32,7 +32,14 @@ const MAX_BUILD_ATTEMPTS = Number(process.env.TOASTER_MAX_ATTEMPTS || 3);
 // the same function -- so when the rebase conflicts, the fix is not a cleverer
 // merge, it is doing the work again against what actually landed. One redo:
 // enough to absorb a collision, not enough to loop in a busy channel.
-const MAX_REDOS = Number(process.env.TOASTER_MAX_REDOS || 1);
+const MAX_REDOS = (function () {
+  // Infinity and 1.5 both parse as numbers and both break the bound -- one
+  // removes it, the other rounds up through it. Only a small whole count is a
+  // bound at all.
+  const raw = process.env.TOASTER_MAX_REDOS;
+  const n = raw === undefined || raw === "" ? 1 : Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 3) : 1;
+})();
 
 // Audio attachments. Binaries live in the repo forever, so cap the size and
 // keep exactly one track -- the page declares a <source> per format and plays
@@ -107,7 +114,20 @@ async function prepareWorkspace(workDir, request) {
  * to the agent as a URL. Exactly one track is kept: the previous one is cleared
  * first, otherwise an old music.mp3 would keep winning over a new music.ogg.
  */
-async function saveAudioAttachment(workDir, attachments) {
+async function saveAudioAttachment(workDir, attachments, stash) {
+  // A redo re-clones into a fresh workDir, so the track saved on the first
+  // attempt is gone -- and the Discord URL it came from has a good chance of
+  // having expired by then. Reuse the copy kept outside workDir instead of
+  // letting a merge collision turn a valid music request into a failed one.
+  if (stash && fs.existsSync(stash.path)) {
+    const dir = path.join(workDir, "web", "audio");
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(stash.path, path.join(dir, "music" + stash.ext));
+    console.log("[toaster] reused stashed audio " + stash.name);
+    return { saved: stash.name, rel: "web/audio/music" + stash.ext, stash: stash };
+  }
+
   for (const a of attachments || []) {
     const name = a.name || "";
     const isAudio = AUDIO_EXT.test(name) || /^audio\//.test(a.contentType || "");
@@ -125,11 +145,36 @@ async function saveAudioAttachment(workDir, attachments) {
     fs.mkdirSync(dir, { recursive: true });
     const dest = path.join(dir, "music" + ext);
 
-    const r = await run("curl", ["-sSL", "--max-time", "180", "-o", dest, a.url]);
-    const ok = r.ok && fs.existsSync(dest) && fs.statSync(dest).size > 0;
-    if (!ok) return { skipped: `I could not download ${name}` };
-    console.log(`[toaster] saved audio ${name} -> web/audio/music${ext}`);
-    return { saved: name, rel: "web/audio/music" + ext };
+    // --fail matters here: without it curl writes the CDN's 403/404 HTML body
+    // to the file and still exits 0, and "nonempty" then calls that a track.
+    const r = await run("curl", ["-sSL", "--fail", "--max-time", "180", "-o", dest, a.url]);
+    const got = r.ok && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+    if (!got) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return { skipped: `I could not download ${name}` };
+    }
+    // a.size above is the caller's claim about the file; this is the file that
+    // actually arrived, which is the one that would go into the repo forever.
+    if (got > MAX_AUDIO_BYTES) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return {
+        skipped: `${name} came down as ${(got / 1048576).toFixed(1)}MB and the limit is ` +
+          `${(MAX_AUDIO_BYTES / 1048576).toFixed(0)}MB`,
+      };
+    }
+
+    // Outside workDir, so prepareWorkspace cannot wipe it; runFeature deletes
+    // it once the job (including any redo) is finished with it.
+    const stashPath = workDir + ".audio";
+    let kept = null;
+    try {
+      fs.copyFileSync(dest, stashPath);
+      kept = { path: stashPath, ext: ext, name: name };
+    } catch (e) {
+      console.warn("[toaster] could not stash audio: " + e.message);
+    }
+    console.log(`[toaster] saved audio ${name} -> web/audio/music${ext} (${got} bytes)`);
+    return { saved: name, rel: "web/audio/music" + ext, stash: kept };
   }
   return {};
 }
@@ -219,7 +264,13 @@ function withIntegrationLock(fn) {
 async function integrate(workDir, branch, rounds = 5) {
   for (let round = 1; round <= rounds; round++) {
     const ff = await git(workDir, "push", "origin", "HEAD:main");
-    if (ff.ok) return { merged: true };
+    // After a rebase round HEAD is a different commit than the one that was
+    // pushed to the branch, so read it here rather than trusting the caller's
+    // pre-integration sha -- that one names a commit no longer on main.
+    if (ff.ok) {
+      const h = await git(workDir, "rev-parse", "--short", "HEAD");
+      return { merged: true, sha: h.ok ? h.stdout.trim() : null };
+    }
 
     // main moved. Rebase onto it -- but their change plus ours is a tree
     // nobody has ever built, and two changes that each compile alone can fail
@@ -263,7 +314,37 @@ async function integrate(workDir, branch, rounds = 5) {
  * @param {function} o.onProgress    called with short status strings for Discord
  * @returns {Promise<{text:string, ok:boolean, url?:string, preview?:string, sha?:string}>}
  */
+/**
+ * Wrapper whose only job is the promise this module makes to its caller: it
+ * resolves, always, with a `text` somebody can be shown. Every silence this bot
+ * has produced traced back to a rejection nobody was catching, so the failure
+ * mode is closed here once rather than at each of the twenty return sites.
+ */
 async function runFeature(o) {
+  const none = { turns: 0, inputTokens: 0, outputTokens: 0 };
+  try {
+    const r = await runFeatureOnce(o);
+    if (r && typeof r.text === "string" && r.text) return r;
+    console.error("[toaster] runFeature returned no text:", JSON.stringify(r));
+    return Object.assign({ ok: false }, none, r || {}, {
+      text: "The job finished without producing a result. Nothing shipped.",
+    });
+  } catch (e) {
+    console.error("[toaster] runFeature threw:", (e && e.stack) || e);
+    return Object.assign({ ok: false }, none, {
+      text: `The job hit an unexpected error and stopped: ${(e && e.message) || e}. ` +
+        "Nothing shipped.",
+    });
+  } finally {
+    // Only the attempt that created the stash retires it; a redo is handed one
+    // it does not own and whose file the outer attempt still needs afterwards.
+    if (!o.audioStash) {
+      try { fs.rmSync(o.workDir + ".audio", { force: true }); } catch (e) {}
+    }
+  }
+}
+
+async function runFeatureOnce(o) {
   const { request, workDir, answer, systemPrompt, model, maxTurns, onProgress } = o;
   const say = (s) => {
     try {
@@ -287,7 +368,15 @@ async function runFeature(o) {
 
   // Attachments land in the checkout before the agent starts, so it can see
   // the file rather than being told about a URL it cannot fetch.
-  const audio = await saveAudioAttachment(workDir, o.attachments);
+  let audio;
+  try {
+    audio = await saveAudioAttachment(workDir, o.attachments, o.audioStash);
+  } catch (e) {
+    // Outside the setup try/catch above, this used to escape runFeature
+    // entirely -- a filesystem error on a music upload meant total silence.
+    console.warn("[toaster] attachment save failed: " + e.message);
+    audio = { skipped: `I could not save the attachment (${e.message})` };
+  }
 
   let lastAgentText = "";
   let lastBuildError = "";
@@ -380,6 +469,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       say("merging...");
       const m = await integrate(workDir, branch);
       if (!m.merged) return { stage: "merge", reason: m.reason, conflict: !!m.conflict };
+      if (m.sha) sha = m.sha;   // a rebase rewrote it; report what landed
 
       // Publish main itself, so the live site equals main by construction
       // rather than by assuming a branch ref resolved to what we think it did.
@@ -391,12 +481,18 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       // the mutable `current` symlink, so a job publishing between our deploy
       // and this fetch would hand the asker a picture of someone else's
       // feature. Inside the lock, nothing can move underneath us.
-      await run(
+      const png = path.join(workDir, "preview.png");
+      const shot = await run(
         "curl",
-        ["-sS", "-o", path.join(workDir, "preview.png"), `${SITE_URL}/preview.png?t=${Date.now()}`],
+        ["-sS", "--fail", "-o", png, `${SITE_URL}/preview.png?t=${Date.now()}`],
         { timeout: 60_000 }
       );
-      return { stage: "done" };
+      const gotShot = shot.ok && fs.existsSync(png) && fs.statSync(png).size > 0;
+      // A missed screenshot is not a missed feature -- it shipped either way.
+      // But a truncated or HTML-bodied file must not be handed to
+      // collectAttachments, which would post it as if it were the frame.
+      if (!gotShot) fs.rmSync(png, { force: true });
+      return { stage: "done", shot: gotShot };
     });
 
     // Someone else landed while this was being written. Do the work again on
@@ -407,7 +503,11 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       say("someone landed first - rebuilding on top of their change...");
       console.log(`[toaster] ${branch}: rebasing conflicted, redoing against new main`);
       const again = await runFeature(
-        Object.assign({}, o, { redo: (o.redo || 0) + 1, priorConflict: outcome.reason })
+        Object.assign({}, o, {
+          redo: (o.redo || 0) + 1,
+          priorConflict: outcome.reason,
+          audioStash: audio.stash,   // the URL it came from may be dead by now
+        })
       );
       // The first attempt's tokens were still spent; do not report them as free.
       return Object.assign({}, again, {
@@ -450,8 +550,9 @@ Your work is saved on branch \`${branch}\`. Asking again now that main ` +
           (lastAgentText || "I made the change.") +
           `
 
-It is merged into main, but publishing it failed, so the site is still ` +
-          `showing the previous version. Worth a look at the build host.`,
+It is merged into main, but the publish step failed or timed out. A failure ` +
+          `there does not tell me whether the site picked the change up or not, ` +
+          `so check ${SITE_URL} and the build host rather than assuming either.`,
       };
     }
 
@@ -465,13 +566,16 @@ It is merged into main, but publishing it failed, so the site is still ` +
         sha,
         branch,
         url: SITE_URL,
-        preview: `${SITE_URL}/preview.png`,
+        preview: outcome.shot ? `${SITE_URL}/preview.png` : undefined,
         merged: true,
         text:
           (lastAgentText || "Done.") +
           (exhausted ? `
 
-(I hit my turn limit, but what I had built and shipped.)` : ""),
+(I hit my turn limit, but what I had built and shipped.)` : "") +
+          (outcome.shot ? "" : `
+
+-# The change is live; I just could not grab a screenshot of it.`),
       };
     }
 
@@ -577,19 +681,34 @@ const PLAN_PROMPT = [
 
 /** Ask for a plan. Any doubt at all falls back to a single increment. */
 async function planIncrements(o) {
-  const res = await o.answer(
-    PLAN_PROMPT + "\n\nThe request:\n" + o.request,
-    "You are planning work on a small C game. Reply with JSON only.",
-    o.model,
-    null,
-    12,                      // planning is cheap; it must not become the work
-    o.workDir + "-plan",     // its own dir, so stray edits cannot leak into the build
-    false,
-    // Same provider as the work itself. Without this the planner inherits the
-    // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
-    // name, and the request goes to Google asking for a Claude model.
-    "anthropic"
-  );
+  const res = await planAsk(o);
+  if (!res) return { plan: null, usage: { turns: 0, inputTokens: 0, outputTokens: 0 } };
+  return parsePlan(res);
+}
+
+/** The provider call on its own, so a provider outage degrades to one job. */
+async function planAsk(o) {
+  try {
+    return await o.answer(
+      PLAN_PROMPT + "\n\nThe request:\n" + o.request,
+      "You are planning work on a small C game. Reply with JSON only.",
+      o.model,
+      null,
+      12,                      // planning is cheap; it must not become the work
+      o.workDir + "-plan",     // its own dir, so stray edits cannot leak into the build
+      false,
+      // Same provider as the work itself. Without this the planner inherits the
+      // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
+      // name, and the request goes to Google asking for a Claude model.
+      "anthropic"
+    );
+  } catch (e) {
+    console.warn("[toaster] planner unavailable, treating as one change:", e.message);
+    return null;
+  }
+}
+
+function parsePlan(res) {
   const usage = {
     turns: res && res.turns ? res.turns : 0,
     inputTokens: res && res.inputTokens ? res.inputTokens : 0,
@@ -624,6 +743,21 @@ async function planIncrements(o) {
  *        is delivered before the next clone wipes the work dir.
  */
 async function runFeatureEpic(o) {
+  try {
+    return await runFeatureEpicInner(o);
+  } catch (e) {
+    // Same promise as runFeature: whoever asked gets an answer. The planner's
+    // answer() call in particular sits outside every other catch.
+    console.error("[toaster] runFeatureEpic threw:", (e && e.stack) || e);
+    return {
+      ok: false, turns: 0, inputTokens: 0, outputTokens: 0,
+      text: `The job hit an unexpected error before it could ship anything: ` +
+        `${(e && e.message) || e}.`,
+    };
+  }
+}
+
+async function runFeatureEpicInner(o) {
   const started = Date.now();
   const total = { turns: 0, inputTokens: 0, outputTokens: 0 };
   const add = function (r) {
@@ -653,17 +787,21 @@ async function runFeatureEpic(o) {
     const elapsed = Date.now() - started;
 
     if (left <= 0 || elapsed > EPIC_MS_BUDGET) {
+      // This branch used to interpolate `r`, which is declared below it and is
+      // block-scoped to this iteration -- so running out of budget threw a
+      // ReferenceError instead of reporting, which is the one outcome this bot
+      // is not allowed to have. There is no `r` here by construction: the step
+      // being described never started.
+      const why = left <= 0
+        ? "the turn budget for one request was used up"
+        : `the ${Math.round(EPIC_MS_BUDGET / 60000)}-minute budget for one request ran out`;
       return Object.assign({
         ok: shipped.length > 0,
-        // The step's own message already leads with the outcome, so do not
-        // prefix it with "Nothing landed" -- that read as a contradiction next
-        // to an agent write-up describing the feature as finished.
         text:
           (shipped.length
-            ? summarise(shipped, plan) + "\n\nThen **" + step.title + "** did not land.\n\n"
-            : "**" + step.title + "** did not land.\n\n") +
-          r.text +
-          "\n\nI stopped there rather than building the rest on top of it.",
+            ? summarise(shipped, plan) + "\n\nThen **" + step.title + "** never started: " + why + "."
+            : "**" + step.title + "** never started: " + why + ".") +
+          "\n\nNothing is half-finished -- ask for the rest and I will pick up from here.",
       }, total);
     }
 
@@ -672,7 +810,12 @@ async function runFeatureEpic(o) {
       try { o.onProgress("step " + (i + 1) + " of " + plan.length + ": " + step.title); }
       catch (e) {}
     }
-    const r = await runFeature(Object.assign({}, o, { request: step.request }));
+    // `left` was computed and then dropped on the floor, so every increment
+    // got the full per-request allowance and the epic budget bounded nothing.
+    const r = await runFeature(Object.assign({}, o, {
+      request: step.request,
+      maxTurns: Math.max(1, Math.min(o.maxTurns || left, left)),
+    }));
     add(r);
 
     if (!r.ok) {
