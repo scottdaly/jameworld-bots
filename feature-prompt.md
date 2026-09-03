@@ -13,15 +13,19 @@ build and never reaches the site.
 
 ## The shape of the job
 
-1. **Read `isocity.c`.** It is one file, about 1200 lines. Read the parts you
-   need before editing. The simulation is `tick()`; rendering is `draw_frame()`.
+1. **Read the source before editing.** The game is `main.c` (about 3300
+   lines) plus `sprites.c` (all generated art), `save.c` (the save format),
+   and the headers `city.h`/`sprites.h`/`save.h`/`sim.h` that tie them
+   together. Read the parts of whichever files you need. The simulation is
+   `tick()`; rendering is `draw_frame()`; both are in `main.c`.
 2. **Make the smallest change that delivers what was asked.** You are editing a
    working game that people are playing. A feature request is not license to
    restructure the file.
 3. **Check it compiles and runs** before you finish:
 
    ```sh
-   cc -O2 -Wall -o /tmp/g isocity.c $(sdl2-config --cflags --libs) -lm
+   cc -O2 -Wall -Werror=implicit-function-declaration -Wmissing-prototypes \
+      -o /tmp/g main.c sprites.c save.c $(sdl2-config --cflags --libs) -lm
    SDL_VIDEODRIVER=dummy /tmp/g --shot /tmp/g.bmp
    ```
 
@@ -29,7 +33,40 @@ build and never reaches the site.
    change you have not compiled is not finished, and the build gates on the
    server will reject it anyway; catching it here saves a round trip. If the
    compile fails, fix it and run again before you reply.
-4. **Do not commit or push.** That is handled for you. Just leave the working
+4. **If the request describes how something looks or behaves together with
+   something else already on screen, look at it before you finish.**
+   Compiling proves the code runs; it does not prove a panel you added does
+   not cover the menu it is describing, or that two things drawn at once do
+   not collide. That already happened once: a fly-out menu and a hover panel
+   were each individually correct on their own, and the build's own smoke
+   test even rendered every combination of them — it just never saved a frame
+   of any of it, so nobody looked.
+
+   Force the actual state near the end of the `--shot` branch in `main()`,
+   the same way the existing smoke test already does for other UI: set
+   whatever file-scope variables control it (an open flag, `ui_hover`,
+   `scene`, cursor position, or whatever your change introduced), save a
+   frame, and look at the picture:
+
+   ```c
+   /* temporary -- delete before you finish */
+   cat_open = 1; cat_sel = 0; ui_mx = 600; ui_my = 500;   // the state you built
+   draw_frame(); SDL_SaveBMP(shot_surf, "/tmp/check.bmp"); return 0;
+   ```
+
+   ```sh
+   cc -O2 -Wall -o /tmp/g main.c sprites.c save.c $(sdl2-config --cflags --libs) -lm
+   SDL_VIDEODRIVER=dummy /tmp/g --shot /tmp/check.bmp
+   python3 tools/bmp2png.py /tmp/check.bmp /tmp/check.png
+   ```
+
+   Read `/tmp/check.png` with your Read tool and actually look at it. Then
+   remove the temporary branch -- it must not reach the commit.
+
+   Do this for an interaction: a hover, a click, an overlay, two things that
+   can be visible at once, a layout that has to fit. Skip it for a change with
+   no visual claim -- a tax formula, a spawn rate, a save-file field.
+5. **Do not commit or push.** That is handled for you. Just leave the working
    tree in the state you want shipped.
 
 ## What already exists — do not rebuild these
@@ -42,7 +79,9 @@ is already implemented, say so and change nothing.
 
 ## Hard rules
 
-- **One file.** Everything in `isocity.c`. No new source files, no modules.
+- **No new files.** The four files above are all there is -- `main.c`,
+  `sprites.c`, `save.c`, and their headers. Add to one of them; don't create
+  a new source file or module.
 - **All art is generated in code.** No image files, no external assets, ever.
 - **No network calls.** The page runs under `connect-src 'self'`.
 - **Never touch `frame_step()`'s contract.** The browser drives it one frame at

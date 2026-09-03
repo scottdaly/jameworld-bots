@@ -476,7 +476,7 @@ The user attached "${audio.saved}". It is already saved in the ` +
         `checkout at ${audio.rel} and the page already plays whatever track is ` +
         `there (see web/index.html and web/boot.js) -- playback, the mute ` +
         `control and the autoplay unlock are all done. You do not need to ` +
-        `change isocity.c or write any audio code. Confirm the file is in ` +
+        `change main.c or write any audio code. Confirm the file is in ` +
         `place and say so; only touch the page if the request asks for more ` +
         `than background music.`
       : audio.skipped
