@@ -345,6 +345,84 @@ async function drainOutbox(pool, handler, limit = 5) {
   return posted;
 }
 
+/**
+ * Run claimed jobs with bounded concurrency.
+ *
+ * Before the gateway/worker split, feature jobs ran side by side in the
+ * gateway: the agent phase overlaps freely (each job has its own clone) and
+ * only gate/merge/publish is serialised, by the in-process integration lock
+ * in toaster-feature.js. The split moved jobs into the worker and the loop
+ * there ran strictly one at a time, so a second person's request sat queued
+ * behind a 45-minute epic for no structural reason. This restores the
+ * overlap inside the one worker process -- the same process, so that lock
+ * still holds. Running MORE THAN ONE WORKER PROCESS is a different matter
+ * and still unsafe: the integration lock is a promise chain, not a database
+ * lock. That is why concurrency is a knob here and not a compose --scale.
+ *
+ * opts:
+ *   claim()            -> a claimed row, or null when the queue is empty
+ *   run(row)           -> promise; must do its own reporting and cleanup
+ *   limit              -> max jobs in flight (>= 1)
+ *   pollMs             -> idle wait between claims
+ *   isDraining()       -> true once shutdown began: finish, claim nothing
+ *   canStartAnother()  -> true, or a string saying why a SECOND slot must
+ *                         wait (the first job always starts); polled while
+ *                         held, logged once per hold
+ *   log(msg)           -> optional
+ *   sleep, until       -> test hooks; until() true ends the loop after the
+ *                         active jobs finish
+ */
+async function workerPump(opts) {
+  const limit = Math.max(1, Number(opts.limit) || 1);
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const log = opts.log || (() => {});
+  const active = new Set();
+  let held = null;
+  for (;;) {
+    if (opts.until && opts.until()) { await Promise.all([...active]); return; }
+    if (opts.isDraining && opts.isDraining()) { await sleep(1000); continue; }
+    if (active.size >= limit) { await Promise.race([...active]); continue; }
+    if (active.size > 0 && opts.canStartAnother) {
+      const verdict = opts.canStartAnother();
+      if (verdict !== true) {
+        if (held !== verdict) { held = verdict; log(`holding a free slot: ${verdict}`); }
+        await Promise.race([...active, sleep(opts.pollMs)]);
+        continue;
+      }
+    }
+    if (held) { log("headroom is back; taking work again"); held = null; }
+    let row = null;
+    try { row = await opts.claim(); }
+    catch (err) {
+      log(`claim failed: ${err && err.message}`);
+      await sleep(opts.pollMs);
+      continue;
+    }
+    if (!row) { await sleep(opts.pollMs); continue; }
+    if (active.size > 0) log(`job ${row.id} starts alongside ${active.size} other(s)`);
+    const p = Promise.resolve()
+      .then(() => opts.run(row))
+      .catch((err) => log(`job ${row.id} escaped its handler: ${(err && err.stack) || err}`))
+      .finally(() => active.delete(p));
+    active.add(p);
+  }
+}
+
+/**
+ * Memory the kernel says a new process could actually get, in MB. Read from
+ * /proc/meminfo rather than os.freemem(): "free" on Linux excludes page
+ * cache, which is reclaimable and on this box is most of the number.
+ * Falls back to os.freemem() where /proc does not exist (tests on Windows).
+ */
+function availableMemoryMb() {
+  try {
+    const m = require("fs").readFileSync("/proc/meminfo", "utf8")
+      .match(/MemAvailable:\s+(\d+)\s*kB/);
+    if (m) return Math.round(Number(m[1]) / 1024);
+  } catch (e) { /* not Linux */ }
+  return Math.round(require("os").freemem() / 1048576);
+}
+
 /** Rows a gateway should be showing live progress for. */
 async function liveRows(pool) {
   const { rows } = await pool.query(
@@ -361,4 +439,5 @@ module.exports = {
   WORKER_ID, LEASE_MS, HEARTBEAT_MS, MAX_ATTEMPTS, UNCLAIMED_MS,
   ensureSchema, enqueue, claimNext, heartbeat, complete, finishJob,
   reapExhausted, pruneOutbox, pushOutbox, drainOutbox, liveRows,
+  workerPump, availableMemoryMb,
 };

@@ -21,12 +21,17 @@ build and never reaches the site.
 2. **Make the smallest change that delivers what was asked.** You are editing a
    working game that people are playing. A feature request is not license to
    restructure the file.
-3. **Check it compiles and runs** before you finish:
+3. **Check it compiles and runs** before you finish. Scratch output (the
+   binary, screenshots) goes in `$PWD-scratch`, a directory beside your
+   checkout -- never at a fixed name under `/tmp`. Another job can be running
+   in this same container at the same time, and `/tmp/g` would be theirs too;
+   you would be looking at their screenshot and calling it yours.
 
    ```sh
+   mkdir -p "$PWD-scratch"
    cc -O2 -Wall -Werror=implicit-function-declaration -Wmissing-prototypes \
-      -o /tmp/g main.c sprites.c save.c $(sdl2-config --cflags --libs) -lm
-   SDL_VIDEODRIVER=dummy /tmp/g --shot /tmp/g.bmp
+      -o "$PWD-scratch/g" main.c sprites.c save.c $(sdl2-config --cflags --libs) -lm
+   SDL_VIDEODRIVER=dummy "$PWD-scratch/g" --shot "$PWD-scratch/g.bmp"
    ```
 
    Both of these work in your sandbox — SDL2 is installed. **Run them.** A
@@ -51,16 +56,17 @@ build and never reaches the site.
    ```c
    /* temporary -- delete before you finish */
    cat_open = 1; cat_sel = 0; ui_mx = 600; ui_my = 500;   // the state you built
-   draw_frame(); SDL_SaveBMP(shot_surf, "/tmp/check.bmp"); return 0;
+   draw_frame(); SDL_SaveBMP(shot_surf, argv[2]); return 0;   // argv[2] is the --shot path
    ```
 
    ```sh
-   cc -O2 -Wall -o /tmp/g main.c sprites.c save.c $(sdl2-config --cflags --libs) -lm
-   SDL_VIDEODRIVER=dummy /tmp/g --shot /tmp/check.bmp
-   python3 tools/bmp2png.py /tmp/check.bmp /tmp/check.png
+   cc -O2 -Wall -o "$PWD-scratch/g" main.c sprites.c save.c $(sdl2-config --cflags --libs) -lm
+   SDL_VIDEODRIVER=dummy "$PWD-scratch/g" --shot "$PWD-scratch/check.bmp"
+   python3 tools/bmp2png.py "$PWD-scratch/check.bmp" "$PWD-scratch/check.png"
    ```
 
-   Read `/tmp/check.png` with your Read tool and actually look at it. Then
+   Read `$PWD-scratch/check.png` (spell out the real path) with your Read tool
+   and actually look at it. Then
    remove the temporary branch -- it must not reach the commit.
 
    Do this for an interaction: a hover, a click, an overlay, two things that

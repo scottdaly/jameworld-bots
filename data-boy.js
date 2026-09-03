@@ -36,6 +36,16 @@ const JOB_ROLE = process.argv.includes("--worker")
   : (process.env.DATA_BOY_ROLE || "gateway").toLowerCase();
 const SPLIT_ENABLED = process.env.TOASTER_SPLIT === "1";
 const WORKER_POLL_MS = Number(process.env.TOASTER_WORKER_POLL_MS || 4000);
+// Jobs one worker process runs side by side. 2 is what the gateway used to
+// do before the split (one per asker, agent phases overlapping, only
+// gate/merge/publish serialised). See workerPump in job-queue.js for why this
+// is a per-process knob and not a second container.
+const WORKER_CONCURRENCY = Math.max(1, Number(process.env.TOASTER_WORKER_CONCURRENCY || 2));
+// A second job only starts with this much memory actually available. A
+// running job is a Claude subprocess plus a compiler; on a 2GB box two of
+// them can OOM-kill the worker with both jobs in flight. They would be
+// reclaimed after their leases lapse, but that is a stall, not a plan.
+const WORKER_MIN_FREE_MB = Number(process.env.TOASTER_WORKER_MIN_FREE_MB || 450);
 const GATEWAY_POLL_MS = Number(process.env.TOASTER_GATEWAY_POLL_MS || 5000);
 const MAX_QUEUED_PER_USER = Number(process.env.TOASTER_MAX_QUEUED_PER_USER || 2);
 
@@ -1912,6 +1922,7 @@ ${fr.url}` : fr.text,
       // was ever deleting it -- they had been piling up since epics shipped.
       fs.rmSync(workDir, { recursive: true, force: true });
       fs.rmSync(workDir + "-plan", { recursive: true, force: true });
+      fs.rmSync(workDir + "-scratch", { recursive: true, force: true });
       // Fetched at the top of the feature branch above, at the same level as
       // workDir itself -- nothing inside runFeatureEpic owns this one, so
       // nothing inside it retires it either. This is the only place that can.
@@ -2335,94 +2346,98 @@ async function runQueuedJob(row) {
 }
 
 async function runWorkerLoop() {
-  for (;;) {
-    // Once we are shutting down, finish what is in hand and take nothing new.
-    // Claiming during a drain would start a job with seconds left to live.
-    if (shuttingDown) { await sleep(1000); continue; }
-    let row = null;
-    try {
-      row = await jobs.claimNext(adminPool);
-    } catch (err) {
-      console.error(`[worker] claim failed: ${err.message}`);
-      await sleep(WORKER_POLL_MS);
-      continue;
-    }
-    if (!row) { await sleep(WORKER_POLL_MS); continue; }
+  await jobs.workerPump({
+    limit: WORKER_CONCURRENCY,
+    pollMs: WORKER_POLL_MS,
+    isDraining: () => shuttingDown,
+    claim: () => jobs.claimNext(adminPool),
+    run: runClaimedJob,
+    canStartAnother: () => {
+      const mb = jobs.availableMemoryMb();
+      return mb >= WORKER_MIN_FREE_MB
+        ? true
+        : `${mb}MB available, a second job needs ${WORKER_MIN_FREE_MB}MB`;
+    },
+    log: (m) => console.log(`[worker] ${m}`),
+  });
+}
 
-    workerJobs.add(row.id);
-    // Set by runQueuedJob's normal-completion path once finishJob's own
-    // transaction has already released the row -- see the comment there.
-    // Any other exit (fenced, an exception below) leaves this false, which
-    // is exactly when complete() below still has real work to do.
-    let released = false;
+/** One claimed job, start to finish: run it, report it, release it, clean up. */
+async function runClaimedJob(row) {
+  workerJobs.add(row.id);
+  // Set by runQueuedJob's normal-completion path once finishJob's own
+  // transaction has already released the row -- see the comment there.
+  // Any other exit (fenced, an exception below) leaves this false, which
+  // is exactly when complete() below still has real work to do.
+  let released = false;
+  try {
+    const outcome = await runQueuedJob(row);
+    released = !!(outcome && outcome.released);
+  } catch (err) {
+    // runFeatureEpic already promises never to reject, so this is the
+    // outbox or the database. Either way the asker is owed a sentence.
+    console.error(`[worker] job ${row.id} threw: ${(err && err.stack) || err}`);
     try {
-      const outcome = await runQueuedJob(row);
-      released = !!(outcome && outcome.released);
-    } catch (err) {
-      // runFeatureEpic already promises never to reject, so this is the
-      // outbox or the database. Either way the asker is owed a sentence.
-      console.error(`[worker] job ${row.id} threw: ${(err && err.stack) || err}`);
+      await jobs.pushOutbox(adminPool, {
+        logId: row.id, channelId: row.discord_channel_id,
+        replyTo: row.discord_message_id, kind: "final",
+        text: `That job hit an unexpected error and stopped: ${err.message}`,
+      });
+    } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
+    await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
+  } finally {
+    // complete() is predicated on ownership: it only succeeds if this
+    // worker's fence still matches the row. Its return value is therefore
+    // also the answer to "is it safe to delete the shared files below" --
+    // a fenced-out worker that fell through to here anyway (loseFence logs
+    // and keeps running rather than aborting mid-build) must not touch a
+    // checkout the reclaiming worker may already be writing to. This used
+    // to delete unconditionally: same path, same ".audio"/".images"
+    // siblings, no ownership check at all, so a worker that lost its lease
+    // could erase the new owner's live clone and stashes out from under it.
+    // Skipped when `released` is already true: finishJob cleared
+    // job_worker in the same transaction that recorded the answer, so
+    // calling complete() again here would always find no match and
+    // always report false -- which is exactly the bug that made every
+    // ordinarily successful job stop cleaning up after itself the first
+    // time this fence check was added.
+    let stillOwned = released;
+    if (!released) {
+      try { stillOwned = await jobs.complete(adminPool, row.id, fenceOf(row)); }
+      catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+    }
+
+    if (stillOwned) {
+      // Nobody else will. The gateway used to delete this in its own
+      // finally, but a handed-off job returns from that handler before the
+      // work has even started -- so without this the clone sits on the
+      // volume forever, one full checkout of the game per request. Safe
+      // here specifically because stillOwned just proved no other worker
+      // holds this row. The previews worth keeping were copied out to
+      // post-*.png above.
       try {
-        await jobs.pushOutbox(adminPool, {
-          logId: row.id, channelId: row.discord_channel_id,
-          replyTo: row.discord_message_id, kind: "final",
-          text: `That job hit an unexpected error and stopped: ${err.message}`,
-        });
-      } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
-      await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
-    } finally {
-      // complete() is predicated on ownership: it only succeeds if this
-      // worker's fence still matches the row. Its return value is therefore
-      // also the answer to "is it safe to delete the shared files below" --
-      // a fenced-out worker that fell through to here anyway (loseFence logs
-      // and keeps running rather than aborting mid-build) must not touch a
-      // checkout the reclaiming worker may already be writing to. This used
-      // to delete unconditionally: same path, same ".audio"/".images"
-      // siblings, no ownership check at all, so a worker that lost its lease
-      // could erase the new owner's live clone and stashes out from under it.
-      // Skipped when `released` is already true: finishJob cleared
-      // job_worker in the same transaction that recorded the answer, so
-      // calling complete() again here would always find no match and
-      // always report false -- which is exactly the bug that made every
-      // ordinarily successful job stop cleaning up after itself the first
-      // time this fence check was added.
-      let stillOwned = released;
-      if (!released) {
-        try { stillOwned = await jobs.complete(adminPool, row.id, fenceOf(row)); }
-        catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+        const wd = path.join(WORK_ROOT, String(row.discord_message_id));
+        fs.rmSync(wd, { recursive: true, force: true });
+        fs.rmSync(wd + "-plan", { recursive: true, force: true });
+        fs.rmSync(wd + "-scratch", { recursive: true, force: true });
+        // runFeature only retires a stash it created itself, and this one
+        // came from the gateway -- so nobody else is going to remove it.
+        fs.rmSync(wd + ".audio", { force: true });
+        fs.rmSync(wd + ".images", { recursive: true, force: true });
+      } catch (e) {
+        console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);
       }
-
-      if (stillOwned) {
-        // Nobody else will. The gateway used to delete this in its own
-        // finally, but a handed-off job returns from that handler before the
-        // work has even started -- so without this the clone sits on the
-        // volume forever, one full checkout of the game per request. Safe
-        // here specifically because stillOwned just proved no other worker
-        // holds this row. The previews worth keeping were copied out to
-        // post-*.png above.
-        try {
-          const wd = path.join(WORK_ROOT, String(row.discord_message_id));
-          fs.rmSync(wd, { recursive: true, force: true });
-          fs.rmSync(wd + "-plan", { recursive: true, force: true });
-          // runFeature only retires a stash it created itself, and this one
-          // came from the gateway -- so nobody else is going to remove it.
-          fs.rmSync(wd + ".audio", { force: true });
-          fs.rmSync(wd + ".images", { recursive: true, force: true });
-        } catch (e) {
-          console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);
-        }
-      } else {
-        // stillOwned is false either because another worker's fence now
-        // matches instead of ours, or because the release query itself
-        // failed -- fenced (runQueuedJob's own flag) is not in scope here,
-        // and does not need to be: not proven safe is reason enough to skip.
-        console.warn(
-          `[worker] job ${row.id}: not confirmed still ours; leaving its ` +
-          "checkout and stashes alone rather than risk deleting a live clone."
-        );
-      }
-      workerJobs.delete(row.id);
+    } else {
+      // stillOwned is false either because another worker's fence now
+      // matches instead of ours, or because the release query itself
+      // failed -- fenced (runQueuedJob's own flag) is not in scope here,
+      // and does not need to be: not proven safe is reason enough to skip.
+      console.warn(
+        `[worker] job ${row.id}: not confirmed still ours; leaving its ` +
+        "checkout and stashes alone rather than risk deleting a live clone."
+      );
     }
+    workerJobs.delete(row.id);
   }
 }
 
@@ -2615,7 +2630,8 @@ discord.once("ready", async () => {
   if (JOB_ROLE === "worker") {
     // No Discord connection: this process exists to survive the one that has
     // it being restarted. Anything it wants said goes through the outbox.
-    console.log(`Worker ${jobs.WORKER_ID} up, polling every ${WORKER_POLL_MS}ms.`);
+    console.log(`Worker ${jobs.WORKER_ID} up, polling every ${WORKER_POLL_MS}ms, ` +
+      `up to ${WORKER_CONCURRENCY} job(s) at once (second needs ${WORKER_MIN_FREE_MB}MB free).`);
     await runWorkerLoop();     // never returns
     return;
   }
