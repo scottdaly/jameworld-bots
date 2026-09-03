@@ -1028,9 +1028,20 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
 
   const failed =
     isErrorResult ||
+    apiErrorStatus != null ||
+    status === null ||
     status === "error_during_execution" ||
     status === "error_max_budget_usd" ||
     status === "error_max_structured_output_retries";
+  // status === null means the loop ended without ever seeing a result
+  // message at all -- the SDK's own contract is exactly one per turn, so an
+  // iterator that just ends is not a quiet "nothing to say", it is the
+  // stream stopping short. Treating that as success returned empty text as
+  // if the model had genuinely answered nothing.
+  // apiErrorStatus alone (without is_error) is included defensively: the
+  // installed package's own types don't rule out a success-shaped message
+  // still carrying a real HTTP error status, and there is no legitimate
+  // reason a completed, error-free turn would carry one at all.
   if (failed) {
     // Prefer the SDK's own structured account of what went wrong over
     // anything scraped from text: api_error_status alone is enough for
@@ -2286,7 +2297,7 @@ async function runQueuedJob(row) {
       // Whoever holds the job now will post its own answer. Two finals in the
       // channel is worse than one late one.
       console.warn(`[worker] job ${row.id} finished but we no longer own it; not posting.`);
-      return;
+      return { released: false };
     }
     // Answer recorded, claim released and reply queued together, so there is
     // no window where the job looks unfinished but the answer is already out
@@ -2305,8 +2316,17 @@ async function runQueuedJob(row) {
         filePath: keep,
       }
     );
-    if (!kept) { loseFence("finish"); return; }
+    if (!kept) { loseFence("finish"); return { released: false }; }
     console.log(`[worker] job ${row.id} done in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+    // finishJob's own transaction already cleared job_worker/job_status in
+    // the same write that recorded the answer -- that IS the release. A
+    // second complete() call afterward would find job_worker already NULL
+    // and its fence would never match, always returning false: every
+    // ordinarily successful job would silently stop cleaning up its
+    // checkout and stashes forever, which is what happened the first time
+    // this was written this way. Reporting it back here instead of calling
+    // complete() again is what lets the caller know it is already done.
+    return { released: true };
   } finally {
     clearInterval(beat);
   }
@@ -2328,8 +2348,14 @@ async function runWorkerLoop() {
     if (!row) { await sleep(WORKER_POLL_MS); continue; }
 
     workerJobs.add(row.id);
+    // Set by runQueuedJob's normal-completion path once finishJob's own
+    // transaction has already released the row -- see the comment there.
+    // Any other exit (fenced, an exception below) leaves this false, which
+    // is exactly when complete() below still has real work to do.
+    let released = false;
     try {
-      await runQueuedJob(row);
+      const outcome = await runQueuedJob(row);
+      released = !!(outcome && outcome.released);
     } catch (err) {
       // runFeatureEpic already promises never to reject, so this is the
       // outbox or the database. Either way the asker is owed a sentence.
@@ -2352,9 +2378,17 @@ async function runWorkerLoop() {
       // to delete unconditionally: same path, same ".audio"/".images"
       // siblings, no ownership check at all, so a worker that lost its lease
       // could erase the new owner's live clone and stashes out from under it.
-      let stillOwned = false;
-      try { stillOwned = await jobs.complete(adminPool, row.id, fenceOf(row)); }
-      catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+      // Skipped when `released` is already true: finishJob cleared
+      // job_worker in the same transaction that recorded the answer, so
+      // calling complete() again here would always find no match and
+      // always report false -- which is exactly the bug that made every
+      // ordinarily successful job stop cleaning up after itself the first
+      // time this fence check was added.
+      let stillOwned = released;
+      if (!released) {
+        try { stillOwned = await jobs.complete(adminPool, row.id, fenceOf(row)); }
+        catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
+      }
 
       if (stillOwned) {
         // Nobody else will. The gateway used to delete this in its own

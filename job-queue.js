@@ -316,8 +316,19 @@ async function drainOutbox(pool, handler, limit = 5) {
   // and the final answer claimed together could post final-first.
   rows.sort((a, b) => Number(a.id) - Number(b.id));
 
+  // A job's own later rows (an increment, then that same job's final) must
+  // still go out in order, so one failure has to stop THAT job's remaining
+  // rows in this batch. It must not stop everyone else's: this used to
+  // `break` the whole batch on the first failure, so a single stuck row --
+  // one bad channel, one malformed entry -- silently consumed every other
+  // job's attempts each cycle without their handler ever running once,
+  // until they hit OUTBOX_MAX_ATTEMPTS and were dropped having never
+  // actually been tried. A final answer stuck behind someone else's broken
+  // increment would never have gone out at all.
   let posted = 0;
+  const blockedLogIds = new Set();
   for (const r of rows) {
+    if (r.log_id != null && blockedLogIds.has(r.log_id)) continue;
     try {
       await handler(r);
       await pool.query("UPDATE data_boy_outbox SET posted_at = NOW() WHERE id = $1", [r.id]);
@@ -328,9 +339,7 @@ async function drainOutbox(pool, handler, limit = 5) {
         `outbox ${r.id} (${r.kind}) failed to post: ${err.message}` +
         (left > 0 ? ` -- ${left} attempt(s) left` : " -- giving up")
       );
-      // Stop the batch: the next rows are probably for the same channel, and
-      // posting them now would reorder them ahead of this one.
-      break;
+      if (r.log_id != null) blockedLogIds.add(r.log_id);
     }
   }
   return posted;

@@ -31,6 +31,16 @@ function capacityFinalMessage(provider) {
   return `${providerName(provider)} is still cucking data boy (｡•̀ ⤙ •́ ｡ꐦ)... try again in a few minutes.`;
 }
 
+// A bare .includes('401') matches inside "port 4010" or a timestamp just as
+// happily as inside "401 Unauthorized" -- confirmed as a real
+// misclassification, not a hypothetical one. \b works here because digits
+// count as word characters: \b401\b matches "401" in "401 Unauthorized" (a
+// space is a boundary) but not the same three characters inside "4010" (no
+// boundary between the "1" and the "0" that follows it).
+function hasCode(msg, code) {
+  return new RegExp('\\b' + code + '\\b').test(msg);
+}
+
 // Recognize the family of "the upstream is overloaded, your retries won't
 // help, fail fast" errors. Matches messages emitted by both the Vercel AI
 // SDK wrapper and the underlying Gemini / Anthropic transports.
@@ -52,10 +62,11 @@ function isCapacityError(err) {
     msg.includes('overloaded') ||
     msg.includes('resource exhausted') ||
     msg.includes('unavailable') ||
-    msg.includes('503') ||
-    msg.includes('529') ||
-    msg.includes('429') ||
+    hasCode(msg, '503') ||
+    hasCode(msg, '529') ||
+    hasCode(msg, '429') ||
     msg.includes('rate limit') ||
+    msg.includes('rate_limit') ||   // Anthropic's actual JSON error type is rate_limit_error
     msg.includes('quota')
   );
 }
@@ -70,8 +81,8 @@ function isAuthError(err) {
   if (err && (err.apiErrorStatus === 401 || err.apiErrorStatus === 403)) return true;
   const msg = String(err && err.message || err || '').toLowerCase();
   return (
-    msg.includes('401') ||
-    msg.includes('403') ||
+    hasCode(msg, '401') ||
+    hasCode(msg, '403') ||
     msg.includes('forbidden') ||
     msg.includes('unauthorized') ||
     msg.includes('invalid api key') ||

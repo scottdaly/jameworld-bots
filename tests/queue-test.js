@@ -194,7 +194,8 @@ async function newJob(pool, opts = {}) {
       "SELECT posted_at, attempts FROM data_boy_outbox ORDER BY id LIMIT 1")).rows[0];
     check("a failed post is not marked posted", row.posted_at === null);
     check("and its attempt is counted", row.attempts === 1);
-    check("the batch stops rather than reordering past the failure", tries === 1, `tries=${tries}`);
+    check("a later row for the SAME job is not reordered ahead of the failure",
+      tries === 1, `tries=${tries}`);
 
     // it comes back once the claim ages out, and eventually gives up
     await pool.query("UPDATE data_boy_outbox SET claimed_at = NOW() - INTERVAL '3 minutes'");
@@ -206,6 +207,34 @@ async function newJob(pool, opts = {}) {
     let afterGiveUp = 0;
     await jobs.drainOutbox(pool, async () => { afterGiveUp++; });
     check("a message is not retried forever", afterGiveUp === 0);
+
+    // one job's persistently failing row must not starve every OTHER job's
+    // rows of ever being attempted at all -- the original bug: the whole
+    // batch broke on the first failure, so unrelated jobs' rows sat claimed
+    // (their attempts already incremented) but never once actually posted,
+    // marching toward the attempt limit having never really been tried.
+    await pool.query("DELETE FROM data_boy_outbox");
+    await jobs.pushOutbox(pool, { logId: 9001, channelId: "c", kind: "final", text: "job A, will fail" });
+    await jobs.pushOutbox(pool, { logId: 9002, channelId: "c", kind: "final", text: "job B, should still run" });
+    await jobs.pushOutbox(pool, { logId: 9003, channelId: "c", kind: "final", text: "job C, should still run" });
+    const attemptedFor = [];
+    const posted = await jobs.drainOutbox(pool, async (r) => {
+      attemptedFor.push(r.log_id);
+      if (String(r.log_id) === "9001") throw new Error("job A is stuck");
+    });
+    check("job A's failure did not stop job B and C from being attempted",
+      attemptedFor.map(String).includes("9002") && attemptedFor.map(String).includes("9003"),
+      JSON.stringify(attemptedFor));
+    check("the two unrelated jobs' rows actually posted despite job A failing",
+      posted === 2, `posted=${posted}`);
+    const remaining = (await pool.query(
+      "SELECT log_id, posted_at IS NOT NULL AS posted FROM data_boy_outbox ORDER BY log_id"
+    )).rows;
+    check("only job A's row is left unposted; B and C are done",
+      remaining.length === 3 &&
+      String(remaining[0].log_id) === "9001" && remaining[0].posted === false &&
+      remaining.slice(1).every((r) => r.posted === true),
+      JSON.stringify(remaining));
 
     // -- 8. jobs nothing can finish get a dead letter -------------------------
     await pool.query("UPDATE data_boy_logs SET job_status = NULL");
