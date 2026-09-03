@@ -5,7 +5,7 @@
 // stashAttachments() entry point, against a real local HTTP server standing
 // in for Discord's CDN, using the real curl the shipped code shells out to.
 process.env.TOASTER_MAX_IMAGE_BYTES = "500";   // small, so "big" is trivial to trigger
-process.env.TOASTER_MAX_IMAGES = "2";          // small, so the cap is trivial to trigger
+process.env.TOASTER_MAX_IMAGES = "4";          // room for both bad ones plus two good, below
 
 const http = require("http");
 const fs = require("fs");
@@ -22,7 +22,13 @@ function check(name, cond, extra) {
 const GOOD = Buffer.from("not really a png but nothing parses it, only measures it");
 const BIG = Buffer.alloc(600, 1);  // exceeds the 500-byte cap above
 
+// Every request is logged so the test can prove rejection actually ran,
+// not merely that a name is absent from the result -- absence alone does
+// not distinguish "downloaded and rejected" from "never even requested",
+// which is exactly the gap a slice-before-validate bug would hide.
+const requested = [];
 const server = http.createServer((req, res) => {
+  requested.push(req.url);
   if (req.url === "/good1.png") return res.end(GOOD);
   if (req.url === "/good2.png") return res.end(GOOD);
   if (req.url === "/good3.png") return res.end(GOOD);   // to prove the cap trims it
@@ -37,23 +43,37 @@ const server = http.createServer((req, res) => {
   const base = `http://127.0.0.1:${port}`;
   const workDir = path.join(os.tmpdir(), "toaster-imgtest-" + Date.now());
 
-  // -- everything at once: two accepted, one over-cap in bytes, one 404, one
-  //    trimmed by the count cap, one non-image ignored entirely -------------
+  // The bad ones go FIRST and within the cap (4), so validation actually
+  // runs on them instead of them being sliced off before a download is ever
+  // attempted -- which is what let the previous ordering pass without really
+  // exercising rejection at all. good3 alone sits past the cap, to prove
+  // trimming independently of validation.
   const atts = [
+    // No claimed size: saveImageAttachments rejects on the CLAIMED size
+    // first, without downloading, when the caller supplies one that already
+    // exceeds the cap -- a real and separate check, but not the one this
+    // case means to exercise. Omitting it forces the download to actually
+    // happen, so this hits the post-download byte-count check instead.
+    { name: "big.png", url: `${base}/big.png`, contentType: "image/png" },
+    { name: "gone.png", url: `${base}/gone.png`, size: 10, contentType: "image/png" },
     { name: "good1.png", url: `${base}/good1.png`, size: GOOD.length, contentType: "image/png" },
     { name: "good2.png", url: `${base}/good2.png`, size: GOOD.length, contentType: "image/png" },
-    { name: "good3.png", url: `${base}/good3.png`, size: GOOD.length, contentType: "image/png" }, // cap=2
-    { name: "big.png", url: `${base}/big.png`, size: BIG.length, contentType: "image/png" },
-    { name: "gone.png", url: `${base}/gone.png`, size: 10, contentType: "image/png" },
+    { name: "good3.png", url: `${base}/good3.png`, size: GOOD.length, contentType: "image/png" }, // past cap=4
     { name: "notes.txt", url: `${base}/good1.png`, size: 4, contentType: "text/plain" },
   ];
 
   const stash = await stashAttachments(workDir, atts);
   check("stashAttachments returns an images array", stash && Array.isArray(stash.images),
     JSON.stringify(stash));
-  check("the count cap (2) is honoured even though 3 good images were offered",
+  check("exactly the two good images within the cap were kept",
     stash.images.length === 2, `got ${stash.images && stash.images.length}`);
   check("no audio stash when nothing audio was attached", stash.audio === null);
+  check("the oversize image was actually downloaded and THEN rejected on real bytes, not just absent",
+    requested.includes("/big.png"), requested.join(","));
+  check("the 404 was actually requested and THEN rejected, not just absent",
+    requested.includes("/gone.png"), requested.join(","));
+  check("the image past the count cap was never requested at all",
+    !requested.includes("/good3.png"), requested.join(","));
 
   for (const s of stash.images) {
     check(`kept file exists on disk: ${s.name}`, fs.existsSync(s.path));

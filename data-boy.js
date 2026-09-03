@@ -925,6 +925,9 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
   let inputTokens = 0;
   let outputTokens = 0;
   let status = null;
+  let isErrorResult = false;
+  let apiErrorStatus = null;
+  let sdkErrors = [];
 
   const onActivity = opts.onActivity || null;
   let liveTurns = 0;
@@ -1002,22 +1005,50 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
       turns = msg.num_turns ?? turns;
       inputTokens = msg.usage?.input_tokens ?? inputTokens;
       outputTokens = msg.usage?.output_tokens ?? outputTokens;
-      // subtype: "success" | "error_max_turns" | "error_during_execution".
-      // This is what tells an empty answer caused by turn exhaustion apart
-      // from the model genuinely returning nothing — the single most useful
-      // field for debugging "(Data Boy returned no answer.)".
+      // subtype union, confirmed against the installed package's own
+      // sdk.d.ts (SDKResultMessage = SDKResultSuccess | SDKResultError):
+      // "success" | "error_during_execution" | "error_max_turns" |
+      // "error_max_budget_usd" | "error_max_structured_output_retries".
+      // error_max_turns is deliberately not treated as a failure below --
+      // callers already read it as "ran out of turns", a legitimate outcome
+      // gates decide on, not something to retry.
       status = msg.subtype ?? status;
+      // The field that matters most and is easy to miss: is_error can be
+      // true even when subtype is "success". On that combination `result`
+      // (== resultText, above) IS the API's error text, not a real answer --
+      // returning it as one would have posted an error message to Discord
+      // captioned as if the agent wrote it.
+      isErrorResult = msg.is_error === true;
+      // Both confirmed real, and both absent on the success arm except
+      // api_error_status: the error arm alone carries `errors: string[]`.
+      apiErrorStatus = msg.api_error_status ?? apiErrorStatus;
+      if (Array.isArray(msg.errors) && msg.errors.length) sdkErrors = msg.errors;
     }
   }
 
-  if (status === "error_during_execution") {
-    // A graceful stream, not a thrown exception -- so without this, an
-    // upstream outage or a rejected credential came back as a normally
-    // completed call with an empty answer, and every caller reads "empty
-    // answer" as "the model looked at this and had nothing to add". Those
-    // are not the same thing, and only one of them is worth retrying.
-    const detail = (resultText || lastAssistantText || stderrBuf || "").trim();
-    throw new Error(detail || "execution error with no diagnostic output");
+  const failed =
+    isErrorResult ||
+    status === "error_during_execution" ||
+    status === "error_max_budget_usd" ||
+    status === "error_max_structured_output_retries";
+  if (failed) {
+    // Prefer the SDK's own structured account of what went wrong over
+    // anything scraped from text: api_error_status alone is enough for
+    // isCapacityError/isAuthError below to classify correctly without
+    // guessing at substrings.
+    const parts = [];
+    if (apiErrorStatus != null) parts.push(`API error ${apiErrorStatus}`);
+    if (sdkErrors.length) parts.push(sdkErrors.join("; "));
+    if (resultText) parts.push(resultText);           // the is_error-on-success case
+    if (!parts.length && lastAssistantText) parts.push(lastAssistantText);
+    if (!parts.length && stderrBuf) parts.push(stderrBuf);
+    const e = new Error(parts.join(" - ").trim() || "execution error with no diagnostic output");
+    e.apiErrorStatus = apiErrorStatus;
+    // A failed call still burned real turns and tokens; without carrying
+    // them the retry loop's usage accounting silently drops whatever this
+    // attempt cost before throwing it away.
+    e.partialUsage = { turns, inputTokens, outputTokens };
+    throw e;
   }
 
   return {
@@ -1707,16 +1738,30 @@ discord.on("messageCreate", async (message) => {
     }
 
     if (route === "feature") {
+      const inlineAtts = [...message.attachments.values()].map((a) => ({
+        name: a.name, url: a.url, size: a.size, contentType: a.contentType,
+      }));
+      // Fetched once, up front, and threaded through every increment below
+      // via o.imageStash/o.audioStash -- without this each increment's own
+      // runFeature() call fetched (and then deleted) its own copy, so a
+      // multi-step request kept re-downloading the same attachment from a
+      // Discord URL that gets closer to expiring each time. This is the
+      // split path's fallback; TOASTER_SPLIT normally handles the live case.
+      let inlineStash = null;
+      if (inlineAtts.length) {
+        try {
+          inlineStash = await stashAttachments(workDir, inlineAtts);
+        } catch (e) {
+          console.warn(`could not stash attachment for ${logRowId}: ${e.message}`);
+        }
+      }
       const fr = await runFeatureEpic({
         request: question,
         // Discord CDN links expire, so the module downloads these immediately
         // rather than handing the agent a URL that may be dead by then.
-        attachments: [...message.attachments.values()].map((a) => ({
-          name: a.name,
-          url: a.url,
-          size: a.size,
-          contentType: a.contentType,
-        })),
+        attachments: inlineAtts,
+        audioStash: inlineStash && inlineStash.audio,
+        imageStash: inlineStash && inlineStash.images,
         workDir,
         answer,
         systemPrompt,
@@ -1854,6 +1899,11 @@ ${fr.url}` : fr.text,
       // was ever deleting it -- they had been piling up since epics shipped.
       fs.rmSync(workDir, { recursive: true, force: true });
       fs.rmSync(workDir + "-plan", { recursive: true, force: true });
+      // Fetched at the top of the feature branch above, at the same level as
+      // workDir itself -- nothing inside runFeatureEpic owns this one, so
+      // nothing inside it retires it either. This is the only place that can.
+      fs.rmSync(workDir + ".audio", { force: true });
+      fs.rmSync(workDir + ".images", { recursive: true, force: true });
     }
   }
 });
@@ -2293,25 +2343,47 @@ async function runWorkerLoop() {
       } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
       await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
     } finally {
-      // Fenced or not, complete() is predicated on ownership, so this can only
-      // ever close a job this worker still holds.
-      try { await jobs.complete(adminPool, row.id, fenceOf(row)); }
+      // complete() is predicated on ownership: it only succeeds if this
+      // worker's fence still matches the row. Its return value is therefore
+      // also the answer to "is it safe to delete the shared files below" --
+      // a fenced-out worker that fell through to here anyway (loseFence logs
+      // and keeps running rather than aborting mid-build) must not touch a
+      // checkout the reclaiming worker may already be writing to. This used
+      // to delete unconditionally: same path, same ".audio"/".images"
+      // siblings, no ownership check at all, so a worker that lost its lease
+      // could erase the new owner's live clone and stashes out from under it.
+      let stillOwned = false;
+      try { stillOwned = await jobs.complete(adminPool, row.id, fenceOf(row)); }
       catch (e) { console.error(`[worker] could not release ${row.id}: ${e.message}`); }
-      // Nobody else will. The gateway used to delete this in its own finally,
-      // but a handed-off job returns from that handler before the work has
-      // even started -- so without this the clone sits on the volume forever,
-      // one full checkout of the game per request. Safe here: the previews
-      // worth keeping were copied out to post-*.png above.
-      try {
-        const wd = path.join(WORK_ROOT, String(row.discord_message_id));
-        fs.rmSync(wd, { recursive: true, force: true });
-        fs.rmSync(wd + "-plan", { recursive: true, force: true });
-        // runFeature only retires a stash it created itself, and this one came
-        // from the gateway -- so nobody else is going to remove it.
-        fs.rmSync(wd + ".audio", { force: true });
-        fs.rmSync(wd + ".images", { recursive: true, force: true });
-      } catch (e) {
-        console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);
+
+      if (stillOwned) {
+        // Nobody else will. The gateway used to delete this in its own
+        // finally, but a handed-off job returns from that handler before the
+        // work has even started -- so without this the clone sits on the
+        // volume forever, one full checkout of the game per request. Safe
+        // here specifically because stillOwned just proved no other worker
+        // holds this row. The previews worth keeping were copied out to
+        // post-*.png above.
+        try {
+          const wd = path.join(WORK_ROOT, String(row.discord_message_id));
+          fs.rmSync(wd, { recursive: true, force: true });
+          fs.rmSync(wd + "-plan", { recursive: true, force: true });
+          // runFeature only retires a stash it created itself, and this one
+          // came from the gateway -- so nobody else is going to remove it.
+          fs.rmSync(wd + ".audio", { force: true });
+          fs.rmSync(wd + ".images", { recursive: true, force: true });
+        } catch (e) {
+          console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);
+        }
+      } else {
+        // stillOwned is false either because another worker's fence now
+        // matches instead of ours, or because the release query itself
+        // failed -- fenced (runQueuedJob's own flag) is not in scope here,
+        // and does not need to be: not proven safe is reason enough to skip.
+        console.warn(
+          `[worker] job ${row.id}: not confirmed still ours; leaving its ` +
+          "checkout and stashes alone rather than risk deleting a live clone."
+        );
       }
       workerJobs.delete(row.id);
     }

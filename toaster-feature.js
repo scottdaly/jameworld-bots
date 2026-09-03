@@ -208,9 +208,22 @@ async function saveImageAttachments(workDir, attachments, stash) {
   const dir = workDir + ".images";
 
   // Already fetched by an earlier attempt at this same job. Reuse rather than
-  // re-fetching from Discord, whose CDN links expire.
-  if (Array.isArray(stash) && stash.length && stash.every((s) => fs.existsSync(s.path))) {
-    return { saved: stash.map((s) => s.name), stash };
+  // re-fetching from Discord, whose CDN links expire -- and keep whichever
+  // stashed files still exist even if not all of them do, rather than
+  // discarding every still-valid copy because one sibling went missing and
+  // re-requesting all of them from URLs that may by now be dead.
+  if (Array.isArray(stash) && stash.length) {
+    const surviving = stash.filter((s) => fs.existsSync(s.path));
+    if (surviving.length) {
+      if (surviving.length < stash.length) {
+        console.warn(
+          `[toaster] ${stash.length - surviving.length} of ${stash.length} stashed ` +
+          "image(s) went missing; keeping the rest rather than re-fetching everything"
+        );
+      }
+      return { saved: surviving.map((s) => s.name), stash: surviving };
+    }
+    // nothing survived -- fall through to a fresh fetch
   }
 
   const candidates = (attachments || [])
@@ -476,48 +489,55 @@ async function runFeatureOnce(o) {
   let lastAgentText = "";
   let lastBuildError = "";
 
-  for (let attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
-    const audioNote = audio.saved
-      ? `
+  // Constant for the whole call, built once rather than per attempt -- and
+  // (a real gap this closes) now included on EVERY attempt's prompt, not
+  // just the first. Each answer() call is a fresh, memoryless agent
+  // invocation -- a build-fix or capacity retry has no memory of attempt 1's
+  // conversation, so without repeating these it silently forgot an attached
+  // screenshot or audio track existed at all past the first try.
+  const audioNote = audio.saved
+    ? `
 
 The user attached "${audio.saved}". It is already saved in the ` +
-        `checkout at ${audio.rel} and the page already plays whatever track is ` +
-        `there (see web/index.html and web/boot.js) -- playback, the mute ` +
-        `control and the autoplay unlock are all done. You do not need to ` +
-        `change main.c or write any audio code. Confirm the file is in ` +
-        `place and say so; only touch the page if the request asks for more ` +
-        `than background music.`
-      : audio.skipped
-        ? `
+      `checkout at ${audio.rel} and the page already plays whatever track is ` +
+      `there (see web/index.html and web/boot.js) -- playback, the mute ` +
+      `control and the autoplay unlock are all done. You do not need to ` +
+      `change main.c or write any audio code. Confirm the file is in ` +
+      `place and say so; only touch the page if the request asks for more ` +
+      `than background music.`
+    : audio.skipped
+      ? `
 
 Note: an attached audio file was not used -- ${audio.skipped}.`
-        : "";
-
-    const imageNote = images.saved && images.saved.length
-      ? "\n\nThe user attached " + images.saved.length +
-        (images.saved.length === 1 ? " image" : " images") +
-        ". Read it with the Read tool before making changes -- it shows what " +
-        "they mean, whether that is a bug, a reference for how something should " +
-        "look, or a part of the game they are pointing at:\n" +
-        images.stash.map((s) => `- ${s.path}`).join("\n")
-      : images.skipped
-        ? `\n\nNote: an attached image was not used -- ${images.skipped}.`
-        : "";
-
-    const redoNote = o.priorConflict
-      ? "\n\nNote: you already wrote this once, but another change landed first " +
-        "and the two could not be merged. The checkout below is current -- their " +
-        "change is already in it. Implement the request again on top of what is " +
-        "there now rather than assuming your earlier version."
       : "";
 
-    const prompt =
-      attempt === 1
-        ? request + audioNote + imageNote + redoNote
-        : `Your last change did not build. Fix it.\n\nThe request was:\n${request}\n\n` +
-          `The build failed with:\n\`\`\`\n${lastBuildError}\n\`\`\`\n\n` +
-          `The working tree still has your edits. Correct them.`;
+  const imageNote = images.saved && images.saved.length
+    ? "\n\nThe user attached " + images.saved.length +
+      (images.saved.length === 1 ? " image" : " images") +
+      ". Read it with the Read tool before making changes -- it shows what " +
+      "they mean, whether that is a bug, a reference for how something should " +
+      "look, or a part of the game they are pointing at:\n" +
+      images.stash.map((s) => `- ${s.path}`).join("\n")
+    : images.skipped
+      ? `\n\nNote: an attached image was not used -- ${images.skipped}.`
+      : "";
 
+  const redoNote = o.priorConflict
+    ? "\n\nNote: you already wrote this once, but another change landed first " +
+      "and the two could not be merged. The checkout below is current -- their " +
+      "change is already in it. Implement the request again on top of what is " +
+      "there now rather than assuming your earlier version."
+    : "";
+
+  // Shared across every build-fix attempt in this call, not reset per
+  // attempt -- three build-fix cycles used to each get their own fresh 50s
+  // capacity budget, so a genuine outage could cost up to 150s (300s with a
+  // redo) before this job gave up and said so. Capacity being down is a fact
+  // about the upstream service at a point in time, not about which attempt
+  // is running; the budget should be spent once, not re-granted per retry.
+  let capacityRetries = 0;
+
+  for (let attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
     say(attempt === 1 ? "editing the code…" : `build failed — fixing (attempt ${attempt})…`);
 
     // A capacity blip and an ordinary bug both throw from answer() now (an
@@ -526,9 +546,37 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
     // down). Capacity backs off and retries the same prompt; a credential
     // failure will not fix itself by waiting, so it fails fast instead;
     // anything else reports honestly rather than silently.
+    // A failed call still burned real turns and tokens before it threw --
+    // without folding e.partialUsage in here, that spend vanished from
+    // accounting entirely rather than merely not producing an edit.
+    const addPartialUsage = (e) => {
+      const p = e && e.partialUsage;
+      if (!p) return;
+      usage.turns += p.turns || 0;
+      usage.inputTokens += p.inputTokens || 0;
+      usage.outputTokens += p.outputTokens || 0;
+    };
+
     let res;
-    let capacityRetries = 0;
     for (;;) {
+      // Rebuilt every pass through THIS loop, not once per outer attempt --
+      // capacityRetries changes inside this same loop (the catch below), and
+      // a prompt built before that increment and then resent verbatim on
+      // `continue` would never actually carry the note it was written for.
+      const capacityRetryNote = capacityRetries > 0
+        ? "\n\nNote: an earlier attempt at this exact request was interrupted " +
+          "partway through by a capacity error upstream. The checkout may " +
+          "already carry its partial edits -- check what is actually there " +
+          "before assuming you are starting clean, and finish or correct it " +
+          "rather than redoing it from scratch."
+        : "";
+      const prompt =
+        attempt === 1
+          ? request + audioNote + imageNote + redoNote + capacityRetryNote
+          : `Your last change did not build. Fix it.\n\nThe request was:\n${request}\n\n` +
+            `The build failed with:\n\`\`\`\n${lastBuildError}\n\`\`\`\n\n` +
+            `The working tree still has your edits. Correct them.` +
+            audioNote + imageNote + capacityRetryNote;
       try {
         // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
         // path, which has the file-editing tools this job needs.
@@ -536,6 +584,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
                            { onActivity: o.onActivity });
         break;
       } catch (e) {
+        addPartialUsage(e);
         if (isAuthError(e)) {
           return { ok: false, ...usage, text: authFailureMessage("anthropic") };
         }

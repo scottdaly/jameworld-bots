@@ -34,7 +34,18 @@ function capacityFinalMessage(provider) {
 // Recognize the family of "the upstream is overloaded, your retries won't
 // help, fail fast" errors. Matches messages emitted by both the Vercel AI
 // SDK wrapper and the underlying Gemini / Anthropic transports.
+//
+// The real Anthropic Agent SDK result-message type (verified against the
+// installed package's own sdk.d.ts, not assumed) carries a structured
+// `api_error_status` -- data-boy.js attaches it to the error it throws as
+// `.apiErrorStatus`. That is a far more reliable signal than scanning text,
+// so it is checked first; substring matching stays as the fallback for
+// errors thrown by other code (git, curl, a build failure) that never had a
+// structured status to carry.
 function isCapacityError(err) {
+  if (err && (err.apiErrorStatus === 429 || err.apiErrorStatus === 503 || err.apiErrorStatus === 529)) {
+    return true;
+  }
   const msg = String(err && err.message || err || '').toLowerCase();
   return (
     msg.includes('no capacity available') ||
@@ -56,15 +67,22 @@ function isCapacityError(err) {
 // ordinary bad luck, with nothing anywhere saying "this is systemic, go look
 // at the token" instead of "eh, one job didn't work out".
 function isAuthError(err) {
+  if (err && (err.apiErrorStatus === 401 || err.apiErrorStatus === 403)) return true;
   const msg = String(err && err.message || err || '').toLowerCase();
   return (
     msg.includes('401') ||
+    msg.includes('403') ||
+    msg.includes('forbidden') ||
     msg.includes('unauthorized') ||
     msg.includes('invalid api key') ||
     msg.includes('invalid_api_key') ||
+    msg.includes('access token invalid') ||
+    msg.includes('invalid oauth token') ||
     msg.includes('authentication_error') ||
     msg.includes('could not authenticate') ||
     msg.includes('invalid_grant') ||
+    msg.includes('credentials expired') ||
+    msg.includes('credential has expired') ||
     msg.includes('token has expired') ||
     msg.includes('token expired') ||
     (msg.includes('please run') && msg.includes('login')) ||

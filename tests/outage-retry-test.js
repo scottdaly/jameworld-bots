@@ -120,6 +120,45 @@ function baseOpts(workDir, answer) {
       !r.text.includes("cucking") && !r.text.includes("yeeted"), r.text);
   }
 
+  // -- E: a failed call's usage is not silently dropped when it retries -----
+  {
+    let calls = 0;
+    const workDir = path.join(root, "e");
+    const r = await runFeature(baseOpts(workDir, async () => {
+      calls++;
+      if (calls === 1) {
+        const e = new Error("529 Overloaded");
+        e.partialUsage = { turns: 4, inputTokens: 500, outputTokens: 50 };
+        throw e;
+      }
+      return { text: "done, nothing to change", turns: 2, inputTokens: 100, outputTokens: 20, status: "success" };
+    }));
+    check("usage from a failed-then-retried call is not dropped: turns",
+      r.turns === 6, `turns=${r.turns}`);
+    check("usage from a failed-then-retried call is not dropped: inputTokens",
+      r.inputTokens === 600, `inputTokens=${r.inputTokens}`);
+    check("usage from a failed-then-retried call is not dropped: outputTokens",
+      r.outputTokens === 70, `outputTokens=${r.outputTokens}`);
+  }
+
+  // -- F: the retried prompt warns about a possibly-partial checkout --------
+  {
+    let calls = 0;
+    const prompts = [];
+    const workDir = path.join(root, "f");
+    await runFeature(baseOpts(workDir, async (prompt) => {
+      calls++;
+      prompts.push(prompt);
+      if (calls === 1) throw new Error("429 rate_limit_error");
+      return { text: "ok", turns: 1, status: "success" };
+    }));
+    check("first attempt's prompt carries no partial-work warning",
+      !prompts[0].includes("interrupted partway through"));
+    check("the retried prompt tells the fresh agent it may be continuing partial work",
+      calls === 2 && prompts[1].includes("interrupted partway through"),
+      `calls=${calls}`);
+  }
+
   fs.rmSync(root, { recursive: true, force: true });
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exitCode = fail ? 1 : 0;

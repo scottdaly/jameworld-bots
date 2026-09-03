@@ -79,9 +79,10 @@ is already implemented, say so and change nothing.
 
 ## Hard rules
 
-- **No new files.** The four files above are all there is -- `main.c`,
-  `sprites.c`, `save.c`, and their headers. Add to one of them; don't create
-  a new source file or module.
+- **No new files.** The source files from step 1 above are all there is --
+  `main.c`, `sprites.c`, `save.c`, and the headers `city.h`/`sprites.h`/
+  `save.h`/`sim.h`. Add to one of them; don't create a new source file or
+  module.
 - **All art is generated in code.** No image files, no external assets, ever.
 - **No network calls.** The page runs under `connect-src 'self'`.
 - **Never touch `frame_step()`'s contract.** The browser drives it one frame at
