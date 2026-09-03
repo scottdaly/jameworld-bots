@@ -90,6 +90,9 @@ function check(name, cond, extra) {
     /never a/.test(seen.prompt) && /new build system/.test(seen.prompt));
   check("prompt forbids editing the throwaway checkout",
     /Do not edit any file here/.test(seen.prompt));
+  check("prompt says a revert is one step, taken from git history, and polish keeps it",
+    /revert, restore/.test(seen.prompt) && /git revert/.test(seen.prompt) &&
+    /keep the restored version/.test(seen.prompt));
   check("system prompt says read, do not edit, JSON only",
     /edit nothing/.test(seen.systemPrompt) && /JSON only/.test(seen.systemPrompt));
   check("the plan came back parsed", r && r.plan && r.plan.length === 2,
