@@ -90,6 +90,11 @@ services:
       - TOASTER_REPO=github-push:scottdaly/toaster-city.git
       - TOASTER_DEPLOY_HOST=toaster-deploy
       - TOASTER_SITE_URL=https://city.rsdaly.com
+      # An epic (a request the planner splits into up to four steps) may run
+      # this long in total. A real step on the real game is about fifteen
+      # minutes, so the old 45-minute default lost the last step of every
+      # four-step plan to the clock. The turn budget stays as the cost guard.
+      - TOASTER_EPIC_MS=5400000
       # Set to 1 in .env to send feature requests to the worker instead of
       # running them in the gateway. Off means today's behaviour exactly.
       - TOASTER_SPLIT=${TOASTER_SPLIT:-}
