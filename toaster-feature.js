@@ -565,6 +565,19 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       "there now rather than assuming your earlier version."
     : "";
 
+  const continuationNote = o.continuation
+    ? "\n\nThis is a continuation of Data Boy job #" + o.continuation.sourceJobId + ". " +
+      "Start from the current main checkout in front of you. " +
+      (o.continuation.sourceBranch
+        ? "The previous attempt is preserved at `origin/" + o.continuation.sourceBranch +
+          "`; inspect its commits and diff for useful completed work, but do not blindly " +
+          "merge or cherry-pick it because main has moved. Port only what is still needed. "
+        : "No saved branch was recorded, so use the original request and current tree as the source of truth. ") +
+      (o.continuation.direction
+        ? "The user's new direction is: " + o.continuation.direction
+        : "Finish the remaining work from the original request.")
+    : "";
+
   // Shared across every build-fix attempt in this call, not reset per
   // attempt -- three build-fix cycles used to each get their own fresh 50s
   // capacity budget, so a genuine outage could cost up to 150s (300s with a
@@ -608,11 +621,11 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
         : "";
       const prompt =
         attempt === 1
-          ? request + audioNote + imageNote + redoNote + capacityRetryNote
+          ? request + audioNote + imageNote + redoNote + continuationNote + capacityRetryNote
           : `Your last change did not build. Fix it.\n\nThe request was:\n${request}\n\n` +
             `The build failed with:\n\`\`\`\n${lastBuildError}\n\`\`\`\n\n` +
             `The working tree still has your edits. Correct them.` +
-            audioNote + imageNote + capacityRetryNote;
+            audioNote + imageNote + continuationNote + capacityRetryNote;
       try {
         // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
         // path, which has the file-editing tools this job needs.
@@ -682,7 +695,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
     // Everything from here to publication touches shared state -- the shared
     // build checkout, origin/main, and the live symlink. One job at a time.
     say("building...");
-    const outcome = await withIntegrationLock(async () => {
+    const integrateAndPublish = async () => {
       // Last look before shared state. Past this point a cancel is honoured
       // only between gate and merge -- never between merge and publish,
       // where stopping would leave main and the site disagreeing.
@@ -734,7 +747,10 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
         }
       }
       return { stage: "done", shot: gotShot };
-    });
+    };
+    const outcome = o.integrationLocked
+      ? await integrateAndPublish()
+      : await withIntegrationLock(integrateAndPublish);
 
     // Someone else landed while this was being written. Do the work again on
     // top of theirs rather than handing back a branch and asking a person to
@@ -743,14 +759,21 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
     if (outcome.stage === "merge" && outcome.conflict && (o.redo || 0) < MAX_REDOS) {
       say("someone landed first - rebuilding on top of their change...");
       console.log(`[toaster] ${branch}: rebasing conflicted, redoing against new main`);
-      const again = await runFeature(
+      const redo = () => runFeature(
         Object.assign({}, o, {
           redo: (o.redo || 0) + 1,
           priorConflict: outcome.reason,
+          integrationLocked: true,
           audioStash: audio.stash,   // the URL it came from may be dead by now
           imageStash: images.stash,
         })
       );
+      // The first retry used to go back into the ordinary editing pool. A
+      // second job could therefore land while it was rebuilding and make the
+      // exact same request lose twice. Hold the integration lane from the
+      // fresh clone through publish: other agents may keep editing, but none
+      // can move main underneath this semantic redo.
+      const again = o.integrationLocked ? await redo() : await withIntegrationLock(redo);
       // The first attempt's tokens were still spent; do not report them as free.
       return Object.assign({}, again, {
         turns: (again.turns || 0) + usage.turns,
@@ -949,9 +972,19 @@ const PLAN_PROMPT = [
 
 /** Ask for a plan. Any doubt at all falls back to a single increment. */
 async function planIncrements(o) {
-  const res = await planAsk(o);
-  if (!res) return { plan: null, usage: { turns: 0, inputTokens: 0, outputTokens: 0 } };
-  return parsePlan(res);
+  const phase = async (name) => {
+    if (typeof o.onPhase !== "function") return;
+    try { await o.onPhase(name); }
+    catch (e) { console.warn(`[toaster] could not report ${name} phase: ${e.message}`); }
+  };
+  await phase("planning");
+  try {
+    const res = await planAsk(o);
+    if (!res) return { plan: null, usage: { turns: 0, inputTokens: 0, outputTokens: 0 } };
+    return parsePlan(res);
+  } finally {
+    await phase("working");
+  }
 }
 
 /** The provider call on its own, so a provider outage degrades to one job. */
@@ -988,7 +1021,7 @@ async function planAsk(o) {
       // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
       // name, and the request goes to Google asking for a Claude model.
       "anthropic",
-      { abortController: o.abortController }
+      { abortController: o.abortController, onActivity: o.onActivity }
     );
   } catch (e) {
     console.warn("[toaster] planner unavailable, treating as one change:", e.message);

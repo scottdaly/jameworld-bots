@@ -294,6 +294,24 @@ async function newJob(pool, opts = {}) {
         String((await jobs.latestJobFor(pool, "matthan")).id) === String(b));
       check("the reaper leaves cancelled rows alone",
         !(await jobs.reapExhausted(pool)).some((r) => String(r.id) === String(a) || String(r.id) === String(q)));
+
+      await pool.query(
+        `UPDATE data_boy_logs
+            SET question = 'create a full tutorial for a new world',
+                answer = 'Saved on branch \`feat/tutorial\`.',
+                job_state = $2
+          WHERE id = $1`,
+        [a, JSON.stringify({ plan: [{ title: "panel" }, { title: "save" }], shipped: [], step: 0 })]
+      );
+      const byWords = await jobs.findContinuation(pool, "scott", "the tutorial");
+      check("!continue finds a relevant completed/stopped feature job for its asker",
+        byWords.match && String(byWords.match.id) === String(a), JSON.stringify(byWords));
+      const byNumber = await jobs.findContinuation(pool, "matthan", `#${a}`);
+      check("!continue #number resolves exactly even when someone else asked originally",
+        byNumber.match && String(byNumber.match.id) === String(a), JSON.stringify(byNumber));
+      const activeIsExcluded = await jobs.findContinuation(pool, "matthan", `#${b}`);
+      check("!continue refuses to duplicate a job that is still running",
+        activeIsExcluded.match === null, JSON.stringify(activeIsExcluded));
     }
 
     await pool.query("UPDATE data_boy_logs SET job_status = NULL");

@@ -44,13 +44,16 @@ function check(name, cond, extra) {
   const workDir = path.join(root, "job");
   const planDir = workDir + "-plan";
   const seen = {};
+  const phases = [], activity = [];
 
   // -- A: the planner is handed a real checkout, and told not to wipe it ----
   const r = await planIncrements({
     request: "make our game more cool and fun like city skyline",
     workDir,
     model: "claude-opus-5",
-    answer: async (prompt, systemPrompt, model, onProgress, maxTurns, cwd, prepared, provider) => {
+    onPhase: async (phase) => phases.push(phase),
+    onActivity: (what, turn) => activity.push({ what, turn }),
+    answer: async (prompt, systemPrompt, model, onProgress, maxTurns, cwd, prepared, provider, opts) => {
       // Everything is recorded at call time, because the directory is
       // supposed to be gone by the time the call returns.
       seen.prompt = prompt;
@@ -58,10 +61,12 @@ function check(name, cond, extra) {
       seen.cwd = cwd;
       seen.prepared = prepared;
       seen.provider = provider;
+      seen.opts = opts;
       seen.maxTurns = maxTurns;
       seen.files = fs.existsSync(cwd) ? fs.readdirSync(cwd).sort() : null;
       seen.claudeMd = fs.existsSync(path.join(cwd, "CLAUDE.md"))
         ? fs.readFileSync(path.join(cwd, "CLAUDE.md"), "utf8") : null;
+      if (opts && opts.onActivity) opts.onActivity("reading CLAUDE.md", 2);
       return {
         text: JSON.stringify({ increments: [
           { title: "one", request: "add a park tile to main.c" },
@@ -82,6 +87,11 @@ function check(name, cond, extra) {
   check("answer() was told the dir is prepared, so it must not wipe the clone",
     seen.prepared === true, `prepared=${seen.prepared}`);
   check("planner is routed to anthropic explicitly", seen.provider === "anthropic");
+  check("planner forwards live tool activity", activity.length === 1 &&
+    activity[0].what === "reading CLAUDE.md" && activity[0].turn === 2,
+    JSON.stringify(activity));
+  check("planner reports its phase before and after planning",
+    phases.join(",") === "planning,working", phases.join(","));
   check("prompt says the game already exists and the checkout is it",
     /existing/i.test(seen.prompt) && /working directory IS that game/.test(seen.prompt));
   check("prompt tells the planner to read CLAUDE.md before planning",

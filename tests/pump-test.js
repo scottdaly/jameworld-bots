@@ -5,7 +5,10 @@
 // moment a job finishes (not on a poll tick), the first job always starts
 // but a SECOND waits while canStartAnother() says no, and draining stops
 // claims while letting what is running finish.
-const { workerPump, availableMemoryMb } = require("../job-queue.js");
+const {
+  workerPump, availableMemoryMb, progressTimes, chooseContinuation,
+  continuationBranch, continuationResumeState,
+} = require("../job-queue.js");
 
 let pass = 0, fail = 0;
 function check(name, cond, extra) {
@@ -136,6 +139,52 @@ function harness(rowIds) {
   {
     const mb = availableMemoryMb();
     check("availableMemoryMb returns a positive number", Number.isFinite(mb) && mb > 0, `mb=${mb}`);
+  }
+
+  // -- G: progress separates queue delay from actual worker time ------------
+  {
+    const t = progressTimes({ queued_at: 1_000 }, { started_at: 11_000 }, 16_000);
+    check("progress reports time waiting for a worker", t.queuedMs === 10_000, JSON.stringify(t));
+    check("progress reports time actually working", t.workingMs === 5_000, JSON.stringify(t));
+    const old = progressTimes({ queued_at: 1_000 }, {}, 16_000);
+    check("old rows without a start marker keep the legacy elapsed clock",
+      old.queuedMs === 0 && old.workingMs === 15_000, JSON.stringify(old));
+  }
+
+  // -- H: !continue resolves saved work without guessing from Discord chat --
+  {
+    const rows = [
+      { id: 274, question: "create a full tutorial for a new world",
+        answer: "Not shipped. Work is saved on branch `feat/tutorial-old`.",
+        status: "feature_failed", job_payload: { request: "create a full tutorial" },
+        job_state: { plan: [{ title: "panel" }, { title: "save" }], shipped: [], step: 0 } },
+      { id: 270, question: "make roads easier to build", answer: "Done.",
+        status: "success", job_payload: { request: "make roads easier" }, job_state: {} },
+    ];
+    const tutorial = chooseContinuation(rows, "the tutorial");
+    check("continuation words select the relevant prior job",
+      tutorial.match && tutorial.match.id === 274, JSON.stringify(tutorial));
+    check("continuation reads a saved branch from an older prose answer",
+      continuationBranch(rows[0]) === "feat/tutorial-old");
+    const resume = continuationResumeState(rows[0]);
+    check("continuation carries an unfinished multi-step checkpoint",
+      resume && resume.step === 0 && resume.plan.length === 2, JSON.stringify(resume));
+    check("a bare !continue prefers unfinished work",
+      chooseContinuation(rows, "").match.id === 274);
+    check("an unrelated phrase does not silently pick a job",
+      chooseContinuation(rows, "weather balloons").match === null);
+    const chain = [{ id: 277, question: "continue the tutorial",
+      job_payload: { request: "continue tutorial", continuation: {
+        sourceJobId: 274, sourceBranch: "feat/tutorial-old",
+        resumeState: rows[0].job_state,
+      } },
+      job_state: {} }, ...rows];
+    check("matching follows a continuation chain to its newest tip",
+      chooseContinuation(chain, "the tutorial").match.id === 277);
+    check("a continuation chain retains its inherited saved branch",
+      continuationBranch(chain[0]) === "feat/tutorial-old");
+    check("a continuation chain retains its inherited checkpoint",
+      continuationResumeState(chain[0]).plan.length === 2);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

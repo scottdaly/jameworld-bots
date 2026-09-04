@@ -238,6 +238,119 @@ async function latestJobFor(pool, user) {
   return rows[0] || null;
 }
 
+/* A continuation is deliberately resolved from structured job history, not
+ * Discord's short conversation window.  `!continue #123` is exact; a phrase
+ * such as `!continue the tutorial` searches the asker's recent feature jobs.
+ * The returned branch is only a reference for the new agent: continuation
+ * always starts from current main, so an old conflict is never replayed by
+ * blindly merging or cherry-picking it. */
+function continuationBranch(row) {
+  const state = row && row.job_state && typeof row.job_state === 'object'
+    ? row.job_state : {};
+  if (typeof state.branch === 'string' && state.branch.trim()) return state.branch.trim();
+  if (typeof state.source_branch === 'string' && state.source_branch.trim()) {
+    return state.source_branch.trim();
+  }
+  const inherited = row && row.job_payload && row.job_payload.continuation &&
+    row.job_payload.continuation.sourceBranch;
+  if (typeof inherited === 'string' && inherited.trim()) return inherited.trim();
+  const answer = String((row && row.answer) || '');
+  const hit = answer.match(/branch\s+`([^`]+)`/i);
+  return hit ? hit[1].trim() : null;
+}
+
+function continuationResumeState(row) {
+  const state = row && row.job_state && typeof row.job_state === 'object'
+    ? row.job_state : null;
+  const inherited = row && row.job_payload && row.job_payload.continuation &&
+    row.job_payload.continuation.resumeState;
+  const checkpoint = state && Array.isArray(state.plan) ? state : inherited;
+  if (!checkpoint || !Array.isArray(checkpoint.plan) || checkpoint.plan.length < 2) return null;
+  const step = Math.max(0, Number(checkpoint.step) || 0);
+  if (step >= checkpoint.plan.length) return null;
+  return {
+    plan: checkpoint.plan,
+    shipped: Array.isArray(checkpoint.shipped) ? checkpoint.shipped : [],
+    step,
+  };
+}
+
+const CONTINUE_STOP_WORDS = new Set([
+  'a', 'an', 'and', 'build', 'building', 'continue', 'feature', 'finish',
+  'for', 'from', 'it', 'job', 'of', 'on', 'please', 'that', 'the', 'this',
+  'to', 'work', 'working', 'with',
+]);
+
+function continuationWords(text) {
+  return String(text || '').toLowerCase().match(/[a-z0-9]+/g)?.filter(
+    (word) => word.length > 2 && !CONTINUE_STOP_WORDS.has(word)
+  ) || [];
+}
+
+function chooseContinuation(rows, hint) {
+  const candidates = Array.isArray(rows) ? rows : [];
+  if (!candidates.length) return { match: null, ambiguous: [] };
+  const words = [...new Set(continuationWords(hint))];
+  if (!words.length) {
+    const unfinished = candidates.find((row) =>
+      continuationResumeState(row) ||
+      (continuationBranch(row) && !(row.job_state && row.job_state.merged === true)) ||
+      row.status === 'feature_failed' || row.job_status === 'cancelled');
+    return { match: unfinished || candidates[0], ambiguous: [] };
+  }
+
+  const scored = candidates.map((row) => {
+    const haystack = [row.question, row.answer, JSON.stringify(row.job_payload || {}),
+      JSON.stringify(row.job_state || {})].join(' ').toLowerCase();
+    const hayWords = new Set(haystack.match(/[a-z0-9]+/g) || []);
+    let score = words.reduce((n, word) => n + (hayWords.has(word) ? 10 : 0), 0);
+    const phrase = words.join(' ');
+    if (words.length > 1 && haystack.includes(phrase)) score += 15;
+    return { row, score };
+  }).sort((a, b) => b.score - a.score || Number(b.row.id) - Number(a.row.id));
+
+  if (scored[0].score === 0) return { match: null, ambiguous: [] };
+  const tied = scored.filter((x) => x.score === scored[0].score).map((x) => x.row);
+  if (tied.length > 1) {
+    // A continuation naturally repeats all the words from its source. If both
+    // are in the result set, the newer continuation is the tip of that chain,
+    // not an ambiguity that should make the user dig up another number.
+    const tiedIds = new Set(tied.map((row) => Number(row.id)));
+    const chainTip = tied.find((row) => {
+      const from = row.job_payload && row.job_payload.continuation &&
+        Number(row.job_payload.continuation.sourceJobId);
+      return from && tiedIds.has(from);
+    });
+    if (chainTip) return { match: chainTip, ambiguous: [] };
+    return { match: null, ambiguous: tied.slice(0, 3) };
+  }
+  return { match: scored[0].row, ambiguous: [] };
+}
+
+async function findContinuation(pool, user, hint) {
+  const exact = String(hint || '').trim().match(/^#?(\d+)(?:\s+.*)?$/);
+  let rows;
+  if (exact) {
+    ({ rows } = await pool.query(
+      `SELECT id, discord_user, question, answer, status, job_status, job_payload, job_state
+         FROM data_boy_logs
+        WHERE id = $1 AND job_payload IS NOT NULL
+          AND COALESCE(job_status, '') NOT IN ('queued', 'running')`,
+      [Number(exact[1])]
+    ));
+    return { match: rows[0] || null, ambiguous: [] };
+  }
+  ({ rows } = await pool.query(
+    `SELECT id, discord_user, question, answer, status, job_status, job_payload, job_state
+       FROM data_boy_logs
+      WHERE discord_user = $1 AND job_payload IS NOT NULL
+        AND COALESCE(job_status, '') NOT IN ('queued', 'running')
+      ORDER BY id DESC LIMIT 30`,
+    [user]
+  ));
+  return chooseContinuation(rows, hint);
+}
+
 /** Worker side: was the fence lost to a cancel (safe to clean up) or to a re-claim (not)? */
 async function isCancelled(pool, logId) {
   const { rows } = await pool.query(
@@ -520,6 +633,20 @@ function availableMemoryMb() {
   return Math.round(require("os").freemem() / 1048576);
 }
 
+/** Split a running job's clock into time waiting for a worker and time spent
+ *  in the worker. Old rows have no started_at marker, so retain their existing
+ *  behaviour and treat the whole elapsed time as working time. */
+function progressTimes(payload = {}, state = {}, now = Date.now()) {
+  const q = Number(payload.queued_at);
+  const queuedAt = Number.isFinite(q) ? q : now;
+  const s = Number(state.started_at);
+  const startedAt = Number.isFinite(s) && s >= queuedAt ? s : queuedAt;
+  return {
+    workingMs: Math.max(0, now - startedAt),
+    queuedMs: Math.max(0, startedAt - queuedAt),
+  };
+}
+
 /** Rows a gateway should be showing live progress for. */
 async function liveRows(pool) {
   const { rows } = await pool.query(
@@ -536,7 +663,8 @@ module.exports = {
   WORKER_ID, LEASE_MS, HEARTBEAT_MS, MAX_ATTEMPTS, UNCLAIMED_MS,
   WORKER_STALE_MS, WORKER_ANNOUNCE_MS, announce, workersAlive,
   cancelJob, jobRow, latestJobFor, isCancelled,
+  findContinuation, chooseContinuation, continuationBranch, continuationResumeState,
   ensureSchema, enqueue, claimNext, heartbeat, complete, finishJob,
   reapExhausted, pruneOutbox, pushOutbox, drainOutbox, liveRows,
-  workerPump, availableMemoryMb,
+  workerPump, availableMemoryMb, progressTimes,
 };

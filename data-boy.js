@@ -1505,8 +1505,10 @@ discord.on("messageCreate", async (message) => {
   // Bare-prefix feature command, in the same style as !datastats above, so a
   // change request doesn't need an @mention. "@Data Boy feature: ..." still
   // works; both land on the same route.
-  const bang = message.content.trim().match(/^!(?:feature|build)(?:\s+([\s\S]*))?$/i);
-  if (bang && !(bang[1] || "").trim()) {
+  const continueBang = message.content.trim().match(/^!continue(?:\s+([\s\S]*))?$/i);
+  const bang = continueBang ||
+    message.content.trim().match(/^!(?:feature|build)(?:\s+([\s\S]*))?$/i);
+  if (bang && !continueBang && !(bang[1] || "").trim()) {
     // Never leave a bare !feature unanswered -- say what it wants instead.
     await message.reply(
       "Tell me what to change, e.g. `!feature make the night sky purple`. " +
@@ -1537,7 +1539,7 @@ discord.on("messageCreate", async (message) => {
   }
 
   const rawQuestion = bang
-    ? `feature: ${(bang[1] || "").trim()}`
+    ? `feature: ${continueBang ? `continue ${(bang[1] || "").trim()}`.trim() : (bang[1] || "").trim()}`
     : stripMention(message.content, discord.user.id, message);
   // Route BEFORE anything else so an explicit "code:"/"chat:" prefix is
   // stripped before the question reaches logging, context enrichment, or the
@@ -1579,6 +1581,52 @@ discord.on("messageCreate", async (message) => {
     );
     return;
   }
+
+  let continuation = null;
+  if (continueBang) {
+    try {
+      const hint = (continueBang[1] || "").trim();
+      const found = await jobs.findContinuation(adminPool, userTag, hint);
+      if (!found.match) {
+        inFlight.delete(userId);
+        if (found.ambiguous && found.ambiguous.length) {
+          const choices = found.ambiguous.map((row) =>
+            `#${row.id} — ${String(row.question || "feature").slice(0, 90)}`
+          ).join("\n");
+          await message.reply(
+            `I found a few possible jobs:\n${choices}\n\nUse \`!continue #<job number>\` so I grab the right one.`
+          );
+        } else {
+          await message.reply(
+            "I couldn't match that to one of your finished or stopped feature jobs. " +
+              "Use `!continue #<job number>` for an exact match."
+          );
+        }
+        return;
+      }
+      const source = found.match;
+      const branch = jobs.continuationBranch(source);
+      const resumeState = jobs.continuationResumeState(source);
+      const exactHint = hint.match(/^#?\d+\s*(.*)$/);
+      continuation = {
+        sourceJobId: Number(source.id),
+        sourceBranch: branch,
+        originalRequest: source.job_payload?.request || source.question,
+        direction: exactHint ? exactHint[1].trim() : hint,
+        resumeState,
+      };
+    } catch (e) {
+      inFlight.delete(userId);
+      console.error(`[gateway] !continue lookup failed: ${e.message}`);
+      await message.reply(`I couldn't look up the earlier job: ${e.message}`);
+      return;
+    }
+  }
+  const featureRequest = continuation
+    ? `Continue the unfinished work from Data Boy job #${continuation.sourceJobId}.\n\n` +
+      `Original request:\n${continuation.originalRequest}\n\n` +
+      `The user said now:\n${continuation.direction || "Continue and finish the remaining work."}`
+    : question;
 
   // DB-level dedup: atomically claim this Discord message_id. If another
   // invocation already claimed it (uniqueness violation), bail without
@@ -1751,7 +1799,8 @@ discord.on("messageCreate", async (message) => {
       }
 
       await jobs.enqueue(adminPool, logRowId, {
-        request: question,
+        request: featureRequest,
+        continuation,
         attachments: atts,
         audioStash: stash && stash.audio,
         imageStash: stash && stash.images,
@@ -1766,7 +1815,10 @@ discord.on("messageCreate", async (message) => {
       });
       try {
         await placeholder.edit(
-          `Queued as job #${logRowId} — a worker is picking this up. 🛠️\n-# \`!cancel ${logRowId}\` stops it`
+          (continuation
+            ? `Continuing job #${continuation.sourceJobId} as new job #${logRowId} — a worker is picking it up. 🛠️`
+            : `Queued as job #${logRowId} — a worker is picking this up. 🛠️`) +
+          `\n-# \`!cancel ${logRowId}\` stops it`
         );
       } catch {}
       console.log(`Queued feature job (row ${logRowId}) for a worker.`);
@@ -1792,7 +1844,7 @@ discord.on("messageCreate", async (message) => {
         }
       }
       const fr = await runFeatureEpic({
-        request: question,
+        request: featureRequest,
         // Discord CDN links expire, so the module downloads these immediately
         // rather than handing the agent a URL that may be dead by then.
         attachments: inlineAtts,
@@ -1803,6 +1855,8 @@ discord.on("messageCreate", async (message) => {
         systemPrompt,
         model,
         maxTurns,
+        resume: continuation && continuation.resumeState,
+        continuation,
         onProgress: (s) => {
           progressSnippet = s;
           editProgress();
@@ -1810,7 +1864,12 @@ discord.on("messageCreate", async (message) => {
         onActivity,
         // Written after the plan and after every landed increment, so a
         // restart can pick the plan back up instead of losing it.
-        persist: (s) => saveJobState(logRowId, s),
+        persist: (s) => saveJobState(logRowId, continuation
+          ? Object.assign({}, s, {
+              continued_from: continuation.sourceJobId,
+              source_branch: continuation.sourceBranch || null,
+            })
+          : s),
         // Posted between increments of a large request, and awaited: the
         // screenshot lives in the work dir, which the next increment's clone
         // wipes, so it has to be delivered before we move on.
@@ -2242,6 +2301,8 @@ async function runQueuedJob(row) {
   const startedAt = Date.now();
   const payload = row.job_payload && typeof row.job_payload === "object" ? row.job_payload : {};
   const state = row.job_state && typeof row.job_state === "object" ? row.job_state : null;
+  const continuation = payload.continuation && typeof payload.continuation === "object"
+    ? payload.continuation : null;
   const workDir = path.join(WORK_ROOT, String(row.discord_message_id));
   const systemPrompt = await buildSystemPrompt("shallow", "feature");
 
@@ -2269,12 +2330,27 @@ async function runQueuedJob(row) {
     try { abort.abort(); } catch (e) {}
   };
 
-  let snippet = null, activity = null, turn = 0;
+  let snippet = null, activity = null, turn = 0, phase = null;
   const beat = setInterval(() => {
-    jobs.heartbeat(adminPool, row.id, { snippet, activity, turn }, fence)
+    jobs.heartbeat(adminPool, row.id, { snippet, activity, turn, phase, started_at: startedAt }, fence)
       .then((ok) => { if (!ok) loseFence("heartbeat"); })
       .catch((e) => console.warn(`heartbeat failed for ${row.id}: ${e.message}`));
   }, jobs.HEARTBEAT_MS);
+
+  /* Planning can spend minutes reading the checkout before the first coding
+     tool fires. Publish the phase immediately, both for an honest placeholder
+     and to record when this attempt actually left the queue. */
+  const onPhase = async (next) => {
+    phase = next;
+    try {
+      const ok = await jobs.heartbeat(
+        adminPool, row.id, { phase, started_at: startedAt }, fence
+      );
+      if (!ok) loseFence(`phase ${phase}`);
+    } catch (e) {
+      console.warn(`[worker] could not publish ${phase} phase for ${row.id}: ${e.message}`);
+    }
+  };
 
   try {
     console.log(`[worker] job ${row.id} attempt ${row.job_attempts}: ` +
@@ -2292,12 +2368,22 @@ async function runQueuedJob(row) {
       maxTurns: payload.maxTurns || MAX_TURNS_FEATURE,
       // A re-claimed job already has a plan and a shipped list, so picking it
       // back up is the same machinery as recovering one -- nothing extra.
-      resume: state && Array.isArray(state.plan) ? state : null,
+      resume: state && Array.isArray(state.plan)
+        ? state
+        : continuation && continuation.resumeState,
+      continuation,
       persist: async (s) => {
-        if (!(await jobs.heartbeat(adminPool, row.id, s, fence))) loseFence("checkpoint");
+        const checkpoint = continuation
+          ? Object.assign({}, s, {
+              continued_from: continuation.sourceJobId,
+              source_branch: continuation.sourceBranch || null,
+            })
+          : s;
+        if (!(await jobs.heartbeat(adminPool, row.id, checkpoint, fence))) loseFence("checkpoint");
       },
       onProgress: (s) => { snippet = s; },
       onActivity: (what, t) => { activity = what; if (t) turn = t; },
+      onPhase,
       abortController: abort,
       isCancelled: () => fenced,
       onIncrement: async (inc) => {
@@ -2319,6 +2405,15 @@ async function runQueuedJob(row) {
         });
       },
     });
+
+    // Save the branch as structured state. Older jobs can still be continued
+    // because findContinuation also understands the branch in their prose.
+    if (fr.branch && !fenced) {
+      const keptBranch = await jobs.heartbeat(
+        adminPool, row.id, { branch: fr.branch, merged: !!fr.merged }, fence
+      );
+      if (!keptBranch) loseFence("saving branch");
+    }
 
     let keep = null;
     try {
@@ -2363,7 +2458,11 @@ async function runQueuedJob(row) {
       {
         channelId: row.discord_channel_id, replyTo: row.discord_message_id,
         kind: "final",
-        text: fr.ok ? `${fr.text}\n\n${fr.url}` : fr.text,
+        text: fr.ok
+          ? `${fr.text}\n\n${fr.url}`
+          : fr.text + (fr.branch
+              ? `\n\n-# Continue this exact saved work with \`!continue #${row.id}\`.`
+              : ""),
         filePath: keep,
       }
     );
@@ -2552,14 +2651,16 @@ async function refreshQueuedPlaceholders() {
     const payload = r.job_payload || {};
     const st = r.job_state || {};
     if (!payload.placeholder_id || !r.discord_channel_id) continue;
-    const secs = Math.round((Date.now() - (payload.queued_at || Date.now())) / 1000);
-    const clock = secs < 90 ? `${secs}s` : `${Math.floor(secs / 60)}m${secs % 60}s`;
+    const times = jobs.progressTimes(payload, st);
+    const clock = `${ago(times.workingMs)} working` +
+      (times.queuedMs >= 1000 ? ` · ${ago(times.queuedMs)} queued` : "");
+    const verb = st.phase === "planning" ? "planning" : "still thinking";
     const lines = [];
     if (st.snippet) {
-      lines.push(`_(still thinking… ${clock})_`);
+      lines.push(`_(${verb}… ${clock})_`);
       lines.push("> " + String(st.snippet).replace(/\n+/g, " ").slice(0, 300));
     } else {
-      lines.push(`Data Boy is still thinking… (${clock}) 🧠`);
+      lines.push(`Data Boy is ${verb}… (${clock}) 🧠`);
     }
     if (Array.isArray(st.plan) && st.plan.length > 1) {
       // `step` is the index of the increment currently running -- it only
@@ -2572,6 +2673,9 @@ async function refreshQueuedPlaceholders() {
       );
     }
     if (st.activity) lines.push(`-# ${st.activity}${st.turn ? ` · turn ${st.turn}` : ""}`);
+    // The queued placeholder starts with the id, but this refresh replaces
+    // that whole message. Keep the escape hatch visible for the entire run.
+    lines.push(`-# job #${r.id} · \`!cancel ${r.id}\``);
     // Keep !status honest for jobs this process is not running.
     jobNote(r.id, {
       user: r.discord_user || "?", question: r.question,
