@@ -113,8 +113,9 @@ const server = http.createServer((req, res) => {
   ]);
   check("audio attachment is stashed", !!(a1 && a1.audio && a1.audio.name === "beast.mp3"),
     JSON.stringify(a1));
-  check("audio stash lives at the sibling path, outside the checkout",
-    a1.audio.path === workDir2 + ".audio" && fs.existsSync(a1.audio.path), a1.audio.path);
+  check("audio stash lives in a sibling folder, outside the checkout",
+    path.dirname(a1.audio.path) === workDir2 + ".audio" &&
+    fs.existsSync(a1.audio.path), a1.audio.path);
   check("audio stash has the right bytes", fs.readFileSync(a1.audio.path).equals(AUDIO));
   check("audio stash records the real extension and size",
     a1.audio.ext === ".mp3" && a1.audio.bytes === AUDIO.length, JSON.stringify(a1.audio));
@@ -133,7 +134,7 @@ const server = http.createServer((req, res) => {
   ]);
   check("oversize audio was actually requested, then rejected", requested.includes("/huge.mp3"));
   check("oversize audio yields no stash", !a2 || a2.audio === null, JSON.stringify(a2));
-  check("oversize audio leaves no file at the stash path", !fs.existsSync(workDir2 + ".audio"));
+  check("oversize audio leaves no folder at the stash path", !fs.existsSync(workDir2 + ".audio"));
   fs.rmSync(workDir2, { recursive: true, force: true });
 
   // -- the server going away must fail closed, not crash or return a wrong

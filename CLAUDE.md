@@ -41,12 +41,23 @@ Two processes from the same image, chosen by argv:
   promise chain, so **never run two worker containers**.
 - `toaster-feature.js` is the pipeline for one request: clone the game repo
   into `/tmp/data-boy-work/<discord message id>`, optionally plan it into
-  increments (the planner reads a clone of the repo first), run the Claude
-  Agent SDK with `feature-prompt.md`, then `ssh toaster-deploy` (an alias
+  increments (the planner reads a clone of the repo first), run the coding
+  agent with `feature-prompt.md`, then `ssh toaster-deploy` (an alias
   inside the container for dodroplet) to run the game's `deploy.sh "gate
   <ref>"` (all seven gates), merge, `deploy.sh origin/main`, and fetch the
   preview. The agent may leave its own screenshot at
   `<workDir>-scratch/preview.png`; that is what gets posted when present.
+- Feature work defaults to the Codex SDK (`FEATURE_PROVIDER=codex`, model
+  `gpt-5.6-sol`, high reasoning). Normal Data Boy chat is unchanged. Codex
+  can write only in that job's checkout and attachment folders; commands it
+  runs have no bot/database/GitHub secrets and no network. The outer pipeline
+  alone pushes and publishes after the build gates pass.
+  The worker alone has the Docker settings needed to start Codex's inner
+  bubblewrap sandbox. Do not copy those settings to the gateway. The inner
+  sandbox gives each request a private process list, blocks network, and keeps
+  the container read-only outside that job's allowed folders. Its permission
+  profile also hides SSH keys, Gemini login files, cached repos, and sibling
+  jobs completely.
 - `error-classify.js`: capacity (429/503/529) vs auth failures, and the
   jokey user-facing messages. Keep the tone; name the provider that failed.
 
@@ -56,6 +67,9 @@ and reused across retries and re-claims.
 
 ## Running and deploying
 
+- A Codex feature deployment needs `FEATURE_PROVIDER=codex` and
+  `CODEX_API_KEY` in vultr's private `.env`. `bot-deploy.sh` refuses to
+  restart without the key when Codex is selected.
 - Deploy is done **on vultr**, never by copying files:
   ```
   git push origin main
@@ -117,3 +131,11 @@ all seven gates in WSL, pushes, and publishes on dodroplet. Its `CLAUDE.md`
 carries the invariants (no new files, procedural art, keyed saves, the
 world model). The scores API (`toaster-scores` container on dodroplet)
 backs the in-game leaderboard.
+
+## Reusing this for another game bot
+
+Keep one Discord app and one deployment per game. Reuse this image and set
+`GAME_NAME`, `GAME_DESCRIPTION`, `GAME_RULES_FILE`, `GAME_REPO`,
+`GAME_DEPLOY_HOST`, `GAME_SITE_URL`, and `FEATURE_PROMPT_PATH`. Each game
+still needs its own build/deploy rules and its own least-privilege keys; do
+not give one bot a key that can change every game.

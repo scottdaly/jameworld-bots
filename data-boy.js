@@ -63,7 +63,8 @@ const REPLY_CHUNK_LEN = 1900;
 const MAX_TURNS = 30; // shallow default (also the fallback when depth unknown)
 const MAX_TURNS_DEEP = 70;
 
-// MODEL_PROVIDER controls the LLM backend.
+// MODEL_PROVIDER controls Data Boy's normal chat backend. Feature work has a
+// separate provider because it needs a coding agent rather than a chat model.
 //   - "anthropic" uses the Claude Agent SDK over OAuth (Max account).
 //   - "gemini-api" uses the Vercel AI SDK + @ai-sdk/google with a billed
 //     GOOGLE_API_KEY. This is the supported path going forward — the OAuth
@@ -102,6 +103,12 @@ if (!MODELS_BY_PROVIDER[MODEL_PROVIDER]) {
 }
 const MODEL_SHALLOW = MODELS_BY_PROVIDER[MODEL_PROVIDER].shallow;
 const MODEL_DEEP = MODELS_BY_PROVIDER[MODEL_PROVIDER].deep;
+
+const FEATURE_PROVIDER = (process.env.FEATURE_PROVIDER || "codex").toLowerCase();
+if (!['anthropic', 'codex'].includes(FEATURE_PROVIDER)) {
+  console.error(`Unknown FEATURE_PROVIDER=${FEATURE_PROVIDER}. Expected anthropic or codex.`);
+  process.exit(1);
+}
 
 // Capacity backoff, provider-flavored messages, and the auth-vs-capacity-
 // vs-everything-else classification -- shared with toaster-feature.js,
@@ -286,12 +293,24 @@ const CODE_PROMPT_PATH = path.join(__dirname, "code-prompt.md");
 // Feature mode edits real C and must get it compiling, which takes many more
 // steps than answering a question. Ambitious requests are the point, so this is
 // deliberately generous -- the prompt governs reply length, not the turn cap.
-const FEATURE_PROMPT_PATH = path.join(__dirname, "feature-prompt.md");
+const FEATURE_PROMPT_PATH = process.env.FEATURE_PROMPT_PATH ||
+  path.join(__dirname, "feature-prompt.md");
 const MAX_TURNS_FEATURE = Number(process.env.MAX_TURNS_FEATURE || 200);
-// Feature mode always runs on the Anthropic path regardless of
-// MODEL_PROVIDER: editing 1200 lines of C until it compiles is a different
-// job from answering a question, and the global provider serves the latter.
-const FEATURE_MODEL = process.env.FEATURE_MODEL || "claude-opus-5";
+// The game builder is deliberately independent from Data Boy's chat model.
+// Future one-game bots can reuse this setting without inheriting the archive
+// question provider.
+const FEATURE_MODEL = process.env.FEATURE_MODEL ||
+  (FEATURE_PROVIDER === "codex" ? "gpt-5.6-sol" : "claude-opus-5");
+
+// The gateway can share one Compose definition with the worker, but its chat
+// agents must never inherit the coding agent's paid API key. Codex receives it
+// through its own constructor below; every other model subprocess gets a copy
+// of the process environment with that one secret removed.
+function nonCodexAgentEnv() {
+  const env = { ...process.env };
+  delete env.CODEX_API_KEY;
+  return env;
+}
 const MAX_TURNS_CODE = 40;
 const MAX_TURNS_CODE_DEEP = 60;
 // Persistent clone cache (see Dockerfile.data-boy). Survives between questions.
@@ -826,6 +845,10 @@ async function answer(question, systemPrompt, model, onProgress = null, maxTurns
     fs.mkdirSync(workDir, { recursive: true });
   }
 
+  if (provider === "codex") {
+    return answerWithCodex(question, systemPrompt, model, onProgress, workDir, opts);
+  }
+
   // Model and provider arrive as separate arguments, so they can drift apart --
   // and they did: the feature planner passed a Claude model while inheriting the
   // global gemini-api provider, and Google answered "models/claude-opus-5 is not
@@ -852,6 +875,98 @@ async function answer(question, systemPrompt, model, onProgress = null, maxTurns
     return answerWithGeminiApi(question, systemPrompt, model, onProgress, maxTurns, workDir);
   }
   return answerWithAnthropic(question, systemPrompt, model, onProgress, maxTurns, workDir, opts);
+}
+
+/** Run a coding turn without exposing the bot, database, or GitHub secrets to
+ * commands the agent executes. Codex receives its API key, but its shell gets
+ * a fresh, harmless environment and no network. The outer pipeline alone owns
+ * pushing and deployment after the build gates pass. */
+async function answerWithCodex(question, systemPrompt, model, onProgress, workDir, opts = {}) {
+  const apiKey = process.env.CODEX_API_KEY || "";
+  if (!apiKey) throw new Error("CODEX_API_KEY is not set");
+
+  const scratch = workDir + "-scratch";
+  const codexHome = path.join(scratch, "codex-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+
+  const { Codex } = await import("@openai/codex-sdk");
+  const safePath = process.env.PATH ||
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  const shellEnv = {
+    PATH: safePath,
+    HOME: scratch,
+    TMPDIR: scratch,
+    LANG: process.env.LANG || "C.UTF-8",
+  };
+  const codex = new Codex({
+    apiKey,
+    env: { ...shellEnv, CODEX_HOME: codexHome },
+    configOverrides: [
+      'default_permissions="databoygame"',
+      'permissions.databoygame={ extends = ":workspace", filesystem = { ' +
+        '"/root/.ssh" = "deny", "/root/.gemini" = "deny", ' +
+        '"/var/cache/repos" = "deny", "/tmp/data-boy-work" = "deny" } }',
+    ],
+    config: {
+      shell_environment_policy: {
+        inherit: "none",
+        set: shellEnv,
+      },
+    },
+  });
+
+  const extraDirs = [scratch, ...(opts.additionalDirectories || [])]
+    .filter((p, i, all) => p && all.indexOf(p) === i);
+  const thread = codex.startThread({
+    model,
+    modelReasoningEffort: process.env.FEATURE_REASONING_EFFORT || "high",
+    workingDirectory: workDir,
+    additionalDirectories: extraDirs,
+    networkAccessEnabled: false,
+    webSearchMode: "disabled",
+    approvalPolicy: "never",
+    threadSource: "data-boy-game-builder",
+  });
+
+  const input = [{ type: "text", text: `${systemPrompt}\n\n${question}` }];
+  for (const imagePath of opts.localImages || []) {
+    input.push({ type: "local_image", path: imagePath });
+  }
+
+  const streamed = await thread.runStreamed(input, { signal: opts.abortController?.signal });
+  let text = "";
+  let turns = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for await (const event of streamed.events) {
+    if (event.type === "item.completed") {
+      const item = event.item;
+      if (item.type === "agent_message") {
+        text = item.text || text;
+        if (item.text) onProgress?.(item.text);
+      } else if (item.type === "file_change") {
+        const first = item.changes && item.changes[0];
+        opts.onActivity?.(
+          first ? `editing ${baseName(first.path)}` : "editing the game",
+          turns || 1
+        );
+      } else if (item.type === "command_execution") {
+        opts.onActivity?.(describeBash(item.command, ""), turns || 1);
+      } else if (item.type === "error") {
+        opts.onActivity?.("that didn't work - trying another way", turns || 1);
+      }
+    } else if (event.type === "turn.completed") {
+      turns++;
+      inputTokens += event.usage?.input_tokens || 0;
+      outputTokens += event.usage?.output_tokens || 0;
+    } else if (event.type === "turn.failed") {
+      throw new Error(event.error?.message || "Codex turn failed");
+    } else if (event.type === "error") {
+      throw new Error(event.message || "Codex failed");
+    }
+  }
+
+  return { text, turns, inputTokens, outputTokens, status: "success" };
 }
 
 /* ── what the agent is actually doing ──────────────────────────────────────
@@ -976,7 +1091,7 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
         stderrBuf = (stderrBuf + data).slice(-4000);
       },
       env: {
-        ...process.env,
+        ...nonCodexAgentEnv(),
         PGCONN: `postgresql://${encodeURIComponent(process.env.POSTGRES_READONLY_USER)}:${encodeURIComponent(process.env.POSTGRES_READONLY_PASSWORD)}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT}/${process.env.POSTGRES_DB}`,
         CLAUDE_CODE_AUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_AUTH_TOKEN,
         // Read-only GitHub access for code-mode questions. gh reads GH_TOKEN
@@ -1130,7 +1245,7 @@ function bashTimeoutFor(command) {
 
 function buildVercelAiSdkTools(aiTool, workDir) {
   const env = {
-    ...process.env,
+    ...nonCodexAgentEnv(),
     PGCONN: `postgresql://${encodeURIComponent(process.env.POSTGRES_READONLY_USER)}:${encodeURIComponent(process.env.POSTGRES_READONLY_PASSWORD)}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT}/${process.env.POSTGRES_DB}`,
   };
   return {
@@ -1756,6 +1871,7 @@ discord.on("messageCreate", async (message) => {
         audioStash: stash && stash.audio,
         imageStash: stash && stash.images,
         model,
+        provider: FEATURE_PROVIDER,
         maxTurns,
         placeholder_id: placeholder.id,
         queued_at: Date.now(),
@@ -1802,6 +1918,7 @@ discord.on("messageCreate", async (message) => {
         answer,
         systemPrompt,
         model,
+        provider: FEATURE_PROVIDER,
         maxTurns,
         onProgress: (s) => {
           progressSnippet = s;
@@ -1939,7 +2056,7 @@ ${fr.url}` : fr.text,
       // Fetched at the top of the feature branch above, at the same level as
       // workDir itself -- nothing inside runFeatureEpic owns this one, so
       // nothing inside it retires it either. This is the only place that can.
-      fs.rmSync(workDir + ".audio", { force: true });
+      fs.rmSync(workDir + ".audio", { recursive: true, force: true });
       fs.rmSync(workDir + ".images", { recursive: true, force: true });
     }
   }
@@ -2100,6 +2217,7 @@ async function resumeFeatureJob(row, state) {
       attachments: [],           // the originals expired long ago
       workDir, answer, systemPrompt,
       model: FEATURE_MODEL,
+      provider: FEATURE_PROVIDER,
       maxTurns: MAX_TURNS_FEATURE,
       resume: state,
       persist: (s) => saveJobState(row.id, Object.assign({}, s, { resumes: (state.resumes || 0) + 1 })),
@@ -2289,6 +2407,11 @@ async function runQueuedJob(row) {
       answer,
       systemPrompt,
       model: payload.model || FEATURE_MODEL,
+      // Payloads queued by the previous gateway have no provider field. Its
+      // Claude model name is enough to preserve the old route while the two
+      // containers are updated one at a time.
+      provider: payload.provider ||
+        (/^claude-/.test(String(payload.model || "")) ? "anthropic" : FEATURE_PROVIDER),
       maxTurns: payload.maxTurns || MAX_TURNS_FEATURE,
       // A re-claimed job already has a plan and a shipped list, so picking it
       // back up is the same machinery as recovering one -- nothing extra.
@@ -2474,7 +2597,7 @@ async function runClaimedJob(row) {
         fs.rmSync(wd + "-scratch", { recursive: true, force: true });
         // runFeature only retires a stash it created itself, and this one
         // came from the gateway -- so nobody else is going to remove it.
-        fs.rmSync(wd + ".audio", { force: true });
+        fs.rmSync(wd + ".audio", { recursive: true, force: true });
         fs.rmSync(wd + ".images", { recursive: true, force: true });
       } catch (e) {
         console.warn(`[worker] could not clean work dir for ${row.id}: ${e.message}`);

@@ -20,7 +20,12 @@ const CAPACITY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 // it used to say "Google" unconditionally, written back when everything ran
 // through Gemini, and nobody updated it once the feature route started
 // forcing Anthropic. An Opus outage was getting reported as Google's fault.
-const PROVIDER_FLAVOR = { anthropic: 'Anthropic', gemini: 'Google', 'gemini-api': 'Google' };
+const PROVIDER_FLAVOR = {
+  anthropic: 'Anthropic',
+  codex: 'OpenAI',
+  gemini: 'Google',
+  'gemini-api': 'Google',
+};
 function providerName(provider) {
   return PROVIDER_FLAVOR[provider] || 'the model';
 }
@@ -103,6 +108,7 @@ function isAuthError(err) {
 
 const AUTH_HINT = {
   anthropic: 'CLAUDE_CODE_OAUTH_TOKEN needs a human to look at it',
+  codex: 'CODEX_API_KEY needs a human to look at it',
   gemini: 'the Gemini OAuth creds need a human to look at them',
   'gemini-api': 'GOOGLE_API_KEY needs a human to look at it',
 };

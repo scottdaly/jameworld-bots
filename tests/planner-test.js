@@ -49,7 +49,8 @@ function check(name, cond, extra) {
   const r = await planIncrements({
     request: "make our game more cool and fun like city skyline",
     workDir,
-    model: "claude-opus-5",
+    model: "gpt-5.6-sol",
+    provider: "codex",
     answer: async (prompt, systemPrompt, model, onProgress, maxTurns, cwd, prepared, provider) => {
       // Everything is recorded at call time, because the directory is
       // supposed to be gone by the time the call returns.
@@ -81,7 +82,7 @@ function check(name, cond, extra) {
     typeof seen.claudeMd === "string" && seen.claudeMd.includes("Toaster City"));
   check("answer() was told the dir is prepared, so it must not wipe the clone",
     seen.prepared === true, `prepared=${seen.prepared}`);
-  check("planner is routed to anthropic explicitly", seen.provider === "anthropic");
+  check("planner uses the same Codex route as the game work", seen.provider === "codex");
   check("prompt says the game already exists and the checkout is it",
     /existing/i.test(seen.prompt) && /working directory IS that game/.test(seen.prompt));
   check("prompt tells the planner to read CLAUDE.md before planning",

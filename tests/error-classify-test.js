@@ -54,6 +54,7 @@ for (const [msg, wantCap, wantAuth] of cases) {
 // Attribution: the joke's whole point is naming the provider that actually
 // failed, not whichever one the bot happens to default to.
 check("providerName maps anthropic correctly", providerName("anthropic") === "Anthropic");
+check("providerName maps codex correctly", providerName("codex") === "OpenAI");
 check("providerName maps both gemini variants to Google",
   providerName("gemini") === "Google" && providerName("gemini-api") === "Google");
 check("capacity retry message names the given provider, not a hardcoded one",
@@ -63,7 +64,8 @@ check("capacity final message names the given provider",
   capacityFinalMessage("gemini-api").includes("Google"));
 check("auth failure message names the right env var per provider",
   authFailureMessage("anthropic").includes("CLAUDE_CODE_OAUTH_TOKEN") &&
-  authFailureMessage("gemini-api").includes("GOOGLE_API_KEY"));
+  authFailureMessage("gemini-api").includes("GOOGLE_API_KEY") &&
+  authFailureMessage("codex").includes("CODEX_API_KEY"));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

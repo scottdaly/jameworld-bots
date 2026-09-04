@@ -27,9 +27,16 @@ const {
   authFailureMessage,
 } = require("./error-classify.js");
 
-const REPO = process.env.TOASTER_REPO || "github-push:scottdaly/toaster-city.git";
-const DEPLOY_HOST = process.env.TOASTER_DEPLOY_HOST || "toaster-deploy";
-const SITE_URL = process.env.TOASTER_SITE_URL || "https://city.rsdaly.com";
+const GAME_NAME = process.env.GAME_NAME || "Toaster City";
+const GAME_DESCRIPTION = process.env.GAME_DESCRIPTION ||
+  "an existing, working SDL2 isometric city builder in C";
+const GAME_RULES_FILE = process.env.GAME_RULES_FILE || "CLAUDE.md";
+const REPO = process.env.GAME_REPO || process.env.TOASTER_REPO ||
+  "github-push:scottdaly/toaster-city.git";
+const DEPLOY_HOST = process.env.GAME_DEPLOY_HOST ||
+  process.env.TOASTER_DEPLOY_HOST || "toaster-deploy";
+const SITE_URL = process.env.GAME_SITE_URL || process.env.TOASTER_SITE_URL ||
+  "https://city.rsdaly.com";
 
 // Build attempts, not agent turns. If the gates reject the change we hand the
 // compiler error back and let it try again.
@@ -157,22 +164,26 @@ async function saveAudioAttachment(workDir, attachments, stash) {
       };
     }
     const ext = (name.match(AUDIO_EXT) || [".mp3"])[0].toLowerCase();
-    // Outside workDir, so prepareWorkspace cannot wipe it; runFeature deletes
-    // it once the job (including any redo) is finished with it.
-    const dest = workDir + ".audio";
+    // Outside workDir, so prepareWorkspace cannot wipe it; keeping it in its
+    // own directory lets the coding sandbox expose this input without also
+    // exposing every other job beside it.
+    const destDir = workDir + ".audio";
+    fs.rmSync(destDir, { recursive: true, force: true });
+    fs.mkdirSync(destDir, { recursive: true });
+    const dest = path.join(destDir, "input" + ext);
 
     // --fail matters here: without it curl writes the CDN's 403/404 HTML body
     // to the file and still exits 0, and "nonempty" then calls that a track.
     const r = await run("curl", ["-sSL", "--fail", "--max-time", "180", "-o", dest, a.url]);
     const got = r.ok && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
     if (!got) {
-      fs.rmSync(dest, { force: true });
+      fs.rmSync(destDir, { recursive: true, force: true });
       return { skipped: `I could not download ${name}` };
     }
     // a.size above is the caller's claim about the file; this is the file that
     // actually arrived, which is the one that would go into the repo forever.
     if (got > MAX_AUDIO_BYTES) {
-      fs.rmSync(dest, { force: true });
+      fs.rmSync(destDir, { recursive: true, force: true });
       return {
         skipped: `${name} came down as ${(got / 1048576).toFixed(1)}MB and the limit is ` +
           `${(MAX_AUDIO_BYTES / 1048576).toFixed(0)}MB`,
@@ -454,7 +465,7 @@ async function runFeature(o) {
     // Only the attempt that created the stash retires it; a redo is handed one
     // it does not own and whose file the outer attempt still needs afterwards.
     if (!o.audioStash) {
-      try { fs.rmSync(o.workDir + ".audio", { force: true }); } catch (e) {}
+      try { fs.rmSync(o.workDir + ".audio", { recursive: true, force: true }); } catch (e) {}
     }
     if (!o.imageStash) {
       try { fs.rmSync(o.workDir + ".images", { recursive: true, force: true }); } catch (e) {}
@@ -464,6 +475,7 @@ async function runFeature(o) {
 
 async function runFeatureOnce(o) {
   const { request, workDir, answer, systemPrompt, model, maxTurns, onProgress } = o;
+  const provider = o.provider || "anthropic";
   const say = (s) => {
     try {
       onProgress?.(s);
@@ -614,10 +626,21 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
             `The working tree still has your edits. Correct them.` +
             audioNote + imageNote + capacityRetryNote;
       try {
-        // prepared=true keeps our checkout; "anthropic" forces the Agent SDK
-        // path, which has the file-editing tools this job needs.
-        res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, "anthropic",
-                           { onActivity: o.onActivity, abortController: o.abortController });
+        // prepared=true keeps our checkout. The coding agent can see its
+        // attachment and screenshot folders, but not sibling jobs.
+        const extraDirs = [workDir + "-scratch"];
+        if (images.stash && images.stash.length) extraDirs.push(workDir + ".images");
+        if (audio.stash && audio.stash.path) {
+          const audioDir = path.dirname(audio.stash.path);
+          if (audioDir === workDir + ".audio") extraDirs.push(audioDir);
+        }
+        res = await answer(prompt, systemPrompt, model, null, maxTurns, workDir, true, provider,
+                           {
+                             onActivity: o.onActivity,
+                             abortController: o.abortController,
+                             additionalDirectories: extraDirs,
+                             localImages: (images.stash || []).map((s) => s.path),
+                           });
         break;
       } catch (e) {
         addPartialUsage(e);
@@ -625,7 +648,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
         // capacity blip to retry or a bug to report; it is the answer.
         if (cancelled()) return stopped("while editing");
         if (isAuthError(e)) {
-          return { ok: false, ...usage, text: authFailureMessage("anthropic") };
+          return { ok: false, ...usage, text: authFailureMessage(provider) };
         }
         if (isCapacityError(e) && capacityRetries < CAPACITY_RETRY_DELAYS_MS.length) {
           const waitMs = CAPACITY_RETRY_DELAYS_MS[capacityRetries];
@@ -634,7 +657,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
             `[toaster] capacity error (attempt ${capacityRetries}/${CAPACITY_RETRY_DELAYS_MS.length}): ` +
             `${e.message}. Retrying in ${waitMs}ms.`
           );
-          say(capacityRetryMessage("anthropic"));
+          say(capacityRetryMessage(provider));
           await new Promise((r) => setTimeout(r, waitMs));
           continue;
         }
@@ -642,7 +665,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
           ok: false,
           ...usage,
           text: isCapacityError(e)
-            ? capacityFinalMessage("anthropic")
+            ? capacityFinalMessage(provider)
             : `The agent errored out while editing: ${e.message}. Nothing was deployed.`,
         };
       }
@@ -912,10 +935,9 @@ const EPIC_TURN_BUDGET = Number(process.env.TOASTER_EPIC_TURNS || 500);
 const EPIC_MS_BUDGET = Number(process.env.TOASTER_EPIC_MS || 45 * 60 * 1000);
 
 const PLAN_PROMPT = [
-  "You are planning work on Toaster City: an existing, working SDL2 isometric",
-  "city builder in C (main.c, sprites.c, save.c and headers) that is live at",
+  "You are planning work on " + GAME_NAME + ": " + GAME_DESCRIPTION + ", live at",
   SITE_URL + ". The checkout in your working directory IS that game. Read",
-  "CLAUDE.md and enough of the source to know what already exists before",
+  GAME_RULES_FILE + " and enough of the source to know what already exists before",
   "you plan anything. Every increment is an addition to this game -- never a",
   "rewrite, a new project, a new build system, or a different kind of game.",
   "Do not edit any file here; this directory is thrown away after you answer.",
@@ -984,10 +1006,9 @@ async function planAsk(o) {
       12,                      // planning is cheap; it must not become the work
       planDir,
       true,                    // already cloned; answer() must not wipe it
-      // Same provider as the work itself. Without this the planner inherits the
-      // global MODEL_PROVIDER (gemini-api here) while o.model is an Anthropic
-      // name, and the request goes to Google asking for a Claude model.
-      "anthropic",
+      // Same provider as the work itself. Without this the planner can be sent
+      // to a chat model while the actual game work goes to a coding agent.
+      o.provider || "anthropic",
       { abortController: o.abortController }
     );
   } catch (e) {

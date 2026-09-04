@@ -64,8 +64,14 @@ services:
       - NODE_OPTIONS=--dns-result-order=ipv4first
       - DISCORD_TOKEN_DATA_BOY=${DISCORD_TOKEN_DATA_BOY}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - CODEX_API_KEY=${CODEX_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
+      - FEATURE_PROVIDER=${FEATURE_PROVIDER:-codex}
+      # Empty means data-boy.js chooses the matching default for the provider.
+      - FEATURE_MODEL=${FEATURE_MODEL:-}
+      - FEATURE_REASONING_EFFORT=${FEATURE_REASONING_EFFORT:-high}
+      - FEATURE_PROMPT_PATH=${FEATURE_PROMPT_PATH:-/usr/src/app/feature-prompt.md}
       - HOME=/root
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -90,6 +96,14 @@ services:
       - TOASTER_REPO=github-push:scottdaly/toaster-city.git
       - TOASTER_DEPLOY_HOST=toaster-deploy
       - TOASTER_SITE_URL=https://city.rsdaly.com
+      # Generic names are what a future one-game bot changes. The TOASTER_*
+      # aliases remain accepted so old deployments keep working.
+      - GAME_NAME=${GAME_NAME:-Toaster City}
+      - GAME_DESCRIPTION=${GAME_DESCRIPTION:-an existing, working SDL2 isometric city builder in C}
+      - GAME_RULES_FILE=${GAME_RULES_FILE:-CLAUDE.md}
+      - GAME_REPO=${GAME_REPO:-github-push:scottdaly/toaster-city.git}
+      - GAME_DEPLOY_HOST=${GAME_DEPLOY_HOST:-toaster-deploy}
+      - GAME_SITE_URL=${GAME_SITE_URL:-https://city.rsdaly.com}
       # Set to 1 in .env to send feature requests to the worker instead of
       # running them in the gateway. Off means today's behaviour exactly.
       - TOASTER_SPLIT=${TOASTER_SPLIT:-}
@@ -145,6 +159,17 @@ services:
     command: ["node", "data-boy.js", "--worker"]
     environment: *data_boy_env
     volumes: *data_boy_volumes
+    # Current Codex uses bubblewrap to give each request its own read-only
+    # view of the container, private process list, and blocked network. Docker
+    # otherwise stops bubblewrap before that inner sandbox can be created.
+    # These permissions belong on the worker only; no model command receives
+    # them, and no-new-privileges remains set inside the outer container.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - no-new-privileges:true
     network_mode: host
     restart: unless-stopped
 

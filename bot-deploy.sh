@@ -39,6 +39,13 @@ psql_q() {
 preflight() {
   echo "== preflight =="
 
+  local feature_provider
+  feature_provider=$(sed -n 's/^FEATURE_PROVIDER=//p' .env 2>/dev/null | tail -1)
+  feature_provider=${feature_provider:-codex}
+  if [ "$feature_provider" = "codex" ]; then
+    grep -q '^CODEX_API_KEY=.' .env 2>/dev/null || fail "Codex is selected but its API key is missing"
+  fi
+
   # Pull first: the repo is edited from a local clone and pushed, so the
   # server's job is to fetch what was reviewed -- not to be a place files
   # are copied to by hand, which is how three commits ended up existing
