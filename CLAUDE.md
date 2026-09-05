@@ -45,7 +45,11 @@ Two processes from the same image, chosen by argv:
   Agent SDK with `feature-prompt.md`, then `ssh toaster-deploy` (an alias
   inside the container for dodroplet) to run the game's `deploy.sh "gate
   <ref>"` (all seven gates), merge, `deploy.sh origin/main`, and fetch the
-  preview. The agent may leave its own screenshot at
+  preview. The publish is confirmed against the site's own `version.txt`
+  rather than the ssh exit status -- the trigger's answer crosses two SSH
+  hops and can be lost after the release symlink has already swapped -- and
+  a site that is genuinely behind gets one more deploy before it is called
+  a failure. The agent may leave its own screenshot at
   `<workDir>-scratch/preview.png`; that is what gets posted when present.
 - `error-classify.js`: capacity (429/503/529) vs auth failures, and the
   jokey user-facing messages. Keep the tone; name the provider that failed.
@@ -86,6 +90,7 @@ Plain Node scripts, no framework:
 node tests/error-classify-test.js      # pure
 node tests/pump-test.js                # worker concurrency scheduler, pure
 node tests/preview-test.js             # agent preview acceptance
+node tests/publish-verify-test.js      # live-site verification, local HTTP + real git
 node tests/image-attachment-test.js    # real local HTTP server + real curl
 node tests/outage-retry-test.js        # real local git repo, mocked agent
 node tests/cancel-flow-test.js         # real local git repo, mocked agent

@@ -1943,7 +1943,10 @@ async function onMessage(message) {
       // runFeature always returns text -- success, failure, or exhaustion. The
       // built frame is left in workDir, so collectAttachments posts it.
       result = {
-        text: fr.ok ? `${fr.text}
+        // `fr.url` only when there is one: a partially-shipped epic comes back
+        // ok with no url, and interpolating that put the literal string
+        // "undefined" at the bottom of a real report.
+        text: fr.ok && fr.url ? `${fr.text}
 
 ${fr.url}` : fr.text,
         turns: fr.turns || 0,
@@ -2240,7 +2243,7 @@ async function resumeFeatureJob(row, state) {
     });
     clearInterval(beat);
     try { await placeholder.delete(); } catch {}
-    await postChunked(msg, fr.ok ? `${fr.text}\n\n${fr.url}` : fr.text, collectAttachments(workDir));
+    await postChunked(msg, fr.ok && fr.url ? `${fr.text}\n\n${fr.url}` : fr.text, collectAttachments(workDir));
     await finalizeQuery(row.id, {
       answer: fr.text, status: fr.ok ? "success" : "feature_failed",
       turns: fr.turns || 0,
@@ -2518,7 +2521,7 @@ async function runQueuedJob(row) {
       {
         channelId: row.discord_channel_id, replyTo: row.discord_message_id,
         kind: "final",
-        text: fr.ok
+        text: fr.ok && fr.url
           ? `${fr.text}\n\n${fr.url}`
           : fr.text + (fr.branch
               ? `\n\n-# Continue this exact saved work with \`!continue #${row.id}\`.`

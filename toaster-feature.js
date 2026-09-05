@@ -312,6 +312,97 @@ async function deploy(ref) {
 }
 
 /**
+ * Ask the site which commit it is actually serving.
+ *
+ * The trigger's exit status is not the truth. The answer travels back over two
+ * SSH hops and either can drop it *after* the release symlink has already been
+ * swapped, so a non-zero exit means "I did not hear how it went", not "it did
+ * not happen". build.sh writes version.txt from the tree it bundled, so the
+ * site reporting its own commit is the one claim that cannot be fooled by a
+ * lost connection, a stale cache, or a deploy that published a different ref
+ * than we asked for. This is what tools/push.sh has always done by hand.
+ */
+async function liveSha() {
+  const r = await run(
+    "curl",
+    ["-sS", "--fail", "-m", "30", `${SITE_URL}/version.txt?t=${Date.now()}`],
+    { timeout: 60_000 }
+  );
+  if (!r.ok) return null;
+  // An error page or a proxy can hand back any bytes at all; only something
+  // shaped like a sha is an answer.
+  const s = r.stdout.trim();
+  return /^[0-9a-f]{7,40}$/.test(s) ? s : null;
+}
+
+/**
+ * Did `sha` reach the site?
+ *
+ * An exact match is the ordinary answer. An ancestor counts too: what gets
+ * published is `origin/main`, so if a push landed on top of ours between the
+ * deploy and this check, the site is newer than we asked for and our change is
+ * still in it. Calling that a failure would report a shipped feature as broken
+ * -- and it also absorbs git choosing a longer abbreviation on one side than
+ * the other, which a string compare alone would trip over.
+ */
+async function isLive(workDir, sha) {
+  const live = await liveSha();
+  if (!live) return { ok: false, live: null };
+  if (live === sha) return { ok: true, live };
+  // A descendant is, by definition, a commit someone pushed after this job
+  // cloned -- so asking about it here means asking about an object this
+  // checkout has never heard of, and git says "not an ancestor" for the wrong
+  // reason. Fetch before believing that answer, or the one case the ancestry
+  // test exists to handle is the one case it gets wrong: a feature that really
+  // did ship gets a needless second deploy and is then reported as Not live.
+  if (!(await git(workDir, "cat-file", "-e", `${live}^{commit}`)).ok) {
+    await git(workDir, "fetch", "--quiet", "origin");
+  }
+  const anc = await git(workDir, "merge-base", "--is-ancestor", sha, live);
+  return { ok: anc.ok, live };
+}
+
+/**
+ * Publish main, then prove it.
+ *
+ * A failed deploy call tells us nothing on its own: the seven gates finish in
+ * under two minutes and the timeout here is fifteen, so the likeliest reason
+ * for a non-zero exit is the reply getting lost, not the publish failing. So
+ * check the site rather than the exit status -- and when the site really is
+ * behind, try once more, which costs one short build and fixes every transient
+ * cause. Only after a second attempt and a second check do we call it broken,
+ * and by then we can say what the site is serving instead of asking a person
+ * to go and look.
+ */
+async function publishMain(workDir, sha) {
+  const first = await deploy("origin/main");
+  let seen = await isLive(workDir, sha);
+  if (seen.ok) return { ok: true, live: seen.live, recovered: !first.ok };
+
+  // A timeout is the one failure not worth retrying: a build that normally
+  // finishes in under two minutes has gone fifteen without a word, so the far
+  // end is wedged and a second attempt would queue behind the same lock and
+  // hold the integration lane -- and every other job with it -- for half an
+  // hour. Report while the queue is still moving.
+  if (first.timedOut) {
+    console.log(`[toaster] publish timed out (live=${seen.live || "unreadable"}, want=${sha}); not retrying`);
+    return { ok: false, live: seen.live, timedOut: true, output: first.output };
+  }
+
+  console.log(`[toaster] publish did not take (live=${seen.live || "unreadable"}, want=${sha}); retrying`);
+  const second = await deploy("origin/main");
+  seen = await isLive(workDir, sha);
+  if (seen.ok) return { ok: true, live: seen.live, retried: true };
+
+  return {
+    ok: false,
+    live: seen.live,
+    timedOut: first.timedOut || second.timedOut,
+    output: second.output || first.output,
+  };
+}
+
+/**
  * Fast-forward main onto what we just shipped.
  *
  * Without this every request branches from a main that never moves, so feature
@@ -725,8 +816,8 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
       // Publish main itself, so the live site equals main by construction
       // rather than by assuming a branch ref resolved to what we think it did.
       say("publishing...");
-      const pub = await deploy("origin/main");
-      if (!pub.ok) return { stage: "publish" };
+      const pub = await publishMain(workDir, sha);
+      if (!pub.ok) return { stage: "publish", live: pub.live, timedOut: pub.timedOut };
 
       // Grab the frame before releasing the lock. preview.png is read through
       // the mutable `current` symlink, so a job publishing between our deploy
@@ -821,18 +912,26 @@ Your work is saved on branch \`${branch}\`. Asking again now that main ` +
     }
 
     if (outcome.stage === "publish") {
+      // We asked the site itself after every attempt, so this is a statement
+      // about the site, not about an ssh exit code.
       return {
         ok: false,
         ...usage,
         branch,
         merged: true,
+        url: SITE_URL,
         text:
           (lastAgentText || "I made the change.") +
           `
 
-It is merged into main, but the publish step failed or timed out. A failure ` +
-          `there does not tell me whether the site picked the change up or not, ` +
-          `so check ${SITE_URL} and the build host rather than assuming either.`,
+**Not live.** It is merged into main as \`${sha}\`, but ` +
+          (outcome.timedOut
+            ? `the build host went quiet for ${Math.round(DEPLOY_TIMEOUT_MS / 60000)} minutes and I stopped waiting rather than start a second build behind it.`
+            : `two publish attempts did not put it on the site.`) +
+          (outcome.live
+            ? ` The site is still serving \`${outcome.live}\`.`
+            : ` The site did not report a version at all -- it may be down.`) +
+          ` The change itself is safe on main; the build host needs the publish run again.`,
       };
     }
 
@@ -1215,7 +1314,10 @@ async function runFeatureEpicInner(o) {
     }
 
     if (r.cancelled) {
-      return Object.assign({ ok: shipped.length > 0, cancelled: true,
+      // `ok` is true when earlier steps shipped, and the posters append `url`
+      // to anything ok -- so it has to be here, or the channel gets the word
+      // "undefined" glued to the end of a real report.
+      return Object.assign({ ok: shipped.length > 0, cancelled: true, url: SITE_URL,
         text: (shipped.length ? summarise(shipped, plan) + "\n\n" : "") +
           "**" + step.title + "**: " + r.text,
       }, total);
@@ -1227,6 +1329,7 @@ async function runFeatureEpicInner(o) {
       // disagree, and continuing would pile changes on top of that.
       return Object.assign({
         ok: shipped.length > 0,
+        url: SITE_URL,   /* partial success is still `ok`, and an ok result must carry a url */
         branch: r.branch,
         merged: !!r.merged,   /* a merged-but-unpublished step must not be offered as unmerged work to port */
         text: summarise(shipped, plan) +
@@ -1286,6 +1389,7 @@ async function stashAttachments(workDir, attachments) {
 
 module.exports = {
   runFeature, runFeatureEpic, salvageWorkDir, stashAttachments, SITE_URL,
+  liveSha, isLive,   // exported for tests/publish-verify-test.js
   planIncrements,   // exported for tests/planner-test.js
   nominatedPreview, // exported for tests/preview-test.js
 };
