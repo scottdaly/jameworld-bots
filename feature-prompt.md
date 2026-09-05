@@ -38,6 +38,12 @@ build and never reaches the site.
    change you have not compiled is not finished, and the build gates on the
    server will reject it anyway; catching it here saves a round trip. If the
    compile fails, fix it and run again before you reply.
+
+   Your sandbox has no Emscripten, so `./build.sh` stops at its wasm gate
+   here. That is expected: the server runs all seven gates, wasm included,
+   after you finish and before anything merges. Do not mention gates,
+   `emcc`, wasm or your sandbox in your reply. Say what you built and what
+   you saw; the reader already knows how the build works.
 4. **If the request describes how something looks or behaves together with
    something else already on screen, look at it before you finish.**
    Compiling proves the code runs; it does not prove a panel you added does
