@@ -58,8 +58,15 @@ preflight() {
   # The container only gets files the Dockerfile explicitly copies. Forgetting
   # one is invisible on the host and fatal inside the image.
   for f in data-boy.js toaster-feature.js job-queue.js error-classify.js feature-prompt.md data-boy-prompt.md code-prompt.md; do
-    # a COPY line, not any mention: a comment naming the file used to satisfy this
-    grep -Eq "^COPY .*(^|[[:space:]/])$f([[:space:]]|$)" Dockerfile.data-boy || fail "$f is not COPYed in Dockerfile.data-boy"
+    # a COPY line, not any mention: a comment naming the file used to satisfy this.
+    # The first alternative is the first argument -- "COPY data-boy.js ..." --
+    # which the old pattern could not express: it required a space or slash
+    # before the name, and after "^COPY " there is nothing left to be one. A
+    # mid-pattern "^" cannot match there under GNU grep, so every deploy failed
+    # on whichever file happened to be listed first, while BSD grep on a Mac
+    # said it was fine. It went unnoticed from the 2026-09-03 reorder that put
+    # data-boy.js at the front until 2026-09-05.
+    grep -Eq "^COPY([[:space:]]|.*[[:space:]/])$f([[:space:]]|$)" Dockerfile.data-boy || fail "$f is not COPYed in Dockerfile.data-boy"
   done
   echo "  all required files are in the image"
 
