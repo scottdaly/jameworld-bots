@@ -83,7 +83,11 @@ function run(cmd, args, opts = {}) {
   });
 }
 
-const git = (cwd, ...args) => run("git", args, { cwd });
+// Every git call is bounded: an ssh that hangs inside the integration lock
+// would otherwise hold every other job at "building..." for good, with the
+// heartbeat keeping the lease alive so nothing ever re-claimed it.
+const GIT_TIMEOUT_MS = Number(process.env.TOASTER_GIT_TIMEOUT_MS || 10 * 60 * 1000);
+const git = (cwd, ...args) => run("git", args, { cwd, timeout: GIT_TIMEOUT_MS });
 
 function slugify(text) {
   return (
@@ -110,7 +114,7 @@ async function prepareWorkspace(workDir, request) {
   fs.rmSync(workDir, { recursive: true, force: true });
   fs.mkdirSync(workDir, { recursive: true });
 
-  const clone = await run("git", ["clone", "--quiet", REPO, workDir]);
+  const clone = await run("git", ["clone", "--quiet", REPO, workDir], { timeout: GIT_TIMEOUT_MS });
   if (!clone.ok) throw new Error("could not clone the repo: " + clone.stderr.trim());
 
   const branch = `feat/${slugify(request)}-${Date.now().toString(36)}`;
@@ -349,8 +353,11 @@ function withIntegrationLock(fn) {
  * rather than giving up after one attempt: losing the race once does not mean
  * the change cannot land, and dropping it there throws away a finished job.
  */
-async function integrate(workDir, branch, rounds = 5) {
+async function integrate(workDir, branch, rounds = 5, cancelled = () => false) {
   for (let round = 1; round <= rounds; round++) {
+    // each round re-gates and pushes again; a cancel (or a lost fence) that
+    // lands during a rebase round used to be ignored until after publish
+    if (cancelled()) return { merged: false, cancelled: true, reason: "cancelled" };
     const ff = await git(workDir, "push", "origin", "HEAD:main");
     // After a rebase round HEAD is a different commit than the one that was
     // pushed to the branch, so read it here rather than trusting the caller's
@@ -385,6 +392,7 @@ async function integrate(workDir, branch, rounds = 5) {
       };
     }
     console.log(`[toaster] ${branch}: rebased and re-gated (round ${round})`);
+    if (cancelled()) return { merged: false, cancelled: true, reason: "cancelled" };
   }
   return { merged: false, reason: "main kept moving faster than I could rebase onto it" };
 }
@@ -673,6 +681,7 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
     if (!(await hasChanges(workDir))) {
       return {
         ok: false,
+        nochange: true,   /* the epic reads this: on a resumed step it means "already landed" */
         ...usage,
         text:
           lastAgentText ||
@@ -708,7 +717,8 @@ Note: an attached audio file was not used -- ${audio.skipped}.`
 
       if (cancelled()) return { stage: "cancelled" };
       say("merging...");
-      const m = await integrate(workDir, branch);
+      const m = await integrate(workDir, branch, 5, cancelled);
+      if (m.cancelled) return { stage: "cancelled" };
       if (!m.merged) return { stage: "merge", reason: m.reason, conflict: !!m.conflict };
       if (m.sha) sha = m.sha;   // a rebase rewrote it; report what landed
 
@@ -1002,7 +1012,7 @@ async function planAsk(o) {
   const planDir = o.workDir + "-plan";
   try {
     fs.rmSync(planDir, { recursive: true, force: true });
-    const clone = await run("git", ["clone", "--quiet", REPO, planDir]);
+    const clone = await run("git", ["clone", "--quiet", REPO, planDir], { timeout: GIT_TIMEOUT_MS });
     if (!clone.ok) {
       console.warn("[toaster] planner could not clone the repo, treating as one change: " +
         clone.stderr.trim());
@@ -1177,18 +1187,32 @@ async function runFeatureEpicInner(o) {
     // runFeature merges and publishes before returning, and `step` only
     // advances after it returns. A crash in that gap is invisible from here,
     // so the first step after a resume is warned rather than assumed fresh.
-    const firstAfterResume = i === startAt && startAt > 0 && !!o.resume;
+    // step 0 can be the interrupted one just as well as any other, so the
+    // warning goes on the first step of every resume, not only startAt > 0
+    const firstAfterResume = i === startAt && !!o.resume;
+    const direction = o.resume && o.resume.direction
+      ? "\n\nThe user added, when asking to continue: " + o.resume.direction
+      : "";
     const r = await runFeature(Object.assign({}, o, {
-      request: firstAfterResume
+      request: (firstAfterResume
         ? step.request +
           "\n\nNOTE: a previous attempt at this step was interrupted, and it " +
           "may have already landed before it died. Check whether this change is " +
           "already present before making it. If it is, verify it is complete and " +
           "correct rather than doing it a second time."
-        : step.request,
+        : step.request) + direction,
       maxTurns: Math.max(1, Math.min(o.maxTurns || left, left)),
     }));
     add(r);
+
+    if (!r.ok && r.nochange && firstAfterResume) {
+      // it looked, found the step already on main, and changed nothing: that
+      // is the step landing, not failing -- carry on to the next one
+      console.log(`[toaster] resumed step ${i + 1} was already landed; continuing`);
+      shipped.push(step.title);
+      await persist({ plan: plan, shipped: shipped, step: i + 1 });
+      continue;
+    }
 
     if (r.cancelled) {
       return Object.assign({ ok: shipped.length > 0, cancelled: true,
@@ -1204,6 +1228,7 @@ async function runFeatureEpicInner(o) {
       return Object.assign({
         ok: shipped.length > 0,
         branch: r.branch,
+        merged: !!r.merged,   /* a merged-but-unpublished step must not be offered as unmerged work to port */
         text: summarise(shipped, plan) +
           "\n\n**" + step.title + "** did not land: " + r.text +
           "\n\nI stopped there rather than building the rest on top of it.",

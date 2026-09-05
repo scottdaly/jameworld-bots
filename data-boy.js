@@ -400,6 +400,20 @@ const readonlyPool = new Pool({
   port: process.env.POSTGRES_PORT,
   max: 4,
 });
+// pg emits `error` on the pool when an IDLE client's backend goes away (a
+// Postgres restart, a killed connection). With no listener that is an
+// uncaught exception: the worker dies thirty minutes into an epic and the
+// gateway dies with it. The pool already drops the dead client; the next
+// query gets a fresh one. All this has to do is not crash.
+adminPool.on("error", (e) => console.error(`[pg] admin pool: ${e.message}`));
+readonlyPool.on("error", (e) => console.error(`[pg] readonly pool: ${e.message}`));
+// Node 20 turns an unhandled rejection into a crash. The Discord message
+// handler is an async listener whose promise discord.js discards, so any
+// await in it that is not inside a try -- a reply to a message its author
+// just deleted, say -- would take the whole process down. Log, and go on.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[process] unhandled rejection: ${(reason && reason.stack) || reason}`);
+});
 
 async function waitForDb(pool, label) {
   for (let i = 0; i < 10; i++) {
@@ -572,8 +586,17 @@ async function postChunked(question, text, files = [], prefix = "") {
   // The first chunk is the one that replies to the asker, so it is the one
   // worth handing back for the log line.
   let first = null;
+  // a chunk boundary inside a ``` fence would swallow the part label and
+  // render the next chunk's prose as code: close an open fence at the end of
+  // the chunk and reopen it at the start of the next
+  let open = false;
   for (let i = 0; i < parts.length; i++) {
-    const labeled = `${i === 0 ? lead : ""}${parts[i]}\n*(part ${i + 1}/${parts.length})*`;
+    let body = parts[i];
+    if (open) body = "```\n" + body;
+    const fences = (body.match(/```/g) || []).length;
+    open = fences % 2 === 1;
+    if (open) body += "\n```";
+    const labeled = `${i === 0 ? lead : ""}${body}\n*(part ${i + 1}/${parts.length})*`;
     if (i === 0) {
       first = await replyOrSend(question, labeled);
     } else if (i === parts.length - 1) {
@@ -1041,8 +1064,13 @@ async function answerWithAnthropic(question, systemPrompt, model, onProgress = n
     }
   }
 
+  // The CLI sets is_error on the max-turns result as well (checked in the
+  // bundle: `is_error:!0` next to `subtype:"error_max_turns"`), so it must
+  // not count as failure by itself, or an agent that hit its cap with real
+  // edits in the tree is thrown away instead of gated -- which is exactly
+  // what happened between the outage work and this line.
   const failed =
-    isErrorResult ||
+    (isErrorResult && status !== "error_max_turns") ||
     apiErrorStatus != null ||
     status === null ||
     status === "error_during_execution" ||
@@ -1473,7 +1501,15 @@ function shouldSkipDuplicate(message) {
   return null;
 }
 
-discord.on("messageCreate", async (message) => {
+discord.on("messageCreate", (message) => {
+  // Everything below is awaited inside one promise that is caught here, so
+  // a reply that fails before the handler's own try (the asker deleted their
+  // message, Discord returned a 5xx) is logged rather than crashing the bot.
+  onMessage(message).catch((e) => {
+    console.error(`[gateway] message handler failed: ${(e && e.stack) || e}`);
+  });
+});
+async function onMessage(message) {
   if (message.author.bot) return;
   if (!message.guild) return;
 
@@ -1487,7 +1523,11 @@ discord.on("messageCreate", async (message) => {
       `**#${id} ${j.user || "?"}** — ${String(j.question || "").slice(0, 46)}\n` +
       `-# ${ago(now - (j.started || now))} in · last: ${j.note || "?"} (${ago(now - (j.at || now))} ago)`
     );
-    await message.reply(rows.join("\n\n"));
+    // never past Discord's 2000: the reply would be rejected, not trimmed
+    let out = ""; let shown = 0;
+    for (const r of rows) { if (out.length + r.length + 2 > 1800) break; out += (out ? "\n\n" : "") + r; shown++; }
+    if (shown < rows.length) out += `\n\n-# and ${rows.length - shown} more`;
+    await message.reply(out || "Nothing running.");
     return;
   }
 
@@ -1587,6 +1627,17 @@ discord.on("messageCreate", async (message) => {
     try {
       const hint = (continueBang[1] || "").trim();
       const found = await jobs.findContinuation(adminPool, userTag, hint);
+      if (found.match && found.match.discord_user !== userTag) {
+        // an exact #number finds anyone's job; continuing it inherits their
+        // branch and plan, so it takes the same standing as cancelling it
+        let admin = ADMINS.has(message.author.username);
+        try { admin = admin || !!(message.member && message.member.permissions.has("ManageGuild")); } catch (e) {}
+        if (!admin) {
+          inFlight.delete(userId);
+          await message.reply(`Job #${found.match.id} is ${found.match.discord_user}'s. Only they, or someone who manages this server, can continue it.`);
+          return;
+        }
+      }
       if (!found.match) {
         inFlight.delete(userId);
         if (found.ambiguous && found.ambiguous.length) {
@@ -1613,7 +1664,11 @@ discord.on("messageCreate", async (message) => {
         sourceBranch: branch,
         originalRequest: source.job_payload?.request || source.question,
         direction: exactHint ? exactHint[1].trim() : hint,
-        resumeState,
+        // a resumed plan reruns its own step requests, not the wording
+        // above, so the direction travels inside the state as well
+        resumeState: resumeState && (exactHint ? exactHint[1].trim() : hint)
+          ? Object.assign({}, resumeState, { direction: exactHint ? exactHint[1].trim() : hint })
+          : resumeState,
       };
     } catch (e) {
       inFlight.delete(userId);
@@ -1778,6 +1833,7 @@ discord.on("messageCreate", async (message) => {
               "I'll take another once one of those lands."
           );
           await finalizeQuery(logRowId, { error: "per-user queue limit", duration_ms: 0 });
+          livePlaceholderIds.delete(placeholder.id);   /* refused: nothing will replace it */
           handedOff = true;   // the work dir is not ours to delete either way
           return;
         }
@@ -1983,6 +2039,9 @@ ${fr.url}` : fr.text,
     });
   } finally {
     inFlight.delete(userId);
+    liveJobs.delete(logRowId);   /* a chat question is not a live job once answered;
+                                    left in, !status grew by a row per question until
+                                    its reply exceeded Discord's limit */
     // A handed-off job has not started yet: the worker still needs the scratch
     // dir, and the placeholder has to survive until the worker's answer
     // replaces it. Tearing either down here is how a queued job would arrive
@@ -2002,7 +2061,7 @@ ${fr.url}` : fr.text,
       fs.rmSync(workDir + ".images", { recursive: true, force: true });
     }
   }
-});
+}
 
 // Record a placeholder the janitor deleted, so a vanished message is never
 // silent. If this table shows a deletion that overlaps a running query, the
@@ -2390,6 +2449,7 @@ async function runQueuedJob(row) {
         // The preview lives in the work dir, which the next increment's clone
         // wipes -- so copy it somewhere the gateway can still find it when it
         // gets round to posting.
+        if (fenced) return;                     /* not ours any more: whoever owns it posts */
         let keep = null;
         try {
           if (inc.preview && fs.existsSync(inc.preview)) {
@@ -2521,14 +2581,22 @@ async function runClaimedJob(row) {
     // runFeatureEpic already promises never to reject, so this is the
     // outbox or the database. Either way the asker is owed a sentence.
     console.error(`[worker] job ${row.id} threw: ${(err && err.stack) || err}`);
-    try {
-      await jobs.pushOutbox(adminPool, {
-        logId: row.id, channelId: row.discord_channel_id,
-        replyTo: row.discord_message_id, kind: "final",
-        text: `That job hit an unexpected error and stopped: ${err.message}`,
-      });
-    } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
-    await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
+    // only while it is still ours: an attempt that lost the fence and then
+    // threw must not post a second final over the new owner's answer
+    let ours = false;
+    try { ours = await jobs.heartbeat(adminPool, row.id, {}, fenceOf(row)); } catch (e) {}
+    if (ours) {
+      try {
+        await jobs.pushOutbox(adminPool, {
+          logId: row.id, channelId: row.discord_channel_id,
+          replyTo: row.discord_message_id, kind: "final",
+          text: `That job hit an unexpected error and stopped: ${err.message}`,
+        });
+      } catch (e) { console.error(`[worker] could not even report: ${e.message}`); }
+      await finalizeQuery(row.id, { error: String(err.message), duration_ms: 0 });
+    } else {
+      console.warn(`[worker] job ${row.id}: threw after losing ownership; not reporting`);
+    }
   } finally {
     // complete() is predicated on ownership: it only succeeds if this
     // worker's fence still matches the row. Its return value is therefore
@@ -2690,7 +2758,7 @@ async function refreshQueuedPlaceholders() {
     } catch (e) { /* a deleted placeholder is not an error worth logging every 5s */ }
   }
   // Jobs nobody can finish. Say so rather than leaving them queued forever.
-  for (const dead of await jobs.reapExhausted(adminPool)) {
+  for (const dead of await jobs.reapCandidates(adminPool)) {
     liveJobs.delete(dead.id);
     // Never picked up is a different problem from tried and failed, and the
     // person waiting should be told which.
@@ -2710,6 +2778,10 @@ async function refreshQueuedPlaceholders() {
         error: neverRan ? "job was never claimed by a worker" : "job exhausted its attempts",
         duration_ms: 0,
       });
+      // marked dead only once the message is safely in the outbox; a crash
+      // before this line means it is simply reaped again next poll
+      await jobs.reapMark(adminPool, dead.id);
+      if (neverRan) dropStashes(dead.discord_message_id);   /* it never had a worker to clean up */
     } catch (e) { console.error(`reaping ${dead.id}: ${e.message}`); }
   }
 }
@@ -2724,6 +2796,16 @@ async function refreshQueuedPlaceholders() {
  */
 const ADMINS = new Set(String(process.env.DATA_BOY_ADMINS || "")
   .split(",").map((s) => s.trim()).filter(Boolean));
+
+/* the attachment stashes the gateway fetched for a job that never reached a
+   worker -- cancelled or dead-lettered unclaimed -- which no worker cleanup
+   will ever remove */
+function dropStashes(discordMessageId) {
+  if (!discordMessageId) return;
+  const wd = path.join(WORK_ROOT, String(discordMessageId));
+  try { fs.rmSync(wd + ".audio", { force: true }); } catch (e) {}
+  try { fs.rmSync(wd + ".images", { recursive: true, force: true }); } catch (e) {}
+}
 
 function describeCancel(c) {
   const st = c.job_state && typeof c.job_state === "object" ? c.job_state : {};
@@ -2790,6 +2872,7 @@ async function handleCancel(message, id) {
     }
     console.log(`[gateway] job ${c.id} cancelled by ${who} (attempts=${c.attempts})`);
     liveJobs.delete(Number(c.id));
+    if (Number(c.attempts) === 0) dropStashes(c.discord_message_id);   /* never claimed: nobody else will */
     const pid = c.job_payload && c.job_payload.placeholder_id;
     if (pid) {
       livePlaceholderIds.delete(pid);

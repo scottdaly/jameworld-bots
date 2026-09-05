@@ -48,6 +48,8 @@ preflight() {
 
   node --check data-boy.js || fail "data-boy.js does not parse"
   node -e 'require("./toaster-feature.js")' || fail "toaster-feature.js does not load"
+  node -e 'require("./job-queue.js")' || fail "job-queue.js does not load"
+  node -e 'require("./error-classify.js")' || fail "error-classify.js does not load"
   echo "  syntax ok"
 
   docker compose config >/dev/null || fail "docker-compose.yml is invalid"
@@ -56,7 +58,8 @@ preflight() {
   # The container only gets files the Dockerfile explicitly copies. Forgetting
   # one is invisible on the host and fatal inside the image.
   for f in data-boy.js toaster-feature.js job-queue.js error-classify.js feature-prompt.md data-boy-prompt.md code-prompt.md; do
-    grep -q "$f" Dockerfile.data-boy || fail "$f is not COPYed in Dockerfile.data-boy"
+    # a COPY line, not any mention: a comment naming the file used to satisfy this
+    grep -Eq "^COPY .*(^|[[:space:]/])$f([[:space:]]|$)" Dockerfile.data-boy || fail "$f is not COPYed in Dockerfile.data-boy"
   done
   echo "  all required files are in the image"
 
@@ -65,8 +68,13 @@ preflight() {
   # the worker, so blocking a routing change behind somebody's hour-long job is
   # pure cost with nothing bought.
   local n
-  n=$(psql_q "SELECT count(*) FROM data_boy_logs WHERE answer IS NULL AND error IS NULL AND asked_at > NOW() - INTERVAL '2 hours';")
-  if [ "${n:-0}" = "0" ]; then
+  # The queue's own idea of in flight, not a guess from timestamps: a job
+  # queued behind two epics can be claimed two hours after it was asked and
+  # run ninety minutes more, and the old two-hour window missed it. And a
+  # database that cannot be reached is a refusal, not a zero.
+  n=$(psql_q "SELECT count(*) FROM data_boy_logs WHERE job_status IN ('queued', 'running');")
+  [ -n "$n" ] || fail "could not reach the database to check for running jobs"
+  if [ "$n" = "0" ]; then
     echo "  no jobs in flight"
   elif [ "$TARGET" = "$SVC" ] && split_live; then
     echo "  $n job(s) in flight, but they run in the worker -- the gateway is safe to restart"

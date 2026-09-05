@@ -42,12 +42,19 @@ const WORKER_ID = `${os.hostname()}:${process.pid}`;
 // How long a claim is good for without a heartbeat. Long enough that a slow
 // database or a busy event loop cannot make a healthy worker look dead; short
 // enough that a killed one is noticed within a couple of minutes.
-const LEASE_MS = Number(process.env.TOASTER_LEASE_MS || 120_000);
+// Long enough that a Postgres stall of a couple of minutes does not let the
+// job be re-claimed out from under a worker that is merely waiting on the
+// database; 300s at a 75s heartbeat leaves three missed beats before a real
+// crash is assumed.
+const LEASE_MS = Number(process.env.TOASTER_LEASE_MS || 300_000);
 const HEARTBEAT_MS = Math.max(10_000, Math.floor(LEASE_MS / 4));
 
 // A job that has been handed out this many times without finishing is not
 // unlucky, it is poison. Stop feeding it to workers and let somebody look.
-const MAX_ATTEMPTS = Number(process.env.TOASTER_MAX_ATTEMPTS || 3);
+// How many times a job may be claimed before it is dead-lettered. Its own
+// knob: TOASTER_MAX_ATTEMPTS is the feature pipeline's build-fix retries,
+// and raising that must not also raise how often a poison job is re-run.
+const MAX_ATTEMPTS = Number(process.env.TOASTER_MAX_CLAIMS || 3);
 
 // How long a job may sit queued with nobody claiming it before we admit there
 // is no worker and say so.
@@ -393,6 +400,35 @@ async function workersAlive(pool) {
   return rows[0].n;
 }
 
+/* The jobs nobody can finish, NOT yet marked: the gateway tells the asker
+   first and calls reapMark() after, so a failure to tell them is retried
+   next poll rather than leaving a done job with no answer. */
+async function reapCandidates(pool) {
+  const { rows } = await pool.query(
+    `SELECT id, discord_channel_id, discord_message_id, question,
+            COALESCE(job_attempts, 0) AS attempts
+       FROM data_boy_logs
+      WHERE job_status IN ('queued', 'running')
+        AND (job_lease IS NULL OR job_lease < NOW())
+        AND (
+          COALESCE(job_attempts, 0) >= $1
+          OR (COALESCE(job_attempts, 0) = 0
+              AND asked_at < NOW() - ($2 || ' milliseconds')::interval
+              AND NOT EXISTS (
+                SELECT 1 FROM data_boy_workers
+                 WHERE last_seen > NOW() - ($3 || ' milliseconds')::interval))
+        )`,
+    [MAX_ATTEMPTS, String(UNCLAIMED_MS), String(WORKER_STALE_MS)]
+  );
+  return rows;
+}
+async function reapMark(pool, logId) {
+  await pool.query(
+    `UPDATE data_boy_logs SET job_status = 'done', job_worker = NULL, job_lease = NULL
+      WHERE id = $1 AND job_status IN ('queued', 'running')`, [logId]
+  );
+}
+
 async function reapExhausted(pool) {
   const { rows } = await pool.query(
     `UPDATE data_boy_logs
@@ -496,7 +532,10 @@ async function pushOutbox(pool, entry) {
  * answer in the channel is worse than a missing one, and the worker's row
  * still holds the text if anyone needs it back.
  */
-const OUTBOX_MAX_ATTEMPTS = 5;
+// One attempt per gateway poll cycle where the row is actually tried, so
+// this is how long an outage of Discord itself may last before a final
+// answer is dropped: 30 tries at the 2-minute lease is an hour.
+const OUTBOX_MAX_ATTEMPTS = Number(process.env.TOASTER_OUTBOX_MAX_ATTEMPTS || 30);
 
 async function drainOutbox(pool, handler, limit = 5) {
   // Lease, don't consume. The first version stamped posted_at on five rows
@@ -536,9 +575,9 @@ async function drainOutbox(pool, handler, limit = 5) {
   // actually been tried. A final answer stuck behind someone else's broken
   // increment would never have gone out at all.
   let posted = 0;
-  const blockedLogIds = new Set();
+  const blockedLogIds = new Set(), untried = [];
   for (const r of rows) {
-    if (r.log_id != null && blockedLogIds.has(r.log_id)) continue;
+    if (r.log_id != null && blockedLogIds.has(r.log_id)) { untried.push(r.id); continue; }
     try {
       await handler(r);
       await pool.query("UPDATE data_boy_outbox SET posted_at = NOW() WHERE id = $1", [r.id]);
@@ -551,6 +590,16 @@ async function drainOutbox(pool, handler, limit = 5) {
       );
       if (r.log_id != null) blockedLogIds.add(r.log_id);
     }
+  }
+  // A row skipped because an earlier row of its job failed was never tried,
+  // but the claim above already charged it an attempt. Give it back, and
+  // release the claim, or a final answer stuck behind a failing increment
+  // would run out of attempts without its handler ever running once.
+  if (untried.length) {
+    await pool.query(
+      `UPDATE data_boy_outbox SET attempts = GREATEST(COALESCE(attempts, 1) - 1, 0), claimed_at = NULL
+        WHERE id = ANY($1::bigint[])`, [untried]
+    );
   }
   return posted;
 }
@@ -665,6 +714,6 @@ module.exports = {
   cancelJob, jobRow, latestJobFor, isCancelled,
   findContinuation, chooseContinuation, continuationBranch, continuationResumeState,
   ensureSchema, enqueue, claimNext, heartbeat, complete, finishJob,
-  reapExhausted, pruneOutbox, pushOutbox, drainOutbox, liveRows,
+  reapExhausted, reapCandidates, reapMark, pruneOutbox, pushOutbox, drainOutbox, liveRows,
   workerPump, availableMemoryMb, progressTimes,
 };

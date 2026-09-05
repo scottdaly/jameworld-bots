@@ -20,6 +20,7 @@
 process.env.TOASTER_LEASE_MS = "1500";
 process.env.TOASTER_UNCLAIMED_MS = "1000";
 process.env.TOASTER_MAX_ATTEMPTS = "3";
+process.env.TOASTER_OUTBOX_MAX_ATTEMPTS = "5";   // the give-up case below counts to this
 
 const EmbeddedPostgres = require("embedded-postgres").default || require("embedded-postgres");
 const { Pool } = require("pg");
@@ -196,6 +197,16 @@ async function newJob(pool, opts = {}) {
     check("and its attempt is counted", row.attempts === 1);
     check("a later row for the SAME job is not reordered ahead of the failure",
       tries === 1, `tries=${tries}`);
+    // and the row it held back was never tried, so it must not have been
+    // charged an attempt for that: a final stuck behind a failing increment
+    // used to burn every attempt without its handler running once
+    {
+      const { rows: held } = await pool.query(
+        "SELECT attempts, claimed_at FROM data_boy_outbox WHERE posted_at IS NULL ORDER BY id");
+      check("the held-back row keeps its attempts and its claim is released",
+        held.length === 2 && Number(held[1].attempts) === 0 && held[1].claimed_at === null,
+        JSON.stringify(held));
+    }
 
     // it comes back once the claim ages out, and eventually gives up
     await pool.query("UPDATE data_boy_outbox SET claimed_at = NOW() - INTERVAL '3 minutes'");
